@@ -7,6 +7,9 @@ from lunar_forge.agent import CodeAgent
 from lunar_forge.config import AppConfig
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.runtime.sessions import (
+    MAX_LOG_COLLECTION_ITEMS,
+    MAX_LOG_STRING_CHARACTERS,
+    MAX_SESSION_LIST_ENTRIES,
     REDACTED,
     SESSION_ERROR,
     SessionLogger,
@@ -208,3 +211,30 @@ def test_session_listing_returns_metadata_without_reading_contents(tmp_path):
         older.name,
     ]
     assert secret not in json.dumps(result)
+
+
+def test_session_events_and_listing_are_bounded(tmp_path):
+    logger = create_session_logger(tmp_path, environ={})
+    oversized_text = "x" * (MAX_LOG_STRING_CHARACTERS + 100)
+    oversized_items = list(range(MAX_LOG_COLLECTION_ITEMS + 5))
+
+    assert logger.log(
+        "assistant_message",
+        text=oversized_text,
+        items=oversized_items,
+    )
+    event = _events(logger.path)[0]
+
+    assert len(event["data"]["text"]) == MAX_LOG_STRING_CHARACTERS
+    assert event["data"]["text"].endswith("[session value truncated]")
+    assert len(event["data"]["items"]) == MAX_LOG_COLLECTION_ITEMS + 1
+    assert event["data"]["items"][-1] == "[session collection truncated]"
+
+    sessions_directory = logger.path.parent
+    for index in range(MAX_SESSION_LIST_ENTRIES):
+        (sessions_directory / f"extra-{index:04d}.jsonl").touch()
+    result = list_session_files(tmp_path)
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["sessions"]) == MAX_SESSION_LIST_ENTRIES

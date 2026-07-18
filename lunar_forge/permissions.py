@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -63,6 +64,18 @@ _DANGEROUS_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_DISPLAY_SECRET_OPTION = re.compile(
+    r"(?i)((?<!\w)--?(?:api[_-]?key|access[_-]?token|token|secret|password)"
+    r"(?:\s*=\s*|\s+))([^\s]+)"
+)
+_DISPLAY_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*"
+    r"\s*=\s*)([^\s]+)"
+)
+_DISPLAY_API_KEY = re.compile(
+    r"(?i)\b(?:sk-(?:ant-)?|gh[pousr]_|github_pat_)[a-z0-9_-]{8,}\b"
+)
+
 
 def dangerous_command_reason(command: str) -> str | None:
     """Return the prohibited raw-command pattern, without parsing the command."""
@@ -70,6 +83,20 @@ def dangerous_command_reason(command: str) -> str | None:
         if pattern.search(command):
             return label
     return None
+
+
+def normalized_dangerous_command_reason(command: str) -> str | None:
+    """Check a quote-normalized command after the mandatory raw check.
+
+    This catches inputs such as ``rm '-rf'`` or ``s'u'do`` that resolve to a
+    denylisted command after shell-style tokenization. Callers must still run
+    :func:`dangerous_command_reason` on the untouched input first.
+    """
+    try:
+        normalized = " ".join(shlex.split(command, posix=True))
+    except ValueError:
+        return None
+    return dangerous_command_reason(normalized)
 
 
 @dataclass
@@ -97,6 +124,8 @@ class PermissionManager:
                 )
             if isinstance(command, str):
                 dangerous_pattern = dangerous_command_reason(command)
+                if dangerous_pattern is None:
+                    dangerous_pattern = normalized_dangerous_command_reason(command)
                 if dangerous_pattern is not None:
                     return PermissionDecision(
                         allowed=False,
@@ -185,7 +214,7 @@ def _describe_request(tool_name: str, arguments: Mapping[str, Any]) -> str:
     if tool_name == "run_command":
         command = arguments.get("command")
         if isinstance(command, str):
-            preview = " ".join(command.split())
+            preview = _redact_command_preview(" ".join(command.split()))
             if len(preview) > 200:
                 preview = f"{preview[:197]}..."
             return f"Run command: {preview}."
@@ -202,3 +231,9 @@ def _describe_request(tool_name: str, arguments: Mapping[str, Any]) -> str:
     }
     action = actions.get(tool_name, f"Run {tool_name}")
     return f"{action}{path_description}."
+
+
+def _redact_command_preview(command: str) -> str:
+    redacted = _DISPLAY_SECRET_OPTION.sub(r"\1[REDACTED]", command)
+    redacted = _DISPLAY_SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", redacted)
+    return _DISPLAY_API_KEY.sub("[REDACTED]", redacted)

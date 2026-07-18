@@ -4,6 +4,7 @@ import pytest
 
 from lunar_forge.runtime import create_file_checkpoint
 from lunar_forge.runtime.checkpoints import (
+    MAX_CHECKPOINT_LIST_ENTRIES,
     list_checkpoint_directories,
     rollback_file,
 )
@@ -113,3 +114,28 @@ def test_rollback_blocks_outside_paths_and_reports_missing_checkpoint(tmp_path):
         "path": "missing.txt",
         "error": "No checkpoint exists for missing.txt.",
     }
+
+
+def test_checkpoint_listing_is_bounded(tmp_path):
+    checkpoints_root = tmp_path / ".agent" / "checkpoints"
+    checkpoints_root.mkdir(parents=True)
+    source = tmp_path / "old.txt"
+    source.write_text("checkpoint value", encoding="utf-8")
+    create_file_checkpoint(
+        tmp_path,
+        source,
+        created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    source.write_text("current value", encoding="utf-8")
+    for index in range(MAX_CHECKPOINT_LIST_ENTRIES + 1):
+        (checkpoints_root / f"20260101T000000.{index:06d}Z").mkdir()
+
+    result = list_checkpoint_directories(tmp_path)
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(result["checkpoints"]) == MAX_CHECKPOINT_LIST_ENTRIES
+
+    rollback = rollback_file(tmp_path, "old.txt")
+    assert rollback["ok"] is True
+    assert source.read_text(encoding="utf-8") == "checkpoint value"

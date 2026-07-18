@@ -10,6 +10,9 @@ from pathlib import Path
 from lunar_forge.tools.files import safe_path
 
 
+MAX_CHECKPOINT_LIST_ENTRIES = 200
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     id: str
@@ -65,24 +68,33 @@ def list_checkpoint_directories(project_root: str | Path) -> dict[str, object]:
             raise NotADirectoryError(".agent/checkpoints is not a directory.")
 
         checkpoints: list[dict[str, str]] = []
-        for entry in checkpoints_root.iterdir():
+        truncated = False
+        for entry in sorted(
+            checkpoints_root.iterdir(),
+            key=lambda item: item.name,
+            reverse=True,
+        ):
             safe_entry = safe_path(root, entry)
             if not safe_entry.is_dir():
                 continue
+            if len(checkpoints) >= MAX_CHECKPOINT_LIST_ENTRIES:
+                truncated = True
+                break
             checkpoints.append(
                 {
                     "id": safe_entry.name,
                     "path": safe_entry.relative_to(root).as_posix(),
                 }
             )
-        checkpoints.sort(key=lambda item: item["id"], reverse=True)
         return {
             "ok": True,
             "message": (
                 f"Found {len(checkpoints)} checkpoint director"
-                f"{'y' if len(checkpoints) == 1 else 'ies'}."
+                f"{'y' if len(checkpoints) == 1 else 'ies'}"
+                f"{' (list truncated).' if truncated else '.'}"
             ),
             "checkpoints": checkpoints,
+            "truncated": truncated,
         }
     except (OSError, PermissionError, ValueError) as exc:
         return {"ok": False, "error": str(exc), "checkpoints": []}
@@ -134,20 +146,20 @@ def rollback_file(
 
 
 def _latest_checkpoint_for(root: Path, relative_path: Path) -> Path | None:
-    listed = list_checkpoint_directories(root)
-    if listed.get("ok") is not True:
-        error = listed.get("error", "Could not list checkpoints.")
-        raise OSError(str(error))
-    checkpoints = listed.get("checkpoints", [])
-    if not isinstance(checkpoints, list):
+    checkpoints_root = safe_path(root, ".agent/checkpoints")
+    if not checkpoints_root.exists():
         return None
-    for checkpoint in checkpoints:
-        if not isinstance(checkpoint, dict):
+    if not checkpoints_root.is_dir():
+        raise NotADirectoryError(".agent/checkpoints is not a directory.")
+    for checkpoint_directory in sorted(
+        checkpoints_root.iterdir(),
+        key=lambda item: item.name,
+        reverse=True,
+    ):
+        safe_directory = safe_path(root, checkpoint_directory)
+        if not safe_directory.is_dir():
             continue
-        checkpoint_path = checkpoint.get("path")
-        if not isinstance(checkpoint_path, str):
-            continue
-        candidate = safe_path(root, Path(checkpoint_path) / relative_path)
+        candidate = safe_path(root, safe_directory / relative_path)
         if candidate.is_file():
             return candidate
     return None

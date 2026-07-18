@@ -96,6 +96,10 @@ def test_dangerous_command_is_blocked_before_docker_info(monkeypatch, tmp_path):
     assert raw_wrapper["ok"] is False
     assert "raw docker run" in raw_wrapper["error"]
 
+    quoted_option = run_docker_command(tmp_path, "rm '-rf' build")
+    assert quoted_option["ok"] is False
+    assert "rm -rf" in quoted_option["error"]
+
 
 def test_docker_wrapper_refuses_host_home_mount():
     try:

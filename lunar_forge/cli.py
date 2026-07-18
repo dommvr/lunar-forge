@@ -166,6 +166,8 @@ def checkpoints_command(
     for checkpoint in checkpoints:
         if isinstance(checkpoint, dict):
             typer.echo(f"- {checkpoint.get('id')}  {checkpoint.get('path')}")
+    if result.get("truncated") is True:
+        typer.echo("- ... additional checkpoint directories omitted")
 
 
 @app.command("rollback")
@@ -216,6 +218,8 @@ def sessions_command(
             typer.echo(
                 f"- {session.get('name')}  {session.get('size')} bytes"
             )
+    if result.get("truncated") is True:
+        typer.echo("- ... additional session files omitted")
 
 
 def _runtime_overrides(

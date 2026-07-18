@@ -140,3 +140,39 @@ def test_dangerous_command_is_denied_without_requesting_approval():
 
     assert decision.allowed is False
     assert "blocked by safety policy" in decision.reason
+
+
+def test_command_approval_preview_redacts_api_key_like_values():
+    requests: list[PermissionRequest] = []
+    secret = "credential-value-without-a-provider-prefix"
+
+    manager = PermissionManager(
+        mode="default",
+        approval_callback=lambda request: requests.append(request) or False,
+    )
+    manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": f"example-program --api-key {secret} --version"},
+    )
+
+    assert len(requests) == 1
+    assert secret not in requests[0].description
+    assert "[REDACTED]" in requests[0].description
+
+
+def test_quoted_dangerous_command_is_denied_before_approval():
+    def unexpected_approval(request: PermissionRequest) -> bool:
+        raise AssertionError(f"Approval requested for {request.tool_name}")
+
+    decision = PermissionManager(
+        mode="default",
+        approval_callback=unexpected_approval,
+    ).authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "rm '-rf' build"},
+    )
+
+    assert decision.allowed is False
+    assert "rm -rf" in decision.reason

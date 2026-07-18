@@ -8,7 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lunar_forge.permissions import dangerous_command_reason
+from lunar_forge.permissions import (
+    dangerous_command_reason,
+    normalized_dangerous_command_reason,
+)
 from lunar_forge.runtime.local_runner import (
     DEFAULT_TIMEOUT_MS,
     MAX_STDERR_CHARACTERS,
@@ -71,6 +74,8 @@ def run_docker_command(
     # This check intentionally happens before docker info, argument construction,
     # or any subprocess call.
     dangerous_pattern = dangerous_command_reason(command)
+    if dangerous_pattern is None:
+        dangerous_pattern = normalized_dangerous_command_reason(command)
     if dangerous_pattern is not None:
         return _error_result(
             command,

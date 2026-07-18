@@ -57,6 +57,7 @@ def test_command_timeout_is_reported(tmp_path):
     "command",
     (
         "rm -rf build",
+        "rm '-rf' build",
         "sudo python --version",
         "chmod -R 755 src",
         "chown -R user src",

@@ -8,6 +8,11 @@ from typing import Any
 
 import yaml
 
+from lunar_forge.tools.files import safe_path
+
+
+MAX_CONFIG_CHARACTERS = 1_000_000
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -39,7 +44,12 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
 
-    raw = path.read_text(encoding="utf-8")
+    with path.open("r", encoding="utf-8") as handle:
+        raw = handle.read(MAX_CONFIG_CHARACTERS + 1)
+    if len(raw) > MAX_CONFIG_CHARACTERS:
+        raise ValueError(
+            f"Config file exceeds the {MAX_CONFIG_CHARACTERS}-character limit: {path}"
+        )
     data = yaml.safe_load(raw) or {}
 
     if not isinstance(data, dict):
@@ -57,8 +67,9 @@ def load_config(
     Raw API keys are deliberately excluded. ``api_key_env`` identifies the
     environment variable that a model client may read only when making a call.
     """
+    root = Path(project_root).expanduser().resolve()
     user_config_path = Path.home() / ".lunar-forge" / "config.yaml"
-    project_config_path = project_root / ".agent" / "config.yaml"
+    project_config_path = safe_path(root, ".agent/config.yaml")
 
     merged = _default_config()
     merged = deep_merge(merged, _environment_config(os.environ))

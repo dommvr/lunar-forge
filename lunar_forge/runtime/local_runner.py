@@ -71,6 +71,16 @@ def run_local_command(
         return _error_result(command, f"Could not parse command: {exc}", started)
     if not arguments:
         return _error_result(command, "Command must not be empty.", started)
+    normalized_dangerous_pattern = dangerous_command_reason(" ".join(arguments))
+    if normalized_dangerous_pattern is not None:
+        return _error_result(
+            command,
+            (
+                "Command blocked by safety policy after argument normalization: "
+                f"matched prohibited pattern {normalized_dangerous_pattern!r}."
+            ),
+            started,
+        )
 
     try:
         completed = subprocess.run(

@@ -17,6 +17,13 @@ from lunar_forge.tools.files import safe_path
 
 REDACTED = "[REDACTED]"
 SESSION_ERROR = "Session logging failed."
+MAX_LOG_STRING_CHARACTERS = 50_000
+MAX_LOG_RECORD_CHARACTERS = 200_000
+MAX_LOG_COLLECTION_ITEMS = 200
+MAX_LOG_NESTING = 20
+MAX_SESSION_LIST_ENTRIES = 200
+_STRING_TRUNCATION_MARKER = "\n...[session value truncated]"
+_COLLECTION_TRUNCATION_MARKER = "[session collection truncated]"
 
 _SENSITIVE_KEYS = frozenset(
     {
@@ -80,6 +87,19 @@ class SessionLogger:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+            if len(serialized) > MAX_LOG_RECORD_CHARACTERS:
+                record["data"] = {
+                    "truncated": True,
+                    "preview": _redact_string(
+                        serialized,
+                        self._environment_values,
+                    ),
+                }
+                serialized = json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             with safe_log_path.open("a", encoding="utf-8", newline="") as handle:
                 handle.write(f"{serialized}\n")
         except Exception:
@@ -146,10 +166,18 @@ def list_session_files(project_root: str | Path) -> dict[str, object]:
             raise NotADirectoryError(".agent/sessions is not a directory.")
 
         sessions: list[dict[str, object]] = []
-        for entry in sessions_directory.iterdir():
+        truncated = False
+        for entry in sorted(
+            sessions_directory.iterdir(),
+            key=lambda item: item.name,
+            reverse=True,
+        ):
             safe_entry = safe_path(root, entry)
             if not safe_entry.is_file() or safe_entry.suffix != ".jsonl":
                 continue
+            if len(sessions) >= MAX_SESSION_LIST_ENTRIES:
+                truncated = True
+                break
             sessions.append(
                 {
                     "name": safe_entry.name,
@@ -157,11 +185,14 @@ def list_session_files(project_root: str | Path) -> dict[str, object]:
                     "size": safe_entry.stat().st_size,
                 }
             )
-        sessions.sort(key=lambda item: str(item["name"]), reverse=True)
         return {
             "ok": True,
-            "message": f"Found {len(sessions)} session file(s).",
+            "message": (
+                f"Found {len(sessions)} session file(s)"
+                f"{' (list truncated).' if truncated else '.'}"
+            ),
             "sessions": sessions,
+            "truncated": truncated,
         }
     except (OSError, PermissionError, ValueError) as exc:
         return {"ok": False, "error": str(exc), "sessions": []}
@@ -171,7 +202,10 @@ def _sanitize(
     value: Any,
     environment_names: frozenset[str],
     environment_values: tuple[str, ...],
+    depth: int = 0,
 ) -> Any:
+    if depth >= MAX_LOG_NESTING:
+        return _COLLECTION_TRUNCATION_MARKER
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
@@ -180,7 +214,10 @@ def _sanitize(
         return _redact_string(str(value), environment_values)
     if isinstance(value, Mapping):
         sanitized: dict[str, Any] = {}
-        for raw_key, item in value.items():
+        for index, (raw_key, item) in enumerate(value.items()):
+            if index >= MAX_LOG_COLLECTION_ITEMS:
+                sanitized["__lunar_forge_truncated__"] = True
+                break
             key = str(raw_key)
             safe_key = _redact_string(key, environment_values)
             if _is_sensitive_key(key) or key in environment_names:
@@ -190,13 +227,24 @@ def _sanitize(
                     item,
                     environment_names,
                     environment_values,
+                    depth + 1,
                 )
         return sanitized
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [
-            _sanitize(item, environment_names, environment_values)
-            for item in value
-        ]
+        sanitized_items: list[Any] = []
+        for index, item in enumerate(value):
+            if index >= MAX_LOG_COLLECTION_ITEMS:
+                sanitized_items.append(_COLLECTION_TRUNCATION_MARKER)
+                break
+            sanitized_items.append(
+                _sanitize(
+                    item,
+                    environment_names,
+                    environment_values,
+                    depth + 1,
+                )
+            )
+        return sanitized_items
     return _redact_string(str(value), environment_values)
 
 
@@ -232,7 +280,11 @@ def _redact_string(value: str, environment_values: tuple[str, ...]) -> str:
             )
     redacted = _ASSIGNMENT_PATTERN.sub(r"\1[REDACTED]", redacted)
     redacted = _BEARER_PATTERN.sub(r"\1[REDACTED]", redacted)
-    return _API_KEY_PATTERN.sub(REDACTED, redacted)
+    redacted = _API_KEY_PATTERN.sub(REDACTED, redacted)
+    if len(redacted) <= MAX_LOG_STRING_CHARACTERS:
+        return redacted
+    keep = MAX_LOG_STRING_CHARACTERS - len(_STRING_TRUNCATION_MARKER)
+    return f"{redacted[:keep]}{_STRING_TRUNCATION_MARKER}"
 
 
 def _timestamp() -> str:
@@ -259,6 +311,7 @@ class Session:
 __all__ = [
     "REDACTED",
     "SESSION_ERROR",
+    "MAX_LOG_STRING_CHARACTERS",
     "Session",
     "SessionLogger",
     "create_session",
