@@ -221,6 +221,9 @@ def create_tool_registry(
     project_root: str | Path,
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
+    *,
+    runtime_mode: str = "local",
+    allow_network: bool = False,
 ) -> ToolRegistry:
     """Create the current local tool registry under a permission mode."""
     normalized_mode = mode.strip().lower()
@@ -228,8 +231,17 @@ def create_tool_registry(
     tools = [read_registry.get(name) for name in read_registry.names()]
     if normalized_mode != "plan":
         tools.extend(_write_tools(project_root))
-    if normalized_mode not in {"plan", "no-command"}:
-        tools.extend(_execution_tools(project_root))
+    if (
+        normalized_mode not in {"plan", "no-command"}
+        and runtime_mode.strip().lower() != "no-command"
+    ):
+        tools.extend(
+            _execution_tools(
+                project_root,
+                runtime_mode=runtime_mode,
+                allow_network=allow_network,
+            )
+        )
     return ToolRegistry(
         tools,
         permission_manager=PermissionManager(
@@ -318,7 +330,12 @@ def _write_tools(project_root: str | Path) -> tuple[Tool, ...]:
     )
 
 
-def _execution_tools(project_root: str | Path) -> tuple[Tool, ...]:
+def _execution_tools(
+    project_root: str | Path,
+    *,
+    runtime_mode: str,
+    allow_network: bool,
+) -> tuple[Tool, ...]:
     return (
         Tool(
             name="run_command",
@@ -343,7 +360,12 @@ def _execution_tools(project_root: str | Path) -> tuple[Tool, ...]:
                 "required": ["command"],
                 "additionalProperties": False,
             },
-            handler=partial(run_command, project_root),
+            handler=partial(
+                run_command,
+                project_root,
+                runtime_mode=runtime_mode,
+                allow_network=allow_network,
+            ),
             permission=PermissionLevel.EXECUTE,
         ),
         Tool(
@@ -364,7 +386,12 @@ def _execution_tools(project_root: str | Path) -> tuple[Tool, ...]:
                 },
                 "additionalProperties": False,
             },
-            handler=partial(_run_validation, project_root),
+            handler=partial(
+                _run_validation,
+                project_root,
+                runtime_mode=runtime_mode,
+                allow_network=allow_network,
+            ),
             permission=PermissionLevel.EXECUTE,
         ),
     )
@@ -373,8 +400,16 @@ def _execution_tools(project_root: str | Path) -> tuple[Tool, ...]:
 def _run_validation(
     project_root: str | Path,
     timeout_ms: int = 120_000,
+    *,
+    runtime_mode: str = "local",
+    allow_network: bool = False,
 ) -> dict[str, Any]:
     """Import the workflow lazily to keep tool package imports acyclic."""
     from lunar_forge.workflows.validation import run_validation
 
-    return run_validation(project_root, timeout_ms)
+    return run_validation(
+        project_root,
+        timeout_ms,
+        runtime_mode=runtime_mode,
+        allow_network=allow_network,
+    )

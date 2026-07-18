@@ -46,13 +46,25 @@ def run(
         bool,
         typer.Option("--plan", help="Inspect and plan without making changes."),
     ] = False,
+    docker: Annotated[
+        bool,
+        typer.Option("--docker", help="Run approved commands in Docker."),
+    ] = False,
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Use Docker bridge networking instead of network isolation.",
+        ),
+    ] = False,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
-    cli_overrides = {"permissions": {"mode": "plan"}} if plan else None
+    cli_overrides = _runtime_overrides(plan, docker, allow_network)
 
     try:
         config = load_config(project_root, cli_overrides=cli_overrides)
+        _validate_network_flag(allow_network, config.runtime.mode)
         response = run_agent(
             prompt,
             project_root,
@@ -80,20 +92,34 @@ def new_project(
         bool,
         typer.Option("--plan", help="Select a template and plan without writing."),
     ] = False,
+    docker: Annotated[
+        bool,
+        typer.Option("--docker", help="Run approved commands in Docker."),
+    ] = False,
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Use Docker bridge networking instead of network isolation.",
+        ),
+    ] = False,
 ) -> None:
     """Create a small starter project from a built-in template."""
     project_root = project.expanduser().resolve()
-    cli_overrides = {"permissions": {"mode": "plan"}} if plan else None
+    cli_overrides = _runtime_overrides(plan, docker, allow_network)
     template = select_template(prompt)
 
     try:
         config = load_config(project_root, cli_overrides=cli_overrides)
+        _validate_network_flag(allow_network, config.runtime.mode)
         typer.echo(format_new_project_plan(template))
         result = run_new_project(
             prompt,
             project_root,
             mode=config.permissions.mode,
             template=template,
+            runtime_mode=config.runtime.mode,
+            allow_network=config.runtime.allow_network,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -103,6 +129,29 @@ def new_project(
     typer.echo(format_new_project_result(result))
     if result.get("ok") is not True:
         raise typer.Exit(code=1)
+
+
+def _runtime_overrides(
+    plan: bool,
+    docker: bool,
+    allow_network: bool,
+) -> dict[str, dict[str, object]] | None:
+    overrides: dict[str, dict[str, object]] = {}
+    if plan:
+        overrides["permissions"] = {"mode": "plan"}
+    runtime: dict[str, object] = {}
+    if docker:
+        runtime["mode"] = "docker"
+    if allow_network:
+        runtime["allow_network"] = True
+    if runtime:
+        overrides["runtime"] = runtime
+    return overrides or None
+
+
+def _validate_network_flag(allow_network: bool, runtime_mode: str) -> None:
+    if allow_network and runtime_mode != "docker":
+        raise ValueError("--allow-network requires Docker runtime mode.")
 
 
 def main() -> None:

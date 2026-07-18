@@ -84,7 +84,7 @@ def load_config(
             api_base=_optional_string(model_data.get("api_base")),
         ),
         runtime=RuntimeConfig(
-            mode=str(runtime_data["mode"]),
+            mode=_runtime_mode(runtime_data["mode"]),
             allow_network=_as_bool(
                 runtime_data["allow_network"],
                 "runtime.allow_network",
@@ -145,6 +145,15 @@ def _optional_string(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _runtime_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode not in {"local", "docker", "no-command"}:
+        raise ValueError(
+            "runtime.mode must be one of: local, docker, no-command."
+        )
+    return mode
 
 
 def _as_bool(value: Any, name: str) -> bool:

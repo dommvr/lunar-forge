@@ -68,6 +68,8 @@ class CodeAgent:
                     root,
                     mode=mode,
                     approval_callback=self.approval_callback,
+                    runtime_mode=self.config.runtime.mode,
+                    allow_network=self.config.runtime.allow_network,
                 )
             else:
                 tools = registry
@@ -76,7 +78,13 @@ class CodeAgent:
             messages: list[dict[str, Any]] = [
                 {
                     "role": "system",
-                    "content": build_system_prompt(project_info, instructions, mode),
+                    "content": build_system_prompt(
+                        project_info,
+                        instructions,
+                        mode,
+                        runtime_mode=self.config.runtime.mode,
+                        allow_network=self.config.runtime.allow_network,
+                    ),
                 },
                 {
                     "role": "user",

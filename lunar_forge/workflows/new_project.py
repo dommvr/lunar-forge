@@ -79,6 +79,8 @@ def run_new_project(
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
     template: TemplateName | None = None,
+    runtime_mode: str = "local",
+    allow_network: bool = False,
 ) -> dict[str, Any]:
     """Plan or create a starter project without overwriting existing work."""
     root = Path(project_root).expanduser().resolve()
@@ -132,6 +134,8 @@ def run_new_project(
         root,
         mode=normalized_mode,
         approval_callback=approval_callback,
+        runtime_mode=runtime_mode,
+        allow_network=allow_network,
     )
     if selected_template == "vite_react":
         result, session = _scaffold_vite(

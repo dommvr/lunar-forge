@@ -13,6 +13,11 @@ def test_new_command_exists():
     assert "new" in result.stdout
     assert "Create a small starter project" in result.stdout
 
+    run_help = CliRunner().invoke(app, ["run", "--help"])
+    assert run_help.exit_code == 0
+    assert "--docker" in run_help.stdout
+    assert "--allow-network" in run_help.stdout
+
 
 def test_empty_project_can_receive_static_html_files(tmp_path):
     requests: list[PermissionRequest] = []

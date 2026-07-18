@@ -103,3 +103,26 @@ def test_runner_explicitly_uses_shell_false(monkeypatch, tmp_path):
     assert captured["arguments"] == ["example-program", "--version"]
     assert captured["cwd"] == tmp_path.resolve()
     assert captured["shell"] is False
+
+
+def test_shell_dispatch_preserves_local_mode(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_local(project_root, command, timeout_ms):
+        captured.update(
+            project_root=project_root,
+            command=command,
+            timeout_ms=timeout_ms,
+        )
+        return {"ok": True, "runtime": "local"}
+
+    monkeypatch.setattr("lunar_forge.tools.shell.run_local_command", fake_local)
+
+    result = run_command(tmp_path, "python --version", timeout_ms=1234)
+
+    assert result == {"ok": True, "runtime": "local"}
+    assert captured == {
+        "project_root": tmp_path,
+        "command": "python --version",
+        "timeout_ms": 1234,
+    }

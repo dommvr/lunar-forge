@@ -50,6 +50,10 @@ _DANGEROUS_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("~/.ssh", re.compile(r"~[\\/]\.ssh(?:[\\/]|\b)", re.IGNORECASE)),
     (".env", re.compile(r"\.env(?:\b|$)", re.IGNORECASE)),
     (
+        "raw docker run",
+        re.compile(r"\bdocker\s+run\b", re.IGNORECASE),
+    ),
+    (
         "docker run --privileged",
         re.compile(r"\bdocker\s+run\b[\s\S]*--privileged\b", re.IGNORECASE),
     ),

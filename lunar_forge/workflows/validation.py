@@ -27,6 +27,9 @@ class WorkflowResult:
 def run_validation(
     project_root: str | Path,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    *,
+    runtime_mode: str = "local",
+    allow_network: bool = False,
 ) -> dict[str, Any]:
     """Detect and run likely project validation commands in a bounded runner."""
     root = Path(project_root).expanduser().resolve()
@@ -50,10 +53,25 @@ def run_validation(
             "results": [],
         }
 
-    results = [
-        run_local_command(root, command, timeout_ms)
-        for command in commands
-    ]
+    if runtime_mode.strip().lower() == "local":
+        results = [
+            run_local_command(root, command, timeout_ms)
+            for command in commands
+        ]
+    else:
+        # Lazy import avoids a tools-package cycle during workflow imports.
+        from lunar_forge.tools.shell import run_command
+
+        results = [
+            run_command(
+                root,
+                command,
+                timeout_ms,
+                runtime_mode=runtime_mode,
+                allow_network=allow_network,
+            )
+            for command in commands
+        ]
     all_succeeded = all(result.get("ok") is True for result in results)
     return {
         "ok": all_succeeded,
