@@ -129,6 +129,44 @@ def create_session(
     return create_session_logger(project_root, environ)
 
 
+def list_session_files(project_root: str | Path) -> dict[str, object]:
+    """List session filenames and sizes without reading JSONL contents."""
+    try:
+        root = Path(project_root).expanduser().resolve()
+        if not root.is_dir():
+            raise NotADirectoryError(f"Project root is not a directory: {root}")
+        sessions_directory = safe_path(root, ".agent/sessions")
+        if not sessions_directory.exists():
+            return {
+                "ok": True,
+                "message": "No sessions found.",
+                "sessions": [],
+            }
+        if not sessions_directory.is_dir():
+            raise NotADirectoryError(".agent/sessions is not a directory.")
+
+        sessions: list[dict[str, object]] = []
+        for entry in sessions_directory.iterdir():
+            safe_entry = safe_path(root, entry)
+            if not safe_entry.is_file() or safe_entry.suffix != ".jsonl":
+                continue
+            sessions.append(
+                {
+                    "name": safe_entry.name,
+                    "path": safe_entry.relative_to(root).as_posix(),
+                    "size": safe_entry.stat().st_size,
+                }
+            )
+        sessions.sort(key=lambda item: str(item["name"]), reverse=True)
+        return {
+            "ok": True,
+            "message": f"Found {len(sessions)} session file(s).",
+            "sessions": sessions,
+        }
+    except (OSError, PermissionError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "sessions": []}
+
+
 def _sanitize(
     value: Any,
     environment_names: frozenset[str],
@@ -225,4 +263,5 @@ __all__ = [
     "SessionLogger",
     "create_session",
     "create_session_logger",
+    "list_session_files",
 ]

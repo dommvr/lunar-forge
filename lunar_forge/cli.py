@@ -11,6 +11,11 @@ from typer.core import TyperGroup
 
 from lunar_forge.agent import run_agent
 from lunar_forge.config import load_config
+from lunar_forge.runtime.checkpoints import (
+    list_checkpoint_directories,
+    rollback_file,
+)
+from lunar_forge.runtime.sessions import list_session_files
 from lunar_forge.workflows.new_project import (
     format_new_project_plan,
     format_new_project_result,
@@ -23,7 +28,16 @@ class DefaultCommandGroup(TyperGroup):
     """Route legacy root invocations to ``run`` while supporting subcommands."""
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        if args and args[0] not in {"run", "new", "--help", "-h"}:
+        commands = {
+            "run",
+            "new",
+            "checkpoints",
+            "rollback",
+            "sessions",
+            "--help",
+            "-h",
+        }
+        if args and args[0] not in commands:
             args = ["run", *args]
         return super().parse_args(ctx, args)
 
@@ -129,6 +143,79 @@ def new_project(
     typer.echo(format_new_project_result(result))
     if result.get("ok") is not True:
         raise typer.Exit(code=1)
+
+
+@app.command("checkpoints")
+def checkpoints_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """List project checkpoint directories, newest first."""
+    result = list_checkpoint_directories(project.expanduser().resolve())
+    if result.get("ok") is not True:
+        typer.echo(f"Error: {result.get('error', 'Could not list checkpoints.')}", err=True)
+        raise typer.Exit(code=1)
+
+    checkpoints = result.get("checkpoints", [])
+    if not checkpoints:
+        typer.echo("No checkpoints found under .agent/checkpoints.")
+        return
+    typer.echo("Checkpoints (newest first):")
+    for checkpoint in checkpoints:
+        if isinstance(checkpoint, dict):
+            typer.echo(f"- {checkpoint.get('id')}  {checkpoint.get('path')}")
+
+
+@app.command("rollback")
+def rollback_command(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Project-relative file path to restore."),
+    ],
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """Restore the latest checkpoint for a project file."""
+    result = rollback_file(project.expanduser().resolve(), path)
+    if result.get("ok") is not True:
+        typer.echo(f"Error: {result.get('error', 'Rollback failed.')}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Restored {result.get('path')} from {result.get('checkpoint_path')}."
+    )
+    previous_state = result.get("previous_state_checkpoint")
+    if previous_state:
+        typer.echo(f"Saved the replaced state to {previous_state}.")
+
+
+@app.command("sessions")
+def sessions_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """List project session log files without reading their contents."""
+    result = list_session_files(project.expanduser().resolve())
+    if result.get("ok") is not True:
+        typer.echo(f"Error: {result.get('error', 'Could not list sessions.')}", err=True)
+        raise typer.Exit(code=1)
+
+    sessions = result.get("sessions", [])
+    if not sessions:
+        typer.echo("No sessions found under .agent/sessions.")
+        return
+    typer.echo("Sessions (newest first):")
+    for session in sessions:
+        if isinstance(session, dict):
+            typer.echo(
+                f"- {session.get('name')}  {session.get('size')} bytes"
+            )
 
 
 def _runtime_overrides(

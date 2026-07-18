@@ -11,6 +11,7 @@ from lunar_forge.runtime.sessions import (
     SESSION_ERROR,
     SessionLogger,
     create_session_logger,
+    list_session_files,
 )
 
 
@@ -188,3 +189,22 @@ def test_plan_mode_does_not_create_runtime_files(tmp_path):
 
     assert not (tmp_path / ".agent").exists()
     assert output.endswith("Session log: disabled in plan mode")
+
+
+def test_session_listing_returns_metadata_without_reading_contents(tmp_path):
+    sessions_directory = tmp_path / ".agent" / "sessions"
+    sessions_directory.mkdir(parents=True)
+    secret = "sk-session-listing-secret-123456"
+    older = sessions_directory / "20260101T000000000000Z-11111111.jsonl"
+    newer = sessions_directory / "20260201T000000000000Z-22222222.jsonl"
+    older.write_text(f'{{"secret":"{secret}"}}\n', encoding="utf-8")
+    newer.write_text("{}\n", encoding="utf-8")
+
+    result = list_session_files(tmp_path)
+
+    assert result["ok"] is True
+    assert [item["name"] for item in result["sessions"]] == [
+        newer.name,
+        older.name,
+    ]
+    assert secret not in json.dumps(result)
