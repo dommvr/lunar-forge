@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,21 +15,117 @@ from lunar_forge.tools.registry import ToolRegistry, create_tool_registry
 
 TemplateName = str
 
-SUPPORTED_TEMPLATES = ("static_html", "python_tkinter", "vite_react")
+
+@dataclass(frozen=True)
+class TemplateSpec:
+    """Declarative files and commands for one built-in starter template."""
+
+    name: TemplateName
+    files: tuple[str, ...]
+    commands: tuple[str, ...]
+    validation: tuple[str, ...]
+    dependencies: tuple[str, ...]
+    run_instructions: tuple[str, ...]
+
+
 TEMPLATE_ROOT = Path(__file__).resolve().parents[1] / "templates"
+TEMPLATE_SPECS: dict[TemplateName, TemplateSpec] = {
+    "static_html": TemplateSpec(
+        name="static_html",
+        files=("index.html", "styles.css", "README.md"),
+        commands=(),
+        validation=(),
+        dependencies=(),
+        run_instructions=(
+            "Open index.html in a browser, or run python -m http.server 8000.",
+            "Visit http://localhost:8000.",
+        ),
+    ),
+    "python_tkinter": TemplateSpec(
+        name="python_tkinter",
+        files=("app.py", "README.md"),
+        commands=(),
+        validation=(),
+        dependencies=(),
+        run_instructions=("Run python app.py from the project directory.",),
+    ),
+    "vite_react": TemplateSpec(
+        name="vite_react",
+        files=(
+            "index.html",
+            "package.json",
+            "vite.config.js",
+            "src/main.jsx",
+            "src/App.jsx",
+            "src/App.css",
+            "README.md",
+        ),
+        commands=("npm install",),
+        validation=("npm run build",),
+        dependencies=("react", "react-dom", "vite", "@vitejs/plugin-react"),
+        run_instructions=(
+            "Run npm install from the project directory.",
+            "Run npm run dev from the project directory.",
+            "Open the local URL printed by Vite.",
+            "Run npm run build to create a production build.",
+            "Run npm run preview to preview the production build.",
+        ),
+    ),
+    "python_cli": TemplateSpec(
+        name="python_cli",
+        files=("app.py", "test_app.py", "README.md"),
+        commands=(),
+        validation=("python -m unittest -q",),
+        dependencies=(),
+        run_instructions=(
+            "Run python app.py --name Ada from the project directory.",
+            "Run python -m unittest -q to execute the starter test.",
+        ),
+    ),
+    "flask": TemplateSpec(
+        name="flask",
+        files=("app.py", "test_app.py", "requirements.txt", "README.md"),
+        commands=("python -m pip install -r requirements.txt",),
+        validation=("python -m unittest -q",),
+        dependencies=("Flask>=3.0,<4.0",),
+        run_instructions=(
+            "Install dependencies with python -m pip install -r requirements.txt.",
+            "Run flask --app app run --debug from the project directory.",
+            "Visit http://127.0.0.1:5000.",
+        ),
+    ),
+    "fastapi": TemplateSpec(
+        name="fastapi",
+        files=("app.py", "test_app.py", "requirements.txt", "README.md"),
+        commands=("python -m pip install -r requirements.txt",),
+        validation=("python -m unittest -q",),
+        dependencies=(
+            "fastapi>=0.110,<1.0",
+            "uvicorn>=0.29,<1.0",
+        ),
+        run_instructions=(
+            "Install dependencies with python -m pip install -r requirements.txt.",
+            "Run uvicorn app:app --reload from the project directory.",
+            "Visit http://127.0.0.1:8000/docs.",
+        ),
+    ),
+}
+SUPPORTED_TEMPLATES = tuple(TEMPLATE_SPECS)
 TEMPLATE_FILES: dict[str, tuple[str, ...]] = {
-    "static_html": ("index.html", "styles.css", "README.md"),
-    "python_tkinter": ("app.py", "README.md"),
-    "vite_react": (),
+    name: spec.files for name, spec in TEMPLATE_SPECS.items()
 }
 NEAR_EMPTY_ENTRIES = frozenset({"AGENTS.md", "CLAUDE.md", ".gitignore"})
 
 
 def select_template(prompt: str) -> TemplateName:
-    """Choose one of the three starter templates with explicit heuristics."""
+    """Choose a starter template with small, explicit prompt heuristics."""
     normalized = " ".join(prompt.lower().split())
     if "vite" in normalized or "react" in normalized:
         return "vite_react"
+    if "fastapi" in normalized or "fast api" in normalized:
+        return "fastapi"
+    if "flask" in normalized:
+        return "flask"
     if any(
         phrase in normalized
         for phrase in (
@@ -41,6 +137,17 @@ def select_template(prompt: str) -> TemplateName:
         )
     ):
         return "python_tkinter"
+    if any(
+        phrase in normalized
+        for phrase in (
+            "python cli",
+            "command-line",
+            "command line",
+            "console app",
+            "terminal app",
+        )
+    ):
+        return "python_cli"
     return "static_html"
 
 
@@ -58,10 +165,33 @@ def build_new_project_plan(template: TemplateName) -> list[str]:
             "Create app.py with a standard-library Tkinter calculator.",
             "Create README.md with Python run instructions.",
         ]
+    if template == "vite_react":
+        return [
+            "Create a small React app, Vite entry point, and responsive styles.",
+            "Create package.json with dev, build, and preview scripts.",
+            "Create README.md with install, development, and build instructions.",
+            "Request approval to run npm install; this may require network.",
+            "Request separate approval to validate with npm run build.",
+        ]
+    if template == "python_cli":
+        return [
+            "Create app.py with a small argparse-based command-line application.",
+            "Create test_app.py with a standard-library unittest.",
+            "Create README.md with run and test instructions.",
+            "Request approval to run python -m unittest -q.",
+        ]
+    if template == "flask":
+        framework = "Flask"
+        run_command = "flask --app app run --debug"
+    else:
+        framework = "FastAPI"
+        run_command = "uvicorn app:app --reload"
     return [
-        "Request approval to run npm create vite@latest . -- --template react.",
-        "Request separate approval to run npm install; this may require network.",
-        "Provide npm run dev instructions after scaffolding.",
+        f"Create a small {framework} app and standard-library test.",
+        "Create requirements.txt and README.md.",
+        "Request approval before installing dependencies.",
+        "Request approval to run python -m unittest -q.",
+        f"Provide {run_command} instructions.",
     ]
 
 
@@ -86,18 +216,22 @@ def run_new_project(
     root = Path(project_root).expanduser().resolve()
     selected_template = template or select_template(prompt)
     _validate_template(selected_template)
+    spec = TEMPLATE_SPECS[selected_template]
     plan = build_new_project_plan(selected_template)
     normalized_mode = mode.strip().lower() or "default"
     base_result: dict[str, Any] = {
         "template": selected_template,
         "plan": plan,
-        "planned_files": list(TEMPLATE_FILES[selected_template]),
+        "planned_files": list(spec.files),
+        "planned_commands": list(spec.commands),
+        "validation_commands": list(spec.validation),
+        "dependencies": list(spec.dependencies),
         "changed_files": [],
         "commands_run": [],
         "command_results": [],
         "validation": [],
         "checkpoints": [],
-        "run_instructions": _run_instructions(selected_template),
+        "run_instructions": list(spec.run_instructions),
         "session_log": None,
     }
 
@@ -124,7 +258,7 @@ def run_new_project(
             **base_result,
         }
 
-    session = None if selected_template == "vite_react" else _start_session(root)
+    session = _start_session(root)
     if session is not None:
         base_result["session_log"] = session.relative_path
     _log(session, "user_prompt", prompt=prompt)
@@ -137,19 +271,17 @@ def run_new_project(
         runtime_mode=runtime_mode,
         allow_network=allow_network,
     )
-    if selected_template == "vite_react":
-        result, session = _scaffold_vite(
-            root,
+    result = _copy_template_files(
+        spec,
+        registry,
+        base_result,
+        session,
+    )
+    if result.get("ok") is True:
+        result = _run_declared_commands(
+            spec,
             registry,
-            base_result,
-            prompt,
-            plan,
-        )
-    else:
-        result = _copy_template_files(
-            selected_template,
-            registry,
-            base_result,
+            result,
             session,
         )
 
@@ -199,14 +331,14 @@ def run(
 
 
 def _copy_template_files(
-    template: TemplateName,
+    spec: TemplateSpec,
     registry: ToolRegistry,
     result: dict[str, Any],
     session: SessionLogger | None,
 ) -> dict[str, Any]:
-    for relative_path in TEMPLATE_FILES[template]:
+    for relative_path in spec.files:
         try:
-            source = TEMPLATE_ROOT / template / relative_path
+            source = TEMPLATE_ROOT / spec.name / relative_path
             content = source.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             result.update(
@@ -238,68 +370,69 @@ def _copy_template_files(
             return result
         result["changed_files"].append(str(tool_result["path"]))
 
-    result.update(ok=True, message=f"Created the {template} starter project.")
+    result.update(ok=True, message=f"Created the {spec.name} starter project.")
     return result
 
 
-def _scaffold_vite(
-    root: Path,
+def _run_declared_commands(
+    spec: TemplateSpec,
     registry: ToolRegistry,
     result: dict[str, Any],
-    prompt: str,
-    plan: list[str],
-) -> tuple[dict[str, Any], SessionLogger | None]:
-    before = _project_files(root)
-    commands = (
-        "npm create vite@latest . -- --template react",
-        "npm install",
-    )
-    session: SessionLogger | None = None
-    for index, command in enumerate(commands):
-        arguments = {"command": command}
-        if session is not None:
-            _log(session, "tool_call", name="run_command", arguments=arguments)
-        command_result = registry.execute("run_command", arguments)
-        if index == 0:
-            # create-vite expects an empty directory, so create .agent only after
-            # the scaffold attempt and then record the buffered context.
-            session = _start_session(root)
-            if session is not None:
-                result["session_log"] = session.relative_path
-            _log(session, "user_prompt", prompt=prompt)
-            _log(session, "template_selected", template="vite_react", plan=plan)
-            _log(session, "tool_call", name="run_command", arguments=arguments)
-        result["command_results"].append(command_result)
-        _log(session, "tool_result", name="run_command", result=command_result)
-        if command_result.get("permission_denied") is True:
-            _log(
-                session,
-                "permission_denial",
-                name="run_command",
-                reason=command_result.get("error"),
-            )
-        else:
-            result["commands_run"].append(command)
+    session: SessionLogger | None,
+) -> dict[str, Any]:
+    for command in spec.commands:
+        command_result = _execute_command(command, registry, result, session)
         if command_result.get("ok") is not True:
-            result["changed_files"] = sorted(_project_files(root) - before)
             result.update(
                 ok=False,
                 message=(
-                    f"Stopped before completing Vite setup: "
-                    f"{command_result.get('error', 'command failed')}"
+                    f"Created the {spec.name} files, but stopped before completing "
+                    f"setup: {command_result.get('error', 'command failed')}"
                 ),
             )
-            return result, session
+            return result
 
-    result["changed_files"] = sorted(_project_files(root) - before)
-    result.update(
-        ok=True,
-        message=(
-            "Created the Vite React starter. Network availability was not "
-            "assumed; both commands ran only after approval."
-        ),
-    )
-    return result, session
+    for command in spec.validation:
+        command_result = _execute_command(command, registry, result, session)
+        if command_result.get("ok") is True:
+            result["validation"].append(f"{command} passed")
+            continue
+        result["validation"].append(
+            f"{command} failed: {command_result.get('error', 'command failed')}"
+        )
+        result.update(
+            ok=False,
+            message=(
+                f"Created the {spec.name} starter, but validation did not pass."
+            ),
+        )
+        return result
+
+    result.update(ok=True, message=f"Created the {spec.name} starter project.")
+    return result
+
+
+def _execute_command(
+    command: str,
+    registry: ToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
+    arguments = {"command": command}
+    _log(session, "tool_call", name="run_command", arguments=arguments)
+    command_result = registry.execute("run_command", arguments)
+    result["command_results"].append(command_result)
+    _log(session, "tool_result", name="run_command", result=command_result)
+    if command_result.get("permission_denied") is True:
+        _log(
+            session,
+            "permission_denial",
+            name="run_command",
+            reason=command_result.get("error"),
+        )
+    else:
+        result["commands_run"].append(command)
+    return command_result
 
 
 def _is_empty_or_nearly_empty(root: Path) -> bool:
@@ -314,41 +447,6 @@ def _is_empty_or_nearly_empty(root: Path) -> bool:
             return False
         return False
     return True
-
-
-def _project_files(root: Path) -> set[str]:
-    files: set[str] = set()
-    for current_directory, directory_names, file_names in os.walk(
-        root,
-        followlinks=False,
-    ):
-        directory_names[:] = [
-            name for name in directory_names if name not in IGNORED_DIRECTORIES
-        ]
-        current = Path(current_directory)
-        for file_name in file_names:
-            candidate = current / file_name
-            try:
-                resolved = safe_path(root, candidate)
-            except PermissionError:
-                continue
-            if resolved.is_file():
-                files.add(resolved.relative_to(root).as_posix())
-    return files
-
-
-def _run_instructions(template: TemplateName) -> list[str]:
-    if template == "static_html":
-        return [
-            "Open index.html in a browser, or run python -m http.server 8000.",
-            "Visit http://localhost:8000.",
-        ]
-    if template == "python_tkinter":
-        return ["Run python app.py from the project directory."]
-    return [
-        "Run npm run dev from the project directory.",
-        "Open the local URL printed by Vite.",
-    ]
 
 
 def _validate_template(template: TemplateName) -> None:
@@ -382,6 +480,9 @@ def _append_list(lines: list[str], heading: str, values: Any) -> None:
 
 __all__ = [
     "SUPPORTED_TEMPLATES",
+    "TEMPLATE_FILES",
+    "TEMPLATE_SPECS",
+    "TemplateSpec",
     "build_new_project_plan",
     "format_new_project_plan",
     "format_new_project_result",

@@ -15,7 +15,11 @@ from lunar_forge.runtime.checkpoints import (
     list_checkpoint_directories,
     rollback_file,
 )
-from lunar_forge.runtime.sessions import list_session_files
+from lunar_forge.runtime.sessions import (
+    format_session_summary,
+    list_session_files,
+    load_session,
+)
 from lunar_forge.workflows.new_project import (
     format_new_project_plan,
     format_new_project_result,
@@ -34,6 +38,7 @@ class DefaultCommandGroup(TyperGroup):
             "checkpoints",
             "rollback",
             "sessions",
+            "resume",
             "--help",
             "-h",
         }
@@ -220,6 +225,72 @@ def sessions_command(
             )
     if result.get("truncated") is True:
         typer.echo("- ... additional session files omitted")
+
+
+@app.command("resume")
+def resume_command(
+    session_id_or_file: Annotated[
+        str,
+        typer.Argument(help="Session ID, filename, or project-local session path."),
+    ],
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+    prompt: Annotated[
+        str,
+        typer.Option(
+            "--prompt",
+            help="New instruction to continue after loading historical context.",
+        ),
+    ] = "Continue the previous session safely.",
+    summary_only: Annotated[
+        bool,
+        typer.Option(
+            "--summary-only",
+            help="Print a redacted summary without loading config or a model.",
+        ),
+    ] = False,
+    plan: Annotated[
+        bool,
+        typer.Option("--plan", help="Continue in read-only plan mode."),
+    ] = False,
+    docker: Annotated[
+        bool,
+        typer.Option("--docker", help="Run approved commands in Docker."),
+    ] = False,
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Use Docker bridge networking instead of network isolation.",
+        ),
+    ] = False,
+) -> None:
+    """Safely summarize or continue a previous project session."""
+    project_root = project.expanduser().resolve()
+    try:
+        previous_session = load_session(project_root, session_id_or_file)
+        if summary_only:
+            typer.echo(format_session_summary(previous_session))
+            return
+
+        cli_overrides = _runtime_overrides(plan, docker, allow_network)
+        config = load_config(project_root, cli_overrides=cli_overrides)
+        _validate_network_flag(allow_network, config.runtime.mode)
+        response = run_agent(
+            prompt,
+            project_root,
+            config=config,
+            mode=config.permissions.mode,
+            resume_messages=previous_session.messages,
+            resumed_from=previous_session.relative_path,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(response)
 
 
 def _runtime_overrides(

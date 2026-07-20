@@ -125,6 +125,7 @@ def read_file(
             raise FileNotFoundError("File does not exist.")
         if not file_path.is_file():
             raise IsADirectoryError("Path is not a file.")
+        instruction_stack = _instruction_stack(root, file_path)
 
         content: list[str] = []
         character_count = 0
@@ -162,6 +163,7 @@ def read_file(
             "start_line": first_line,
             "end_line": last_line,
             "truncated": truncated,
+            "instruction_stack": instruction_stack,
         }
     except (OSError, PermissionError, UnicodeError, ValueError) as exc:
         return _error(exc)
@@ -212,6 +214,7 @@ def write_file(
         existed = file_path.exists()
         if existed and not overwrite:
             raise FileExistsError("File already exists; set overwrite=true to replace it.")
+        instruction_stack = _instruction_stack(root, file_path)
 
         old_content = file_path.read_text(encoding="utf-8") if existed else ""
         relative_path = _display_path(root, file_path)
@@ -239,6 +242,7 @@ def write_file(
             "diff": diff,
             "diff_truncated": diff_truncated,
             "checkpoint_path": checkpoint_path,
+            "instruction_stack": instruction_stack,
         }
     except (OSError, PermissionError, UnicodeError, ValueError) as exc:
         return _error(exc)
@@ -264,6 +268,7 @@ def edit_file(
             raise FileNotFoundError("File does not exist.")
         if not file_path.is_file():
             raise IsADirectoryError("Path is not a file.")
+        instruction_stack = _instruction_stack(root, file_path)
 
         old_content = file_path.read_text(encoding="utf-8")
         match_count = old_content.count(old_text)
@@ -291,6 +296,7 @@ def edit_file(
             "diff": diff,
             "diff_truncated": diff_truncated,
             "checkpoint_path": checkpoint_path,
+            "instruction_stack": instruction_stack,
         }
     except (OSError, PermissionError, UnicodeError, ValueError) as exc:
         return _error(exc)
@@ -363,3 +369,11 @@ def _checkpoint_file(root: Path, file_path: Path) -> str:
 
     checkpoint_path = create_file_checkpoint(root, file_path)
     return checkpoint_path.relative_to(root).as_posix()
+
+
+def _instruction_stack(root: Path, file_path: Path) -> list[dict[str, Any]]:
+    # Imported lazily because instruction discovery shares this module's
+    # canonical safe_path implementation.
+    from lunar_forge.instructions import get_instruction_stack_for_path
+
+    return get_instruction_stack_for_path(root, file_path)

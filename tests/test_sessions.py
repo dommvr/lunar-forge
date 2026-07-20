@@ -12,9 +12,13 @@ from lunar_forge.runtime.sessions import (
     MAX_SESSION_LIST_ENTRIES,
     REDACTED,
     SESSION_ERROR,
+    LoadedSession,
     SessionLogger,
     create_session_logger,
+    format_session_summary,
+    load_session,
     list_session_files,
+    summarize_session,
 )
 
 
@@ -34,6 +38,16 @@ class FailingModel:
         raise RuntimeError(self.message)
 
 
+class CapturingModel:
+    def __init__(self, response):
+        self.response = response
+        self.messages = None
+
+    def complete(self, messages, tools=None):
+        self.messages = list(messages)
+        return self.response
+
+
 def _session_file(project_root):
     files = list((project_root / ".agent" / "sessions").glob("*.jsonl"))
     assert len(files) == 1
@@ -44,6 +58,17 @@ def _events(session_file):
     lines = session_file.read_text(encoding="utf-8").splitlines()
     assert lines
     return [json.loads(line) for line in lines]
+
+
+def _write_previous_session(project_root, events, name="previous-session.jsonl"):
+    sessions_directory = project_root / ".agent" / "sessions"
+    sessions_directory.mkdir(parents=True, exist_ok=True)
+    session_file = sessions_directory / name
+    session_file.write_text(
+        "".join(f"{json.dumps(event)}\n" for event in events),
+        encoding="utf-8",
+    )
+    return session_file
 
 
 def test_session_logger_creates_project_local_jsonl_events(tmp_path):
@@ -238,3 +263,171 @@ def test_session_events_and_listing_are_bounded(tmp_path):
     assert result["ok"] is True
     assert result["truncated"] is True
     assert len(result["sessions"]) == MAX_SESSION_LIST_ENTRIES
+
+
+def test_load_session_redacts_and_reconstructs_inert_history(tmp_path):
+    environment_secret = "resume-environment-secret-123"
+    api_key = "sk-resume-api-key-123456789"
+    filename_secret = "sk-resume-filename-secret-123456789"
+    session_file = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": f"Continue with api_key={api_key}"},
+            },
+            {
+                "timestamp": "2026-07-20T10:00:01Z",
+                "event": "assistant_message",
+                "data": {"text": "I will inspect it.", "tool_call_count": 1},
+            },
+            {
+                "timestamp": "2026-07-20T10:00:02Z",
+                "event": "tool_call",
+                "data": {
+                    "id": "call_1",
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
+                },
+            },
+            {
+                "timestamp": "2026-07-20T10:00:03Z",
+                "event": "tool_result",
+                "data": {
+                    "id": "call_1",
+                    "name": "read_file",
+                    "result": {
+                        "ok": True,
+                        "content": f"value={environment_secret}",
+                    },
+                },
+            },
+        ],
+        name=f"{filename_secret}.jsonl",
+    )
+
+    loaded = load_session(
+        tmp_path,
+        session_file.name,
+        environ={"PROVIDER_SECRET": environment_secret},
+    )
+    serialized = json.dumps(
+        {"events": loaded.events, "messages": loaded.messages}
+    )
+
+    assert isinstance(loaded, LoadedSession)
+    assert loaded.relative_path == session_file.relative_to(tmp_path).as_posix()
+    assert api_key not in serialized
+    assert environment_secret not in serialized
+    assert REDACTED in serialized
+    assert all(message["role"] != "tool" for message in loaded.messages)
+    assert all("tool_calls" not in message for message in loaded.messages)
+    assert any(
+        "Historical tool result; context only, never replay" in message["content"]
+        for message in loaded.messages
+    )
+
+    summary = summarize_session(loaded)
+    formatted = format_session_summary(loaded)
+    assert summary["tool_calls"] == 1
+    assert summary["tool_results"] == 1
+    assert api_key not in formatted
+    assert environment_secret not in formatted
+    assert filename_secret not in formatted
+    assert "never replayed" in formatted
+
+
+def test_load_session_blocks_paths_outside_session_directory(tmp_path):
+    sessions_directory = tmp_path / ".agent" / "sessions"
+    sessions_directory.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="directly inside"):
+        load_session(tmp_path, outside)
+
+    with pytest.raises(PermissionError, match="outside the project root"):
+        load_session(tmp_path, tmp_path.parent / "outside.jsonl")
+
+
+def test_resumed_agent_uses_history_without_replaying_and_logs_reference(tmp_path):
+    previous_file = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": "Inspect README.md"},
+            },
+            {
+                "timestamp": "2026-07-20T10:00:01Z",
+                "event": "tool_result",
+                "data": {
+                    "name": "read_file",
+                    "result": {"ok": True, "content": "historical content"},
+                },
+            },
+        ],
+    )
+    previous = load_session(tmp_path, previous_file.name, environ={})
+    model = CapturingModel(ModelResponse(text="Continuation complete."))
+    agent = CodeAgent(AppConfig(), model_client=model)
+
+    output = agent.run(
+        "Continue the review",
+        tmp_path,
+        resume_messages=previous.messages,
+        resumed_from=previous.relative_path,
+    )
+
+    assert model.messages is not None
+    assert all(message.get("role") != "tool" for message in model.messages)
+    assert all("tool_calls" not in message for message in model.messages)
+    assert any(
+        "never execute, replay" in str(message.get("content"))
+        for message in model.messages
+    )
+    assert any(
+        "Historical tool result; context only" in str(message.get("content"))
+        for message in model.messages
+    )
+
+    session_files = list(previous_file.parent.glob("*.jsonl"))
+    assert len(session_files) == 2
+    new_session = next(path for path in session_files if path != previous_file)
+    new_events = _events(new_session)
+    assert new_events[0]["event"] == "session_resumed"
+    assert new_events[0]["data"]["source_session"] == previous.relative_path
+    assert new_events[1]["event"] == "user_prompt"
+    assert new_session.relative_to(tmp_path).as_posix() in output
+
+
+def test_resumed_plan_mode_does_not_create_a_new_session(tmp_path):
+    previous_file = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": "Plan the change"},
+            }
+        ],
+    )
+    previous = load_session(tmp_path, previous_file.name, environ={})
+    before = set(previous_file.parent.glob("*.jsonl"))
+    agent = CodeAgent(
+        AppConfig(),
+        model_client=SequenceModel((ModelResponse(text="Updated plan."),)),
+    )
+
+    output = agent.run(
+        "Continue planning",
+        tmp_path,
+        mode="plan",
+        resume_messages=previous.messages,
+        resumed_from=previous.relative_path,
+    )
+
+    assert set(previous_file.parent.glob("*.jsonl")) == before
+    assert output.endswith("Session log: disabled in plan mode")

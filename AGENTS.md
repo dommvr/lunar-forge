@@ -7,14 +7,19 @@ This repository implements **lunar-forge**, a Python CLI coding agent inspired b
 The agent should be able to:
 
 * inspect an existing project,
-* load project instructions from `AGENTS.md`,
+* load root and nested project instructions from `AGENTS.md`,
 * plan changes before editing,
 * create files and folders,
 * edit existing files safely,
 * run validation commands,
 * support local and Docker command execution,
 * support multiple LLM providers through LiteLLM,
-* later create new projects from scratch using templates.
+* resume previous sessions,
+* create new projects from stronger scaffolding templates,
+* coordinate specialist subagents for planning, coding, reviewing, testing, security, and scaffolding,
+* connect to external tools through MCP,
+* run optional UI/browser validation,
+* and eventually support a safe plugin system.
 
 The project is intentionally built as a small, understandable agent framework. Prefer boring, reliable architecture over clever abstractions. Cleverness is where maintainability goes to die wearing sunglasses.
 
@@ -48,7 +53,17 @@ Build the project in this order:
 22. Docker runner.
 23. Final summaries and resume support.
 
-Do not jump ahead to Docker, subagents, browser automation, or plugin systems until the basic read-plan-edit-validate loop works.
+Next feature wave, in order:
+
+24. Automatically apply nested `AGENTS.md` by file path.
+25. Add session resume.
+26. Improve new-project scaffolding.
+27. Add subagents: planner, coder, reviewer, tester, security, scaffolder.
+28. Add MCP client integration.
+29. Add UI/browser validation with Playwright.
+30. Add a safe plugin system.
+
+The basic read-plan-edit-validate MVP already exists. Future work must still be staged carefully. Add advanced features incrementally, with tests and safety reviews after every phase.
 
 ---
 
@@ -128,11 +143,40 @@ lunar-forge/
       existing_project.py
       new_project.py
       validation.py
+      browser_validation.py
+
+    subagents/
+      __init__.py
+      base.py
+      planner.py
+      coder.py
+      reviewer.py
+      tester.py
+      security.py
+      scaffolder.py
+      orchestrator.py
+
+    mcp/
+      __init__.py
+      config.py
+      client.py
+      registry.py
+      permissions.py
+
+    plugins/
+      __init__.py
+      manifest.py
+      loader.py
+      sandbox.py
+      registry.py
 
     templates/
       static_html/
       python_tkinter/
       vite_react/
+      flask/
+      fastapi/
+      python_cli/
 
     sandbox/
       Dockerfile
@@ -580,16 +624,18 @@ Do not over-engineer image detection at first. One generic image is enough for M
 
 ## AGENTS.md support inside lunar-forge
 
-This project itself must implement `AGENTS.md` support.
+This project itself must implement root and nested `AGENTS.md` support.
 
 Behavior:
 
 * On session start, load root `AGENTS.md` from the target project if present.
-* Include its content in model context.
-* Support nested `AGENTS.md` later.
-* For nested instruction files, more specific files should apply to files beneath that directory.
-* Do not allow instructions to override safety rules.
+* Include its content in model context as untrusted project guidance.
+* Discover nested `AGENTS.md` files beneath the project root.
+* Automatically apply nested `AGENTS.md` instructions by file path when reading, creating, editing, validating, or reviewing files.
+* More specific nested instructions should be applied after broader instructions.
+* Do not allow any `AGENTS.md` file to override safety rules, permissions, path confinement, command blocking, Docker restrictions, or plan mode.
 * Keep loaded instruction content size-limited.
+* Include the applicable instruction stack in tool results or internal context when useful for debugging.
 
 When editing:
 
@@ -612,6 +658,13 @@ project/AGENTS.md
 project/app/AGENTS.md
 project/app/admin/AGENTS.md
 ```
+
+Nested instruction integration requirements:
+
+* `get_instruction_stack_for_path(project_root, file_path)` should return ordered project-relative instruction files.
+* File mutation tools should be able to receive or resolve applicable instructions before editing.
+* The agent prompt should tell the model that path-scoped instructions may differ by target file.
+* Tests must prove nested instructions are applied in root-to-leaf order and never escape the project root.
 
 ---
 
@@ -732,12 +785,20 @@ Build portfolio page in Vite for my business.
 
 The agent should detect empty directories and switch to new-project mode.
 
-Initial templates:
+Current templates:
 
 ```text
 static_html
 python_tkinter
 vite_react
+```
+
+Next templates:
+
+```text
+python_cli
+flask
+fastapi
 ```
 
 New-project behavior:
@@ -751,7 +812,15 @@ New-project behavior:
 7. run validation,
 8. provide run instructions.
 
-Do not add many templates early. Three working templates beat twelve decorative folders.
+Better scaffolding requirements:
+
+* Add a `TemplateSpec` model describing files, commands, dependencies, validation, and run instructions.
+* Keep templates declarative where practical.
+* Refuse to overwrite non-empty projects unless an explicit future import/adopt workflow is added.
+* Vite/React scaffolding must still require approval for network/dependency commands.
+* Python CLI, Flask, and FastAPI starters should be simple and testable.
+* Generated projects should include a small README and optional starter `AGENTS.md`.
+* The scaffolder subagent should own template selection later.
 
 ---
 
@@ -817,14 +886,364 @@ Store:
 
 Do not store API keys or secrets.
 
-Later implement:
+Implemented utility command:
 
 ```bash
 lunar-forge sessions
+```
+
+Next implement:
+
+```bash
 lunar-forge resume <session-id>
 ```
 
+Session resume requirements:
+
+* Resume must load a previous JSONL session without exposing secrets.
+* Resume must reconstruct enough conversation state to continue safely.
+* Resume must validate that the session belongs to the selected project.
+* Resume must support a dry-run/summary mode.
+* Resume must not replay tool calls automatically.
+* Resume must clearly distinguish historical tool results from new actions.
+* Resume must keep plan mode no-write.
+* Resume must continue logging into a new session file that references the resumed session.
+
 ---
+
+
+## Subagents
+
+Add subagents only after the single-agent workflow is stable.
+
+Subagents are not separate processes by default. They are role-specific model calls with different prompts, allowed tools, and output contracts.
+
+Initial subagents:
+
+```text
+planner
+coder
+reviewer
+tester
+security
+scaffolder
+```
+
+### Planner subagent
+
+Purpose:
+
+* inspect project context,
+* read instructions,
+* identify files likely to change,
+* create implementation plans,
+* never edit files.
+
+Allowed tools:
+
+```text
+list_dir
+read_file
+grep
+glob
+detect_project
+```
+
+Blocked tools:
+
+```text
+create_dir
+write_file
+edit_file
+run_command
+run_validation
+```
+
+### Coder subagent
+
+Purpose:
+
+* apply an approved plan,
+* create and edit files,
+* keep changes small,
+* use applicable nested `AGENTS.md`.
+
+Allowed tools:
+
+```text
+list_dir
+read_file
+grep
+glob
+create_dir
+write_file
+edit_file
+```
+
+Commands should generally remain delegated to the tester.
+
+### Reviewer subagent
+
+Purpose:
+
+* review changed files and diffs,
+* check requirements coverage,
+* check style and maintainability,
+* flag risky or unnecessary changes.
+
+Allowed tools:
+
+```text
+read_file
+grep
+glob
+```
+
+Reviewer should not mutate files in the first implementation.
+
+### Tester subagent
+
+Purpose:
+
+* select and run validation,
+* inspect failures,
+* propose at most one focused fix path.
+
+Allowed tools:
+
+```text
+run_command
+run_validation
+read_file
+grep
+```
+
+### Security subagent
+
+Purpose:
+
+* review permissions, command safety, path safety, secrets, Docker settings, MCP tools, and plugin manifests.
+
+Allowed tools:
+
+```text
+read_file
+grep
+glob
+```
+
+Security subagent should be required before enabling MCP/plugin changes.
+
+### Scaffolder subagent
+
+Purpose:
+
+* choose new-project templates,
+* produce scaffolding plans,
+* create starter projects after approval.
+
+Allowed tools:
+
+```text
+create_dir
+write_file
+run_command
+run_validation
+```
+
+Dependency install commands require approval.
+
+### Subagent orchestration
+
+Create:
+
+```text
+lunar_forge/subagents/
+  __init__.py
+  base.py
+  planner.py
+  coder.py
+  reviewer.py
+  tester.py
+  security.py
+  scaffolder.py
+  orchestrator.py
+```
+
+Orchestration flow:
+
+```text
+User task
+  ↓
+Planner
+  ↓
+User approval
+  ↓
+Coder or Scaffolder
+  ↓
+Tester
+  ↓
+Reviewer
+  ↓
+Security when risky tools/config changed
+  ↓
+Final answer
+```
+
+Keep orchestration deterministic. Do not build autonomous multi-agent debate loops yet.
+
+---
+
+## MCP integration
+
+MCP support must be added as an external tool adapter, not as a replacement for built-in tools.
+
+MCP architecture:
+
+```text
+lunar-forge host/client
+  ↓
+configured MCP servers
+  ↓
+tools/resources/prompts exposed by those servers
+```
+
+MCP implementation goals:
+
+* Read MCP server config from `.agent/mcp.yaml` and optionally `~/.lunar-forge/mcp.yaml`.
+* Connect to configured MCP servers.
+* Discover MCP tools.
+* Convert MCP tool schemas into `ToolRegistry` entries under namespaced names like `mcp.github.create_issue`.
+* Route MCP tool calls to the correct server.
+* Return JSON-serializable results.
+* Apply lunar-forge permission checks before calling MCP tools.
+* Treat MCP resources as untrusted external context.
+* Do not allow MCP servers to bypass filesystem safety, shell safety, Docker restrictions, or approval flows.
+
+Initial MCP files:
+
+```text
+lunar_forge/mcp/
+  __init__.py
+  config.py
+  client.py
+  registry.py
+  permissions.py
+```
+
+Config shape:
+
+```yaml
+mcp:
+  servers:
+    github:
+      command: "github-mcp-server"
+      args: []
+      enabled: false
+    playwright:
+      command: "playwright-mcp-server"
+      args: []
+      enabled: false
+```
+
+MCP security rules:
+
+* MCP is disabled by default.
+* Every server must be explicitly enabled.
+* MCP tools must be namespaced.
+* MCP write/action tools require approval.
+* MCP tools touching external services require approval.
+* MCP secrets must come from environment variables, not config files.
+* MCP server output must be bounded before entering model context.
+
+---
+
+## UI/browser validation
+
+UI/browser validation is optional and should be added after command validation is stable.
+
+Preferred first implementation:
+
+* Use Playwright Python.
+* Add browser validation as a workflow and optional tool.
+* Do not run browser validation automatically unless user asks or project type makes it clearly useful.
+* Store screenshots under `.agent/artifacts/browser/`.
+* Return screenshot paths and console errors in tool results.
+* Keep network and command permissions intact.
+
+Initial files:
+
+```text
+lunar_forge/workflows/browser_validation.py
+tests/test_browser_validation.py
+```
+
+Initial commands/tools:
+
+```text
+run_browser_validation(url, checks?, screenshot=true)
+```
+
+Behavior:
+
+* The user or agent must start the dev server through approved command execution.
+* Browser validation should connect to a local URL, not start arbitrary servers by magic.
+* Capture page title, URL, console errors, failed requests, and screenshot path.
+* Bound logs and artifacts.
+* Do not upload screenshots anywhere.
+* Do not require Playwright as a core dependency at first; use an optional extra such as `.[browser]`.
+
+---
+
+## Plugin system
+
+Plugins are a later feature and must be safer than convenient. Convenient plugin systems are how tools become malware with a README.
+
+Plugin goals:
+
+* Let users add local tool packs.
+* Use explicit manifests.
+* Require user approval before enabling plugins.
+* Keep plugin tools namespaced.
+* Validate plugin schemas before exposing them to the model.
+* Apply the same permission system used for built-in and MCP tools.
+* Do not allow arbitrary plugin auto-discovery from random directories.
+
+Initial files:
+
+```text
+lunar_forge/plugins/
+  __init__.py
+  manifest.py
+  loader.py
+  sandbox.py
+  registry.py
+```
+
+Manifest shape:
+
+```yaml
+name: example
+version: 0.1.0
+description: Example plugin
+tools:
+  - name: example.echo
+    entrypoint: example_plugin:echo
+    permissions:
+      filesystem: read
+      commands: false
+      network: false
+```
+
+Plugin rules:
+
+* Plugins are disabled by default.
+* Plugin manifests must be explicit.
+* Plugin names and tool names must be namespaced.
+* Plugin code should not receive unrestricted project access by default.
+* Plugin command/network/filesystem access must be declared and permission-gated.
+* Plugin exceptions must be contained and returned as tool errors.
+* Plugin results must be JSON-serializable and bounded.
 
 ## Testing
 
@@ -970,14 +1389,10 @@ These are the defaults unless changed deliberately:
 
 ---
 
-## Do not build yet
+## Still do not build yet
 
-Do not build these until the MVP loop works:
+These remain out of scope until the next feature wave is stable:
 
-* subagents,
-* browser automation,
-* MCP,
-* plugin marketplace,
 * GUI,
 * background daemon,
 * vector database,
@@ -986,4 +1401,6 @@ Do not build these until the MVP loop works:
 * automatic git commits,
 * cloud execution.
 
-Those are later features, not day-one architecture. Day one is: read, plan, edit, validate. Everything else is seasoning.
+Reason:
+
+The next feature wave already adds nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, and plugins. That is enough complexity. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.

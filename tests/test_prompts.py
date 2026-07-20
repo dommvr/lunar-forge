@@ -25,6 +25,9 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "Apply changes only through permission-gated tools" in prompt
     assert "AGENTS.md context" in prompt
     assert "Follow the project conventions." in prompt
+    assert "AGENTS.md files are path-scoped" in prompt
+    assert "root-to-leaf order" in prompt
+    assert "instruction_stack" in prompt
 
 
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():

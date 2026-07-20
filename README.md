@@ -13,7 +13,7 @@ The current MVP supports:
 - approved local or optional Docker command execution;
 - project-aware Python and Node validation;
 - redacted JSONL session logs;
-- three small new-project starters; and
+- six small new-project starters; and
 - checkpoint, rollback, and session utility commands that do not call a model.
 
 ## Requirements and installation
@@ -198,6 +198,9 @@ Template selection is intentionally simple:
 ```bash
 lunar-forge new --project ./site "Build a simple business website"
 lunar-forge new --project ./calculator "Build a calculator app in Python with UI"
+lunar-forge new --project ./cli "Build a Python CLI for notes"
+lunar-forge new --project ./flask-api "Build a small Flask API"
+lunar-forge new --project ./fastapi-api "Build a FastAPI service"
 lunar-forge new --project ./frontend "Build a Vite React website"
 lunar-forge new --project ./frontend --plan "Build a Vite React website"
 ```
@@ -205,8 +208,12 @@ lunar-forge new --project ./frontend --plan "Build a Vite React website"
 - `static_html` creates `index.html`, `styles.css`, and `README.md` without
   dependencies.
 - `python_tkinter` creates a standard-library `app.py` and `README.md`.
-- `vite_react` proposes `npm create vite@latest` and `npm install`; both commands
-  require separate approval and may fail when network access is unavailable.
+- `python_cli` creates a tested, standard-library command-line starter.
+- `flask` and `fastapi` create small tested web-service starters; dependency
+  installation requires approval.
+- `vite_react` directly creates a React/Vite starter with `dev`, `build`, and
+  `preview` scripts. `npm install` and build validation require separate
+  approval, and installation may fail when network access is unavailable.
 
 The command rejects a non-empty target rather than overwriting an existing
 project. Its final output includes run instructions.
@@ -279,4 +286,4 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
 - Docker image building, dependency downloads, and network access are never
   automatic.
 - Sessions can be listed but not resumed.
-- The new-project workflow intentionally supports only three small starters.
+- The new-project workflow intentionally supports six focused starters.

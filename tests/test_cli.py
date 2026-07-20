@@ -1,9 +1,11 @@
+import json
 from datetime import datetime, timezone
 
 from typer.testing import CliRunner
 
 import lunar_forge.cli as cli_module
 from lunar_forge.cli import app
+from lunar_forge.config import AppConfig
 from lunar_forge.runtime.checkpoints import create_file_checkpoint
 
 
@@ -81,3 +83,91 @@ def test_rollback_command_clearly_reports_no_checkpoint(monkeypatch, tmp_path):
 
     assert result.exit_code == 1
     assert "No checkpoint exists for missing.txt" in result.stderr
+
+
+def test_resume_summary_only_is_redacted_and_model_free(monkeypatch, tmp_path):
+    _forbid_model_and_config(monkeypatch)
+    sessions_directory = tmp_path / ".agent" / "sessions"
+    sessions_directory.mkdir(parents=True)
+    secret = "sk-resume-cli-secret-123456789"
+    session = sessions_directory / "20260720T100000000000Z-abcdef12.jsonl"
+    session.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": f"api_key={secret}"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "resume",
+            "abcdef12",
+            "--project",
+            str(tmp_path),
+            "--summary-only",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Session:" in result.stdout
+    assert "Historical tool results" in result.stdout
+    assert secret not in result.stdout
+    assert len(list(sessions_directory.glob("*.jsonl"))) == 1
+
+
+def test_resume_command_passes_inert_history_to_agent(monkeypatch, tmp_path):
+    sessions_directory = tmp_path / ".agent" / "sessions"
+    sessions_directory.mkdir(parents=True)
+    session = sessions_directory / "previous.jsonl"
+    session.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "tool_result",
+                "data": {"name": "read_file", "result": {"ok": True}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    monkeypatch.setattr(cli_module, "load_config", lambda *args, **kwargs: AppConfig())
+
+    def fake_run_agent(prompt, project_root, **kwargs):
+        captured.update(
+            {
+                "prompt": prompt,
+                "project_root": project_root,
+                **kwargs,
+            }
+        )
+        return "Resumed safely."
+
+    monkeypatch.setattr(cli_module, "run_agent", fake_run_agent)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "resume",
+            session.name,
+            "--project",
+            str(tmp_path),
+            "--prompt",
+            "Continue reviewing",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "Resumed safely."
+    assert captured["prompt"] == "Continue reviewing"
+    assert captured["resumed_from"] == session.relative_to(tmp_path).as_posix()
+    assert all(
+        message["role"] != "tool" for message in captured["resume_messages"]
+    )
