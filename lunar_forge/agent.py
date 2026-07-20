@@ -9,7 +9,12 @@ from typing import Any
 
 from lunar_forge.config import AppConfig, load_config
 from lunar_forge.instructions import load_project_instructions
-from lunar_forge.model_clients import LiteLLMClient, ModelClient, ModelResponse, ToolCall
+from lunar_forge.model_clients import (
+    ModelClient,
+    ModelResponse,
+    ToolCall,
+    create_litellm_client,
+)
 from lunar_forge.permissions import ApprovalCallback, PermissionManager
 from lunar_forge.planning import Plan
 from lunar_forge.project_detection import detect_project
@@ -175,13 +180,14 @@ class CodeAgent:
             )
             raise
 
-    def _create_model_client(self) -> LiteLLMClient:
+    def _create_model_client(self) -> ModelClient:
         if self.config.model.provider != "litellm":
             raise AgentError(
                 f"Unsupported model provider: {self.config.model.provider}. "
                 "This milestone supports LiteLLM only."
             )
-        return LiteLLMClient(
+        return create_litellm_client(
+            api=self.config.model.api,
             model=self.config.model.model,
             api_key_env=self.config.model.api_key_env,
             api_base=self.config.model.api_base,

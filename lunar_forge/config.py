@@ -20,6 +20,7 @@ class ModelConfig:
     model: str = "openai/gpt-5.5"
     api_key_env: str | None = "OPENAI_API_KEY"
     api_base: str | None = None
+    api: str = "chat"  # chat | responses
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ def load_config(
             model=str(model_data["model"]),
             api_key_env=_optional_string(model_data.get("api_key_env")),
             api_base=_optional_string(model_data.get("api_base")),
+            api=_model_api(model_data["api"]),
         ),
         runtime=RuntimeConfig(
             mode=_runtime_mode(runtime_data["mode"]),
@@ -114,6 +116,7 @@ def _default_config() -> dict[str, Any]:
             "model": "openai/gpt-5.5",
             "api_key_env": "OPENAI_API_KEY",
             "api_base": None,
+            "api": "chat",
         },
         "runtime": {
             "mode": "local",
@@ -130,6 +133,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
     mappings = {
         "LUNAR_FORGE_MODEL_PROVIDER": ("model", "provider"),
         "LUNAR_FORGE_MODEL": ("model", "model"),
+        "LUNAR_FORGE_MODEL_API": ("model", "api"),
         "LUNAR_FORGE_API_KEY_ENV": ("model", "api_key_env"),
         "LUNAR_FORGE_API_BASE": ("model", "api_base"),
         "LUNAR_FORGE_RUNTIME_MODE": ("runtime", "mode"),
@@ -165,6 +169,13 @@ def _runtime_mode(value: Any) -> str:
             "runtime.mode must be one of: local, docker, no-command."
         )
     return mode
+
+
+def _model_api(value: Any) -> str:
+    api = str(value).strip().lower()
+    if api not in {"chat", "responses"}:
+        raise ValueError("model.api must be one of: chat, responses.")
+    return api
 
 
 def _as_bool(value: Any, name: str) -> bool:

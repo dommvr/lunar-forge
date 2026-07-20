@@ -24,6 +24,11 @@ class ModelResponse:
     model: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
 
+    @property
+    def content(self) -> str:
+        """Compatibility alias for callers that describe model text as content."""
+        return self.text
+
 
 class ModelClient(Protocol):
     """Provider-independent synchronous model interface."""

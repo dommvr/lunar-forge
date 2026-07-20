@@ -51,6 +51,7 @@ Example configuration:
 ```yaml
 model:
   provider: litellm
+  api: chat
   model: openai/gpt-5.5
   api_key_env: OPENAI_API_KEY
   api_base: null
@@ -74,6 +75,7 @@ Supported environment overrides are:
 
 - `LUNAR_FORGE_MODEL_PROVIDER`
 - `LUNAR_FORGE_MODEL`
+- `LUNAR_FORGE_MODEL_API`
 - `LUNAR_FORGE_API_KEY_ENV`
 - `LUNAR_FORGE_API_BASE`
 - `LUNAR_FORGE_RUNTIME_MODE`
@@ -85,6 +87,23 @@ local OpenAI-compatible service. For example, an Ollama model can use
 `ollama/qwen2.5-coder` with `api_base: http://localhost:11434`. Local models may
 have unreliable tool-calling support, so read-only planning is the safer first
 test.
+
+`model.api` defaults to `chat`, preserving the existing
+`litellm.completion()` path. Set it to `responses` for models that need
+LiteLLM's Responses API, including GPT-5.6 reasoning with function tools:
+
+```yaml
+model:
+  provider: litellm
+  api: responses
+  model: openai/gpt-5.6-terra
+  api_key_env: OPENAI_API_KEY
+  api_base: null
+```
+
+Responses mode requires a LiteLLM release that exposes `litellm.responses`
+(LiteLLM documents support in 1.63.8 and newer). If that function is unavailable,
+LunarForge reports a clear upgrade-or-use-chat error.
 
 ## Basic usage
 

@@ -35,18 +35,24 @@ class LiteLLMClient:
         }
         if tools:
             request["tools"] = [dict(tool) for tool in tools]
+        request.update(self._request_options())
+
+        response = _litellm_completion(**request)
+        return _normalize_response(response, fallback_model=self.model)
+
+    def _request_options(self) -> dict[str, Any]:
+        """Return shared LiteLLM connection options without retaining a raw key."""
+        options: dict[str, Any] = {}
         if self.api_base:
-            request["api_base"] = self.api_base
+            options["api_base"] = self.api_base
         if self.api_key_env:
             api_key = os.getenv(self.api_key_env)
             if not api_key:
                 raise RuntimeError(
                     f"API key environment variable is not set: {self.api_key_env}"
                 )
-            request["api_key"] = api_key
-
-        response = _litellm_completion(**request)
-        return _normalize_response(response, fallback_model=self.model)
+            options["api_key"] = api_key
+        return options
 
 
 def _litellm_completion(**request: Any) -> Any:
