@@ -76,10 +76,17 @@ def run(
             help="Use Docker bridge networking instead of network isolation.",
         ),
     ] = False,
+    subagents: Annotated[
+        bool,
+        typer.Option(
+            "--subagents",
+            help="Use the deterministic specialist subagent workflow.",
+        ),
+    ] = False,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
-    cli_overrides = _runtime_overrides(plan, docker, allow_network)
+    cli_overrides = _runtime_overrides(plan, docker, allow_network, subagents)
 
     try:
         config = load_config(project_root, cli_overrides=cli_overrides)
@@ -122,10 +129,17 @@ def new_project(
             help="Use Docker bridge networking instead of network isolation.",
         ),
     ] = False,
+    subagents: Annotated[
+        bool,
+        typer.Option(
+            "--subagents",
+            help="Use specialist phases for scaffolding, testing, and review.",
+        ),
+    ] = False,
 ) -> None:
     """Create a small starter project from a built-in template."""
     project_root = project.expanduser().resolve()
-    cli_overrides = _runtime_overrides(plan, docker, allow_network)
+    cli_overrides = _runtime_overrides(plan, docker, allow_network, subagents)
     template = select_template(prompt)
 
     try:
@@ -139,6 +153,7 @@ def new_project(
             template=template,
             runtime_mode=config.runtime.mode,
             allow_network=config.runtime.allow_network,
+            subagents_enabled=config.subagents.enabled,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -266,6 +281,13 @@ def resume_command(
             help="Use Docker bridge networking instead of network isolation.",
         ),
     ] = False,
+    subagents: Annotated[
+        bool,
+        typer.Option(
+            "--subagents",
+            help="Continue with the deterministic specialist workflow.",
+        ),
+    ] = False,
 ) -> None:
     """Safely summarize or continue a previous project session."""
     project_root = project.expanduser().resolve()
@@ -275,7 +297,12 @@ def resume_command(
             typer.echo(format_session_summary(previous_session))
             return
 
-        cli_overrides = _runtime_overrides(plan, docker, allow_network)
+        cli_overrides = _runtime_overrides(
+            plan,
+            docker,
+            allow_network,
+            subagents,
+        )
         config = load_config(project_root, cli_overrides=cli_overrides)
         _validate_network_flag(allow_network, config.runtime.mode)
         response = run_agent(
@@ -297,6 +324,7 @@ def _runtime_overrides(
     plan: bool,
     docker: bool,
     allow_network: bool,
+    subagents: bool = False,
 ) -> dict[str, dict[str, object]] | None:
     overrides: dict[str, dict[str, object]] = {}
     if plan:
@@ -308,6 +336,8 @@ def _runtime_overrides(
         runtime["allow_network"] = True
     if runtime:
         overrides["runtime"] = runtime
+    if subagents:
+        overrides["subagents"] = {"enabled": True}
     return overrides or None
 
 

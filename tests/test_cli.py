@@ -171,3 +171,21 @@ def test_resume_command_passes_inert_history_to_agent(monkeypatch, tmp_path):
     assert all(
         message["role"] != "tool" for message in captured["resume_messages"]
     )
+
+
+def test_subagents_flag_is_available_and_sets_cli_override():
+    runner = CliRunner()
+
+    for command in ("run", "new", "resume"):
+        result = runner.invoke(app, [command, "--help"])
+
+        assert result.exit_code == 0
+        assert "--subagents" in result.stdout
+
+    overrides = cli_module._runtime_overrides(
+        False,
+        False,
+        False,
+        True,
+    )
+    assert overrides == {"subagents": {"enabled": True}}

@@ -9,6 +9,14 @@ from typing import Any
 from lunar_forge.permissions import ApprovalCallback
 from lunar_forge.project_detection import detect_project
 from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
+from lunar_forge.subagents import (
+    REVIEWER_ROLE,
+    SCAFFOLDER_ROLE,
+    TESTER_ROLE,
+    RestrictedToolRegistry,
+    SubagentOrchestrator,
+    WorkflowKind,
+)
 from lunar_forge.tools.files import IGNORED_DIRECTORIES, safe_path
 from lunar_forge.tools.registry import ToolRegistry, create_tool_registry
 
@@ -211,6 +219,7 @@ def run_new_project(
     template: TemplateName | None = None,
     runtime_mode: str = "local",
     allow_network: bool = False,
+    subagents_enabled: bool = False,
 ) -> dict[str, Any]:
     """Plan or create a starter project without overwriting existing work."""
     root = Path(project_root).expanduser().resolve()
@@ -219,6 +228,15 @@ def run_new_project(
     spec = TEMPLATE_SPECS[selected_template]
     plan = build_new_project_plan(selected_template)
     normalized_mode = mode.strip().lower() or "default"
+    planned_subagents = (
+        list(
+            SubagentOrchestrator()
+            .build_phase_plan(WorkflowKind.NEW_PROJECT)
+            .role_names
+        )
+        if subagents_enabled
+        else []
+    )
     base_result: dict[str, Any] = {
         "template": selected_template,
         "plan": plan,
@@ -233,6 +251,10 @@ def run_new_project(
         "checkpoints": [],
         "run_instructions": list(spec.run_instructions),
         "session_log": None,
+        "subagents_enabled": subagents_enabled,
+        "planned_subagents": planned_subagents,
+        "subagents_run": [],
+        "review": [],
     }
 
     if not root.is_dir():
@@ -271,19 +293,27 @@ def run_new_project(
         runtime_mode=runtime_mode,
         allow_network=allow_network,
     )
-    result = _copy_template_files(
-        spec,
-        registry,
-        base_result,
-        session,
-    )
-    if result.get("ok") is True:
-        result = _run_declared_commands(
+    if subagents_enabled:
+        result = _run_subagent_new_project(
             spec,
             registry,
-            result,
+            base_result,
             session,
         )
+    else:
+        result = _copy_template_files(
+            spec,
+            registry,
+            base_result,
+            session,
+        )
+        if result.get("ok") is True:
+            result = _run_declared_commands(
+                spec,
+                registry,
+                result,
+                session,
+            )
 
     _log(
         session,
@@ -315,6 +345,8 @@ def format_new_project_result(result: dict[str, Any]) -> str:
 
     _append_list(lines, "Checkpoints", result.get("checkpoints"))
     _append_list(lines, "Run instructions", result.get("run_instructions"))
+    if result.get("subagents_enabled") is True:
+        _append_list(lines, "Subagents run", result.get("subagents_run"))
     lines.extend(("", "Notes:", f"- {result.get('message', '')}"))
     session_log = result.get("session_log") or "disabled or unavailable"
     lines.append(f"- Session log: {session_log}")
@@ -330,9 +362,125 @@ def run(
     return run_new_project(prompt, root, **kwargs)
 
 
-def _copy_template_files(
+def _run_subagent_new_project(
     spec: TemplateSpec,
     registry: ToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
+    scaffolder_registry = SCAFFOLDER_ROLE.restrict(registry)
+    _start_subagent(result, session, SCAFFOLDER_ROLE.name)
+    result = _copy_template_files(
+        spec,
+        scaffolder_registry,
+        result,
+        session,
+    )
+    if result.get("ok") is True:
+        result = _run_setup_commands(
+            spec,
+            scaffolder_registry,
+            result,
+            session,
+        )
+    _complete_subagent(result, session, SCAFFOLDER_ROLE.name)
+    if result.get("ok") is not True:
+        return result
+
+    tester_registry = TESTER_ROLE.restrict(registry)
+    _start_subagent(result, session, TESTER_ROLE.name)
+    result = _run_validation_commands(
+        spec,
+        tester_registry,
+        result,
+        session,
+    )
+    _complete_subagent(result, session, TESTER_ROLE.name)
+
+    reviewer_registry = REVIEWER_ROLE.restrict(registry)
+    _start_subagent(result, session, REVIEWER_ROLE.name)
+    result = _review_generated_project(
+        spec,
+        reviewer_registry,
+        result,
+        session,
+    )
+    _complete_subagent(result, session, REVIEWER_ROLE.name)
+    return result
+
+
+def _review_generated_project(
+    spec: TemplateSpec,
+    registry: RestrictedToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
+    issues: list[str] = []
+    for relative_path in spec.files:
+        arguments = {"path": relative_path, "start_line": 1, "end_line": 1}
+        _log(
+            session,
+            "tool_call",
+            subagent=REVIEWER_ROLE.name,
+            name="read_file",
+            arguments=arguments,
+        )
+        tool_result = registry.execute("read_file", arguments)
+        _log(
+            session,
+            "tool_result",
+            subagent=REVIEWER_ROLE.name,
+            name="read_file",
+            result=tool_result,
+        )
+        if tool_result.get("ok") is not True:
+            issues.append(
+                f"Could not review {relative_path}: "
+                f"{tool_result.get('error', 'read failed')}"
+            )
+
+    if issues:
+        result["review"].extend(issues)
+        result.update(
+            ok=False,
+            message=(
+                f"Created the {spec.name} starter, but review found unreadable files."
+            ),
+        )
+        return result
+
+    result["review"].append(
+        f"Reviewer confirmed all {len(spec.files)} declared starter files are readable."
+    )
+    return result
+
+
+def _start_subagent(
+    result: dict[str, Any],
+    session: SessionLogger | None,
+    role_name: str,
+) -> None:
+    result["subagents_run"].append(role_name)
+    _log(session, "subagent_started", role=role_name)
+
+
+def _complete_subagent(
+    result: dict[str, Any],
+    session: SessionLogger | None,
+    role_name: str,
+) -> None:
+    _log(
+        session,
+        "subagent_completed",
+        role=role_name,
+        ok=result.get("ok"),
+        message=result.get("message"),
+    )
+
+
+def _copy_template_files(
+    spec: TemplateSpec,
+    registry: ToolRegistry | RestrictedToolRegistry,
     result: dict[str, Any],
     session: SessionLogger | None,
 ) -> dict[str, Any]:
@@ -380,6 +528,18 @@ def _run_declared_commands(
     result: dict[str, Any],
     session: SessionLogger | None,
 ) -> dict[str, Any]:
+    result = _run_setup_commands(spec, registry, result, session)
+    if result.get("ok") is not True:
+        return result
+    return _run_validation_commands(spec, registry, result, session)
+
+
+def _run_setup_commands(
+    spec: TemplateSpec,
+    registry: ToolRegistry | RestrictedToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
     for command in spec.commands:
         command_result = _execute_command(command, registry, result, session)
         if command_result.get("ok") is not True:
@@ -391,7 +551,15 @@ def _run_declared_commands(
                 ),
             )
             return result
+    return result
 
+
+def _run_validation_commands(
+    spec: TemplateSpec,
+    registry: ToolRegistry | RestrictedToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
     for command in spec.validation:
         command_result = _execute_command(command, registry, result, session)
         if command_result.get("ok") is True:
@@ -414,7 +582,7 @@ def _run_declared_commands(
 
 def _execute_command(
     command: str,
-    registry: ToolRegistry,
+    registry: ToolRegistry | RestrictedToolRegistry,
     result: dict[str, Any],
     session: SessionLogger | None,
 ) -> dict[str, Any]:

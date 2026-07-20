@@ -1,4 +1,9 @@
-from lunar_forge.prompts import build_system_prompt
+from lunar_forge.prompts import (
+    build_subagent_system_prompt,
+    build_subagent_user_prompt,
+    build_system_prompt,
+)
+from lunar_forge.subagents import CODER_ROLE, PLANNER_ROLE
 from lunar_forge.tools.registry import create_tool_registry
 
 
@@ -86,3 +91,35 @@ def test_existing_read_and_execution_tools_remain_available(tmp_path):
         "run_validation",
         "write_file",
     }.issubset(registry.names())
+
+
+def test_subagent_system_prompt_includes_mandatory_role_boundary():
+    base_prompt = build_system_prompt(
+        PROJECT_INFO,
+        "No extra instructions.",
+        "default",
+    )
+
+    prompt = build_subagent_system_prompt(base_prompt, PLANNER_ROLE)
+
+    assert "Active subagent role: planner" in prompt
+    assert "Role instructions:" in prompt
+    assert "Allowed tools:" in prompt
+    assert "read_file" in prompt
+    assert "write_file" in prompt
+    assert "deny-by-default" in prompt
+
+
+def test_subagent_handoff_is_bounded_and_cannot_expand_permissions():
+    prompt = build_subagent_user_prompt(
+        "Update the app",
+        CODER_ROLE,
+        {"planner": "Plan output"},
+        ("app.py",),
+    )
+
+    assert "Original user request:\nUpdate the app" in prompt
+    assert "Active phase: coder" in prompt
+    assert "[planner]\nPlan output" in prompt
+    assert "- app.py" in prompt
+    assert "subject to the existing tool approval policy" in prompt

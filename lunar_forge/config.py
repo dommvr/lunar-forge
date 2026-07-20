@@ -35,10 +35,16 @@ class PermissionConfig:
 
 
 @dataclass(frozen=True)
+class SubagentConfig:
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    subagents: SubagentConfig = field(default_factory=SubagentConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -82,6 +88,7 @@ def load_config(
     model_data = _section(merged, "model")
     runtime_data = _section(merged, "runtime")
     permissions_data = _section(merged, "permissions")
+    subagents_data = _section(merged, "subagents")
 
     if "api_key" in model_data:
         raise ValueError(
@@ -106,6 +113,12 @@ def load_config(
         permissions=PermissionConfig(
             mode=str(permissions_data["mode"]),
         ),
+        subagents=SubagentConfig(
+            enabled=_as_bool(
+                subagents_data["enabled"],
+                "subagents.enabled",
+            ),
+        ),
     )
 
 
@@ -125,6 +138,9 @@ def _default_config() -> dict[str, Any]:
         "permissions": {
             "mode": "default",
         },
+        "subagents": {
+            "enabled": False,
+        },
     }
 
 
@@ -139,6 +155,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_RUNTIME_MODE": ("runtime", "mode"),
         "LUNAR_FORGE_ALLOW_NETWORK": ("runtime", "allow_network"),
         "LUNAR_FORGE_PERMISSION_MODE": ("permissions", "mode"),
+        "LUNAR_FORGE_SUBAGENTS": ("subagents", "enabled"),
     }
 
     for variable, (section, key) in mappings.items():
