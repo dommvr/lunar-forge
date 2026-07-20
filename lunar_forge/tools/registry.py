@@ -417,6 +417,43 @@ def _execution_tools(
             ),
             permission=PermissionLevel.EXECUTE,
         ),
+        Tool(
+            name="run_browser_validation",
+            description=(
+                "Inspect an already-running local web page with optional Playwright "
+                "support after approval; this never starts a development server."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": (
+                            "Local loopback HTTP(S) URL, such as "
+                            "http://127.0.0.1:8000."
+                        ),
+                    },
+                    "screenshot": {
+                        "type": "boolean",
+                        "description": "Capture a bounded viewport screenshot.",
+                        "default": True,
+                    },
+                    "checks": {
+                        "type": "array",
+                        "description": (
+                            "Optional CSS selectors that must each match at least "
+                            "one element."
+                        ),
+                        "items": {"type": "string", "maxLength": 500},
+                        "maxItems": 20,
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+            handler=partial(_run_browser_validation, project_root),
+            permission=PermissionLevel.EXECUTE,
+        ),
     )
 
 
@@ -435,4 +472,21 @@ def _run_validation(
         timeout_ms,
         runtime_mode=runtime_mode,
         allow_network=allow_network,
+    )
+
+
+def _run_browser_validation(
+    project_root: str | Path,
+    url: str,
+    screenshot: bool = True,
+    checks: list[str] | None = None,
+) -> dict[str, Any]:
+    """Import the optional browser workflow only after tool approval."""
+    from lunar_forge.workflows.browser_validation import run_browser_validation
+
+    return run_browser_validation(
+        url,
+        screenshot=screenshot,
+        checks=checks,
+        project_root=project_root,
     )
