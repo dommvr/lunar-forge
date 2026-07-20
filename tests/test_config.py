@@ -82,6 +82,27 @@ def test_subagents_can_be_enabled_by_environment(monkeypatch, tmp_path):
     assert load_config(project).subagents.enabled is True
 
 
+def test_mcp_integration_defaults_to_disabled(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert load_config(project).mcp.enabled is False
+
+
+def test_mcp_integration_requires_explicit_config_enablement(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    config_directory = project / ".agent"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.yaml").write_text(
+        "mcp:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(project).mcp.enabled is True
+
+
 @pytest.mark.parametrize("api", ("chat", "responses"))
 def test_model_api_loads_supported_modes(monkeypatch, tmp_path, api):
     _isolate_user_config(monkeypatch, tmp_path / "home")

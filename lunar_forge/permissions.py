@@ -111,6 +111,8 @@ class PermissionManager:
         permission: PermissionLevel,
         tool_name: str,
         arguments: Mapping[str, Any],
+        *,
+        plan_safe: bool = False,
     ) -> PermissionDecision:
         normalized_mode = self.mode.strip().lower()
         if permission is PermissionLevel.READ:
@@ -139,7 +141,9 @@ class PermissionManager:
                     allowed=False,
                     reason="Command must be a string.",
                 )
-        if normalized_mode == "plan":
+        if normalized_mode == "plan" and not (
+            permission is PermissionLevel.NETWORK and plan_safe
+        ):
             return PermissionDecision(
                 allowed=False,
                 reason="Plan mode blocks write and execution tools.",

@@ -40,11 +40,19 @@ class SubagentConfig:
 
 
 @dataclass(frozen=True)
+class MCPRuntimeConfig:
+    """Experimental MCP integration switch; individual servers opt in separately."""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
     subagents: SubagentConfig = field(default_factory=SubagentConfig)
+    mcp: MCPRuntimeConfig = field(default_factory=MCPRuntimeConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -89,6 +97,7 @@ def load_config(
     runtime_data = _section(merged, "runtime")
     permissions_data = _section(merged, "permissions")
     subagents_data = _section(merged, "subagents")
+    mcp_data = _section(merged, "mcp")
 
     if "api_key" in model_data:
         raise ValueError(
@@ -119,6 +128,12 @@ def load_config(
                 "subagents.enabled",
             ),
         ),
+        mcp=MCPRuntimeConfig(
+            enabled=_as_bool(
+                mcp_data["enabled"],
+                "mcp.enabled",
+            ),
+        ),
     )
 
 
@@ -141,6 +156,9 @@ def _default_config() -> dict[str, Any]:
         "subagents": {
             "enabled": False,
         },
+        "mcp": {
+            "enabled": False,
+        },
     }
 
 
@@ -156,6 +174,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_ALLOW_NETWORK": ("runtime", "allow_network"),
         "LUNAR_FORGE_PERMISSION_MODE": ("permissions", "mode"),
         "LUNAR_FORGE_SUBAGENTS": ("subagents", "enabled"),
+        "LUNAR_FORGE_MCP_ENABLED": ("mcp", "enabled"),
     }
 
     for variable, (section, key) in mappings.items():

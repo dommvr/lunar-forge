@@ -62,6 +62,10 @@ runtime:
 
 permissions:
   mode: default
+
+# Experimental and disabled unless explicitly enabled.
+mcp:
+  enabled: false
 ```
 
 Set the named API-key environment variable in your shell. Do not put a raw API
@@ -81,6 +85,7 @@ Supported environment overrides are:
 - `LUNAR_FORGE_RUNTIME_MODE`
 - `LUNAR_FORGE_ALLOW_NETWORK`
 - `LUNAR_FORGE_PERMISSION_MODE`
+- `LUNAR_FORGE_MCP_ENABLED`
 
 LiteLLM model identifiers can also target providers such as Anthropic or a
 local OpenAI-compatible service. For example, an Ollama model can use
@@ -104,6 +109,36 @@ model:
 Responses mode requires a LiteLLM release that exposes `litellm.responses`
 (LiteLLM documents support in 1.63.8 and newer). If that function is unavailable,
 LunarForge reports a clear upgrade-or-use-chat error.
+
+### Experimental MCP integration
+
+MCP support is experimental and disabled by default. It uses two explicit
+opt-ins: set `mcp.enabled: true` in `.agent/config.yaml` (or user config), then
+enable each server separately in `.agent/mcp.yaml` or
+`~/.lunar-forge/mcp.yaml`:
+
+```yaml
+servers:
+  github:
+    command: github-mcp-server
+    args: [--stdio]
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+    enabled: true
+```
+
+Raw credentials are rejected; `env` values name environment variables using
+`${NAME}` references. Discovered tools are namespaced, such as
+`mcp.github.create_issue`, and every MCP call passes through the normal approval
+system. Plan mode exposes only tools carrying the standard MCP
+`annotations.readOnlyHint: true`, and those read-only external calls still
+require approval.
+
+This phase integrates an injectable MCP transport with the agent registry but
+does not bundle a production stdio or network transport. Embedders and tests can
+supply a transport factory; enabling a configured server in the standalone CLI
+without one reports that no transport is configured rather than launching an
+external process implicitly.
 
 ## Basic usage
 

@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lunar_forge.permissions import (
     ApprovalCallback,
@@ -25,6 +25,10 @@ from lunar_forge.tools.search import glob_files, grep
 from lunar_forge.tools.shell import run_command
 
 
+if TYPE_CHECKING:
+    from lunar_forge.mcp.client import MCPClient
+
+
 ToolHandler = Callable[..., dict[str, Any]]
 
 
@@ -37,6 +41,7 @@ class Tool:
     parameters: dict[str, Any]
     handler: ToolHandler = field(repr=False, compare=False)
     permission: PermissionLevel = PermissionLevel.READ
+    plan_safe: bool = False
 
 
 class ToolRegistry:
@@ -82,7 +87,12 @@ class ToolRegistry:
                 },
             }
             for tool in sorted(self._tools.values(), key=lambda item: item.name)
-            if not read_only or tool.permission is PermissionLevel.READ
+            if not read_only
+            or tool.permission is PermissionLevel.READ
+            or (
+                tool.permission is PermissionLevel.NETWORK
+                and tool.plan_safe
+            )
             if allow_execute or tool.permission is not PermissionLevel.EXECUTE
         ]
 
@@ -102,6 +112,7 @@ class ToolRegistry:
             tool.permission,
             tool.name,
             arguments,
+            plan_safe=tool.plan_safe,
         )
         if not decision.allowed:
             return {
@@ -224,8 +235,9 @@ def create_tool_registry(
     *,
     runtime_mode: str = "local",
     allow_network: bool = False,
+    mcp_client: MCPClient | None = None,
 ) -> ToolRegistry:
-    """Create the current local tool registry under a permission mode."""
+    """Create built-in tools and optionally discover experimental MCP tools."""
     normalized_mode = mode.strip().lower()
     read_registry = create_read_only_registry(project_root)
     tools = [read_registry.get(name) for name in read_registry.names()]
@@ -242,13 +254,24 @@ def create_tool_registry(
                 allow_network=allow_network,
             )
         )
-    return ToolRegistry(
+    registry = ToolRegistry(
         tools,
         permission_manager=PermissionManager(
             mode=mode,
             approval_callback=approval_callback,
         ),
     )
+    if mcp_client is not None:
+        # Local import avoids making the central registry depend on an optional
+        # MCP transport during normal built-in-only startup.
+        from lunar_forge.mcp.registry import register_mcp_tools
+
+        register_mcp_tools(
+            registry,
+            mcp_client,
+            read_only_only=normalized_mode == "plan",
+        )
+    return registry
 
 
 def _write_tools(project_root: str | Path) -> tuple[Tool, ...]:

@@ -124,6 +124,43 @@ def test_plan_and_no_command_modes_block_command_execution(tmp_path):
         assert expected_reason in decision.reason
 
 
+def test_plan_mode_allows_approved_plan_safe_network_read():
+    requests: list[PermissionRequest] = []
+    manager = PermissionManager(
+        mode="plan",
+        approval_callback=lambda request: requests.append(request) or True,
+    )
+
+    decision = manager.authorize(
+        PermissionLevel.NETWORK,
+        "mcp.github.search_issues",
+        {"query": "is:open"},
+        plan_safe=True,
+    )
+
+    assert decision.allowed is True
+    assert len(requests) == 1
+    assert requests[0].permission is PermissionLevel.NETWORK
+
+
+def test_plan_safe_flag_cannot_allow_writes_in_plan_mode():
+    def unexpected_approval(request: PermissionRequest) -> bool:
+        raise AssertionError("Plan mode must block writes before prompting")
+
+    decision = PermissionManager(
+        mode="plan",
+        approval_callback=unexpected_approval,
+    ).authorize(
+        PermissionLevel.WRITE,
+        "write_file",
+        {"path": "blocked.txt"},
+        plan_safe=True,
+    )
+
+    assert decision.allowed is False
+    assert "Plan mode blocks" in decision.reason
+
+
 def test_dangerous_command_is_denied_without_requesting_approval():
     def unexpected_approval(request: PermissionRequest) -> bool:
         raise AssertionError(f"Approval requested for {request.tool_name}")

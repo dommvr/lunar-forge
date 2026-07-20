@@ -10,6 +10,9 @@ from typing import Any
 
 from lunar_forge.config import AppConfig, load_config
 from lunar_forge.instructions import load_project_instructions
+from lunar_forge.mcp.client import MCPClient, TransportFactory
+from lunar_forge.mcp.config import load_mcp_config
+from lunar_forge.mcp.registry import register_mcp_tools
 from lunar_forge.model_clients import (
     ModelClient,
     ModelResponse,
@@ -59,6 +62,7 @@ class CodeAgent:
     model_client: ModelClient | None = None
     max_steps: int = MAX_STEPS
     approval_callback: ApprovalCallback | None = None
+    mcp_transport_factory: TransportFactory | None = None
 
     def plan(self, request: str) -> Plan:
         """Preserve the original lightweight planning compatibility helper."""
@@ -97,6 +101,14 @@ class CodeAgent:
                 mode=mode,
                 approval_callback=self.approval_callback,
             )
+            mcp_client = (
+                MCPClient(
+                    load_mcp_config(root),
+                    transport_factory=self.mcp_transport_factory,
+                )
+                if self.config.mcp.enabled
+                else None
+            )
             if registry is None:
                 tools = create_tool_registry(
                     root,
@@ -104,10 +116,23 @@ class CodeAgent:
                     approval_callback=self.approval_callback,
                     runtime_mode=self.config.runtime.mode,
                     allow_network=self.config.runtime.allow_network,
+                    mcp_client=mcp_client,
                 )
             else:
                 tools = registry
                 tools.set_permission_manager(permission_manager)
+                if mcp_client is not None:
+                    register_mcp_tools(
+                        tools,
+                        mcp_client,
+                        read_only_only=normalized_mode == "plan",
+                    )
+            if mcp_client is not None:
+                _log_session(
+                    session,
+                    "mcp_tools_registered",
+                    tools=[name for name in tools.names() if name.startswith("mcp.")],
+                )
             model_client = self.model_client or self._create_model_client()
             system_prompt = build_system_prompt(
                 project_info,
@@ -492,6 +517,7 @@ def run_agent(
     resume_messages: Sequence[Mapping[str, Any]] = (),
     resumed_from: str | None = None,
     use_subagents: bool | None = None,
+    mcp_transport_factory: TransportFactory | None = None,
 ) -> str:
     """Convenience entry point used by the CLI."""
     root = Path(project_root).expanduser().resolve()
@@ -501,6 +527,7 @@ def run_agent(
         model_client=model_client,
         max_steps=max_steps,
         approval_callback=approval_callback,
+        mcp_transport_factory=mcp_transport_factory,
     )
     return agent.run(
         prompt,
