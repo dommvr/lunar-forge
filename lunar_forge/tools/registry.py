@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -27,9 +27,31 @@ from lunar_forge.tools.shell import run_command
 
 if TYPE_CHECKING:
     from lunar_forge.mcp.client import MCPClient
+    from lunar_forge.plugins.loader import LoadedPlugin
+    from lunar_forge.plugins.registry import EntrypointResolver
 
 
 ToolHandler = Callable[..., dict[str, Any]]
+MAX_REGISTRY_RESULT_CHARACTERS = 200_000
+MAX_REGISTRY_RESULT_PREVIEW_CHARACTERS = 20_000
+MAX_REGISTERED_TOOLS = 256
+REDACTED_TOOL_VALUE = "[REDACTED]"
+_SENSITIVE_RESULT_KEYS = frozenset(
+    {
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "cookie",
+        "privatekey",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +80,10 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool is already registered: {tool.name}")
+        if len(self._tools) >= MAX_REGISTERED_TOOLS:
+            raise ValueError(
+                f"Tool registry supports at most {MAX_REGISTERED_TOOLS} tools."
+            )
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool:
@@ -89,11 +115,9 @@ class ToolRegistry:
             for tool in sorted(self._tools.values(), key=lambda item: item.name)
             if not read_only
             or tool.permission is PermissionLevel.READ
-            or (
-                tool.permission is PermissionLevel.NETWORK
-                and tool.plan_safe
-            )
-            if allow_execute or tool.permission is not PermissionLevel.EXECUTE
+            or tool.plan_safe
+            if allow_execute
+            or tool.permission is not PermissionLevel.EXECUTE
         ]
 
     def execute(
@@ -124,7 +148,10 @@ class ToolRegistry:
         try:
             result = tool.handler(**dict(arguments))
         except Exception as exc:
-            return {"ok": False, "error": f"Tool {name} failed: {exc}"}
+            return {
+                "ok": False,
+                "error": f"Tool {name} failed with {type(exc).__name__}.",
+            }
 
         if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
             return {
@@ -132,13 +159,48 @@ class ToolRegistry:
                 "error": f"Tool {name} returned an invalid result.",
             }
         try:
-            json.dumps(result)
-        except (TypeError, ValueError):
+            safe_result = _redact_sensitive_result_values(result)
+            serialized = json.dumps(
+                safe_result,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, RecursionError):
             return {
                 "ok": False,
                 "error": f"Tool {name} returned a non-serializable result.",
             }
-        return result
+        if len(serialized) > MAX_REGISTRY_RESULT_CHARACTERS:
+            bounded_result: dict[str, Any] = {
+                "ok": safe_result["ok"],
+                "truncated": True,
+                "preview": serialized[:MAX_REGISTRY_RESULT_PREVIEW_CHARACTERS],
+            }
+            if safe_result["ok"] is False:
+                bounded_result["error"] = "Tool error result exceeded the size limit."
+            return bounded_result
+        return safe_result
+
+
+def _redact_sensitive_result_values(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("Tool result keys must be strings.")
+            normalized_key = "".join(
+                character for character in key.casefold() if character.isalnum()
+            )
+            redacted[key] = (
+                REDACTED_TOOL_VALUE
+                if normalized_key in _SENSITIVE_RESULT_KEYS
+                else _redact_sensitive_result_values(item)
+            )
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_sensitive_result_values(item) for item in value]
+    return value
 
 
 def create_read_only_registry(project_root: str | Path) -> ToolRegistry:
@@ -236,8 +298,10 @@ def create_tool_registry(
     runtime_mode: str = "local",
     allow_network: bool = False,
     mcp_client: MCPClient | None = None,
+    plugins: Sequence[LoadedPlugin] = (),
+    plugin_resolver: EntrypointResolver | None = None,
 ) -> ToolRegistry:
-    """Create built-in tools and optionally discover experimental MCP tools."""
+    """Create built-ins and explicitly enabled external extension tools."""
     normalized_mode = mode.strip().lower()
     read_registry = create_read_only_registry(project_root)
     tools = [read_registry.get(name) for name in read_registry.names()]
@@ -270,6 +334,16 @@ def create_tool_registry(
             registry,
             mcp_client,
             read_only_only=normalized_mode == "plan",
+        )
+    if plugins and normalized_mode != "plan":
+        if plugin_resolver is None:
+            raise ValueError("Enabled plugins require a trusted entrypoint resolver.")
+        from lunar_forge.plugins.registry import register_plugin_tools
+
+        register_plugin_tools(
+            registry,
+            tuple(plugins),
+            plugin_resolver,
         )
     return registry
 

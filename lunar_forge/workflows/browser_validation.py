@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 from lunar_forge.tools.files import safe_path
 
@@ -20,7 +23,19 @@ MAX_LOG_ENTRIES = 10
 MAX_CHECKS = 20
 MAX_CHECK_CHARACTERS = 500
 MAX_SCREENSHOT_BYTES = 5_000_000
-VIEWPORT = {"width": 1280, "height": 720}
+VIEWPORT = MappingProxyType({"width": 1280, "height": 720})
+_SENSITIVE_URL_KEY_PARTS = (
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)((?:api[_-]?key|authorization|credential|password|secret|token)"
+    r"\s*[=:]\s*)([^\s&,;]+)"
+)
 
 PlaywrightFactory = Callable[[], Any]
 
@@ -59,7 +74,7 @@ def run_browser_validation(
     check_results: list[dict[str, Any]] = []
     state = {"truncated": False}
     title = ""
-    final_url = local_url
+    final_url = _redacted_url(local_url)
     screenshot_path: str | None = None
     screenshot_file: Path | None = None
 
@@ -67,7 +82,7 @@ def run_browser_validation(
         with factory() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
-                page = browser.new_page(viewport=VIEWPORT)
+                page = browser.new_page(viewport=dict(VIEWPORT))
                 page.on(
                     "console",
                     lambda message: _capture_console_error(
@@ -102,12 +117,13 @@ def run_browser_validation(
                     MAX_LOG_TEXT_CHARACTERS,
                 )
                 state["truncated"] = state["truncated"] or title_truncated
+                actual_final_url = str(_event_value(page, "url"))
+                _validated_local_url(actual_final_url)
                 final_url, url_truncated = _bounded_text(
-                    _event_value(page, "url"),
+                    _redacted_url(actual_final_url),
                     MAX_URL_CHARACTERS,
                 )
                 state["truncated"] = state["truncated"] or url_truncated
-                _validated_local_url(final_url)
 
                 for selector in normalized_checks:
                     check_results.append(_run_selector_check(page, selector))
@@ -254,7 +270,7 @@ def _capture_console_error(
     if str(_event_value(message, "type")).lower() != "error":
         return
     text, truncated = _bounded_text(
-        _event_value(message, "text"),
+        _redacted_text(_event_value(message, "text")),
         MAX_LOG_TEXT_CHARACTERS,
     )
     state["truncated"] = state["truncated"] or truncated
@@ -287,8 +303,14 @@ def _append_failed_request(
     if len(failed_requests) >= MAX_LOG_ENTRIES:
         state["truncated"] = True
         return
-    bounded_url, url_truncated = _bounded_text(url, MAX_URL_CHARACTERS)
-    bounded_error, error_truncated = _bounded_text(error, MAX_LOG_TEXT_CHARACTERS)
+    bounded_url, url_truncated = _bounded_text(
+        _redacted_url(url),
+        MAX_URL_CHARACTERS,
+    )
+    bounded_error, error_truncated = _bounded_text(
+        _redacted_text(error),
+        MAX_LOG_TEXT_CHARACTERS,
+    )
     state["truncated"] = (
         state["truncated"] or url_truncated or error_truncated
     )
@@ -309,7 +331,11 @@ def _run_selector_check(page: Any, selector: str) -> dict[str, Any]:
 
 def _screenshot_file(root: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return safe_path(root, f"{ARTIFACT_DIRECTORY}/browser-{timestamp}.png")
+    suffix = uuid4().hex[:8]
+    return safe_path(
+        root,
+        f"{ARTIFACT_DIRECTORY}/browser-{timestamp}-{suffix}.png",
+    )
 
 
 def _event_value(event: Any, name: str) -> Any:
@@ -325,8 +351,40 @@ def _bounded_text(value: Any, limit: int) -> tuple[str, bool]:
 
 
 def _safe_exception_message(exc: Exception) -> str:
-    message, _ = _bounded_text(str(exc), MAX_LOG_TEXT_CHARACTERS)
+    redacted = _redacted_text(exc)
+    message, _ = _bounded_text(redacted, MAX_LOG_TEXT_CHARACTERS)
     return f"Browser validation failed with {type(exc).__name__}: {message}"
+
+
+def _redacted_text(value: Any) -> str:
+    return _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1[REDACTED]", str(value))
+
+
+def _redacted_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    redacted_query = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = "".join(
+            character for character in key.casefold() if character.isalnum()
+        )
+        redacted_value = (
+            "[REDACTED]"
+            if any(part in normalized_key for part in _SENSITIVE_URL_KEY_PARTS)
+            else value
+        )
+        redacted_query.append((key, redacted_value))
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(redacted_query),
+            "",
+        )
+    )
 
 
 def _error_result(error: str) -> dict[str, Any]:

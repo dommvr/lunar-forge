@@ -21,6 +21,7 @@ MAX_OUTPUT_CHARACTERS = 50_000
 MAX_OUTPUT_STRING_CHARACTERS = 20_000
 MAX_OUTPUT_COLLECTION_ITEMS = 100
 MAX_OUTPUT_DEPTH = 12
+MAX_DISCOVERED_TOOLS = 100
 
 
 class MCPClientError(RuntimeError):
@@ -73,6 +74,10 @@ class MCPClient:
             ) from exc
         if isinstance(raw_tools, (str, bytes)) or not isinstance(raw_tools, Sequence):
             raise MCPClientError("MCP tool discovery must return a sequence.")
+        if len(raw_tools) > MAX_DISCOVERED_TOOLS:
+            raise MCPClientError(
+                f"MCP servers may expose at most {MAX_DISCOVERED_TOOLS} tools."
+            )
 
         definitions: list[MCPToolDefinition] = []
         seen_names: set[str] = set()
@@ -100,6 +105,7 @@ class MCPClient:
             encoded_arguments = json.dumps(
                 normalized_arguments,
                 ensure_ascii=True,
+                allow_nan=False,
                 separators=(",", ":"),
             )
             if len(encoded_arguments) > MAX_CALL_ARGUMENT_CHARACTERS:
@@ -107,7 +113,7 @@ class MCPClient:
             transport = self._transport_for(server_name)
             raw_result = transport.call_tool(tool_name, normalized_arguments)
             return _bounded_result(raw_result)
-        except (MCPClientError, TypeError, ValueError) as exc:
+        except MCPClientError as exc:
             return {"ok": False, "error": str(exc)[:500]}
         except Exception as exc:
             return {
@@ -154,8 +160,13 @@ def _parse_tool_definition(raw_tool: Mapping[str, Any]) -> MCPToolDefinition:
         raise MCPClientError(f"MCP tool '{name}' input schema must be an object.")
     schema = dict(input_schema)
     try:
-        encoded_schema = json.dumps(schema, ensure_ascii=True, separators=(",", ":"))
-    except (TypeError, ValueError) as exc:
+        encoded_schema = json.dumps(
+            schema,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
         raise MCPClientError(
             f"MCP tool '{name}' input schema must be JSON-serializable."
         ) from exc
@@ -183,15 +194,19 @@ def _parse_tool_definition(raw_tool: Mapping[str, Any]) -> MCPToolDefinition:
 def _bounded_result(raw_result: Any) -> dict[str, Any]:
     try:
         result, truncated = _normalize_json(raw_result)
-    except (TypeError, ValueError):
+        envelope: dict[str, Any] = {
+            "ok": True,
+            "result": result,
+            "truncated": truncated,
+        }
+        encoded = json.dumps(
+            envelope,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, RecursionError):
         return {"ok": False, "error": "MCP tool returned a non-serializable result."}
-
-    envelope: dict[str, Any] = {
-        "ok": True,
-        "result": result,
-        "truncated": truncated,
-    }
-    encoded = json.dumps(envelope, ensure_ascii=True, separators=(",", ":"))
     if len(encoded) <= MAX_OUTPUT_CHARACTERS:
         return envelope
     return {

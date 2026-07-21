@@ -13,8 +13,11 @@ The current MVP supports:
 - approved local or optional Docker command execution;
 - project-aware Python and Node validation;
 - redacted JSONL session logs;
-- six small new-project starters; and
-- checkpoint, rollback, and session utility commands that do not call a model.
+- six declarative new-project starters;
+- deterministic, optional specialist subagents;
+- disabled-by-default MCP and local plugin adapters;
+- optional local browser validation; and
+- checkpoint, rollback, session resume, and utility commands.
 
 ## Requirements and installation
 
@@ -66,6 +69,9 @@ permissions:
 # Experimental and disabled unless explicitly enabled.
 mcp:
   enabled: false
+
+plugins:
+  enabled: false
 ```
 
 Set the named API-key environment variable in your shell. Do not put a raw API
@@ -85,7 +91,9 @@ Supported environment overrides are:
 - `LUNAR_FORGE_RUNTIME_MODE`
 - `LUNAR_FORGE_ALLOW_NETWORK`
 - `LUNAR_FORGE_PERMISSION_MODE`
+- `LUNAR_FORGE_SUBAGENTS`
 - `LUNAR_FORGE_MCP_ENABLED`
+- `LUNAR_FORGE_PLUGINS_ENABLED`
 
 LiteLLM model identifiers can also target providers such as Anthropic or a
 local OpenAI-compatible service. For example, an Ollama model can use
@@ -140,6 +148,57 @@ supply a transport factory; enabling a configured server in the standalone CLI
 without one reports that no transport is configured rather than launching an
 external process implicitly.
 
+### Experimental local plugins
+
+Plugins are experimental and disabled by default. Enabling one requires two
+project-local opt-ins. First set `plugins.enabled: true` in
+`.agent/config.yaml`. Then name each manifest explicitly in
+`.agent/plugins.yaml`:
+
+```yaml
+plugins:
+  example:
+    manifest: plugin_packs/example/plugin.yaml
+    enabled: true
+```
+
+A minimal manifest keeps the model-facing schema and capabilities explicit:
+
+```yaml
+name: example
+version: 0.1.0
+description: Example local tools
+tools:
+  - name: example.echo
+    description: Echo a message
+    entrypoint: example_plugin:echo
+    parameters:
+      type: object
+      properties:
+        message: {type: string}
+      required: [message]
+      additionalProperties: false
+    permissions:
+      filesystem: read
+      commands: false
+      network: false
+```
+
+The referenced module must live beneath the manifest directory. LunarForge does
+not scan arbitrary directories, fetch remote plugin code, or import a handler
+while discovering tools. It validates the manifest, registers the namespaced
+tool, asks through the normal permission system, and only then loads and invokes
+the local entrypoint. Tools declaring filesystem writes, commands, or network
+access are always permission-gated. All plugin tools are omitted from plan mode
+because in-process code cannot enforce a manifest's read-only claim. Plugin
+arguments, results, and exceptions are contained and bounded before entering
+model context.
+
+Plugin capability declarations are a trust contract, not an operating-system
+sandbox. Enable only code you have reviewed. The loader intentionally supports
+simple bundle-local Python modules; plugin dependency management and isolated
+worker processes are not implemented.
+
 ## Basic usage
 
 Run against the current directory:
@@ -167,6 +226,21 @@ a short plan before the first edit, permission-gated changes, and validation
 when practical. If validation fails, the agent is instructed to attempt at most
 one focused fix.
 
+### Optional subagent mode
+
+Single-agent execution remains the default. Pass `--subagents`, or set
+`subagents.enabled: true`, to use a finite specialist sequence. Existing-project
+work uses Planner -> approval -> Coder -> Tester -> Reviewer. New-project work
+uses Scaffolder -> Tester -> Reviewer. A read-only Security phase is added when
+the changed paths touch permissions, shell execution, Docker, MCP, plugins, or
+configuration.
+
+Each role receives an explicit tool allowlist and cannot obtain tools outside
+it. All allowed mutations and commands still pass through the central registry,
+normal permission prompts, and session logging. This is deterministic role
+handoff, not an autonomous debate or self-spawning agent loop. Final output lists
+the roles that actually ran.
+
 ## Project instructions (`AGENTS.md`)
 
 At session start, LunarForge loads a root `AGENTS.md` from the target project if
@@ -174,9 +248,12 @@ one exists. The content is size-limited and included as untrusted project
 context. It can guide conventions and validation choices, but it cannot override
 path safety, permissions, command blocking, Docker restrictions, or plan mode.
 
-Nested `AGENTS.md` discovery is available as a helper, but nested instructions
-are not yet applied automatically to individual files. When no root instructions
-exist, the model receives a clear fallback notice.
+Nested `AGENTS.md` files are discovered and applied automatically by target file
+path. The instruction stack is ordered from the root toward the most specific
+containing directory, and file tools report the applicable project-relative
+stack. Nested instructions remain untrusted and cannot expand filesystem access
+or bypass safety policy. When no root instructions exist, the model receives a
+clear fallback notice.
 
 Search and file-reading tools skip generated or sensitive runtime directories,
 including `.git`, `.agent`, `node_modules`, virtual environments,
@@ -215,8 +292,8 @@ lunar-forge --docker "Run the tests and explain failures"
 lunar-forge --docker --allow-network "Run an approved network-dependent task"
 ```
 
-Docker mode checks availability with `docker info`. The application—not the
-model—constructs the wrapper. It mounts only the project root at `/workspace`,
+Docker mode checks availability with `docker info`. The application, not the
+model, constructs the wrapper. It mounts only the project root at `/workspace`,
 uses `/workspace` as the working directory, applies 2 GiB memory and 2 CPU
 limits, and uses the `lunar-forge-sandbox` image. It never requests privileged
 mode, mounts the host home directory, or mounts `/var/run/docker.sock`.
@@ -228,7 +305,9 @@ is writable so approved build and validation commands can update project files.
 ## New-project mode
 
 The `new` command only operates on an empty or nearly empty target directory.
-Template selection is intentionally simple:
+Each starter uses a small `TemplateSpec` describing its files, dependencies,
+approval-gated commands, validation, and run instructions. Selection is
+intentionally simple:
 
 ```bash
 lunar-forge new --project ./site "Build a simple business website"
@@ -250,8 +329,11 @@ lunar-forge new --project ./frontend --plan "Build a Vite React website"
   `preview` scripts. `npm install` and build validation require separate
   approval, and installation may fail when network access is unavailable.
 
-The command rejects a non-empty target rather than overwriting an existing
-project. Its final output includes run instructions.
+Generated projects include a README and may include starter `AGENTS.md`
+guidance. The command rejects a non-empty target rather than overwriting an
+existing project. Plan mode selects and describes the starter without writing
+files, creating `.agent`, or running commands. Final output includes validation
+and run instructions.
 
 ## Validation
 
@@ -265,6 +347,27 @@ markers:
 
 Validation uses the same approved local or Docker command runner and reports
 every result. No detected commands is a successful, explicit no-op.
+
+### Optional browser validation
+
+Install Playwright support separately, including its Chromium browser:
+
+```bash
+python -m pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+The permission-gated `run_browser_validation` tool connects only to a provided
+loopback HTTP(S) URL. It does not start a development server. It captures a
+bounded page title, final URL, console errors, failed requests, optional CSS
+selector checks, and an optional screenshot beneath
+`.agent/artifacts/browser/`. Requests leaving loopback are blocked, obvious
+credential query values and log assignments are redacted, screenshot paths are
+project-confined, and artifacts are never uploaded.
+
+Start the application separately through an approved command, then ask
+LunarForge to validate its local URL. Browser validation is hidden in plan mode
+and normal installs and tests do not require Playwright or a real browser.
 
 ## Checkpoints, rollback, and sessions
 
@@ -282,6 +385,8 @@ without model or API access:
 lunar-forge checkpoints --project ../my-app
 lunar-forge rollback src/example.py --project ../my-app
 lunar-forge sessions --project ../my-app
+lunar-forge resume <session-id> --project ../my-app --summary-only
+lunar-forge resume <session-id> --project ../my-app --prompt "Continue the fix"
 ```
 
 `rollback` restores the newest checkpoint for the requested file. If the target
@@ -292,8 +397,13 @@ Non-plan agent runs write redacted JSONL events to
 `.agent/sessions/<timestamp>.jsonl`. Events include prompts, assistant messages,
 tool calls and results, denials, and errors. API-key-like values and environment
 values are redacted, event sizes are bounded, and the `sessions` command lists
-only filenames and sizes—it does not print log contents. Session resume is not
-implemented yet.
+only filenames and sizes; it does not print log contents.
+
+Resume validates that the session is project-local, loads a bounded redacted
+history, and starts a new session that references the old one. Historical tool
+calls are inert records and are never replayed automatically. Use
+`--summary-only` for model-free inspection or `--plan` to continue without
+writes.
 
 ## Development
 
@@ -317,8 +427,14 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
   placeholders.
 - File edits use exact, single-match text replacement rather than a general
   patch engine.
-- Nested `AGENTS.md` files are discovered but not yet applied by path scope.
 - Docker image building, dependency downloads, and network access are never
   automatic.
-- Sessions can be listed but not resumed.
 - The new-project workflow intentionally supports six focused starters.
+- Subagents are role-specific model calls in a fixed sequence, not independent
+  processes or autonomous collaborators.
+- MCP has no bundled production transport yet; configured servers are not
+  launched implicitly.
+- Browser validation requires the optional Playwright extra and a separately
+  started local server.
+- Plugins run reviewed local Python in-process after approval. Capability
+  declarations and output containment do not provide OS-level isolation.

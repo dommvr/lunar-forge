@@ -17,10 +17,16 @@ from lunar_forge.model_clients import (
     ModelClient,
     ModelResponse,
     ToolCall,
-    create_litellm_client,
+    create_model_client,
 )
 from lunar_forge.permissions import ApprovalCallback, PermissionManager
 from lunar_forge.planning import Plan
+from lunar_forge.plugins.loader import load_enabled_plugins
+from lunar_forge.plugins.registry import (
+    EntrypointResolver,
+    register_plugin_tools,
+    resolve_local_plugin_entrypoint,
+)
 from lunar_forge.project_detection import detect_project
 from lunar_forge.prompts import (
     build_subagent_system_prompt,
@@ -63,6 +69,7 @@ class CodeAgent:
     max_steps: int = MAX_STEPS
     approval_callback: ApprovalCallback | None = None
     mcp_transport_factory: TransportFactory | None = None
+    plugin_resolver: EntrypointResolver | None = None
 
     def plan(self, request: str) -> Plan:
         """Preserve the original lightweight planning compatibility helper."""
@@ -109,6 +116,12 @@ class CodeAgent:
                 if self.config.mcp.enabled
                 else None
             )
+            loaded_plugins = (
+                load_enabled_plugins(root)
+                if self.config.plugins.enabled
+                else ()
+            )
+            plugin_resolver = self.plugin_resolver or resolve_local_plugin_entrypoint
             if registry is None:
                 tools = create_tool_registry(
                     root,
@@ -117,6 +130,8 @@ class CodeAgent:
                     runtime_mode=self.config.runtime.mode,
                     allow_network=self.config.runtime.allow_network,
                     mcp_client=mcp_client,
+                    plugins=loaded_plugins,
+                    plugin_resolver=plugin_resolver,
                 )
             else:
                 tools = registry
@@ -127,11 +142,32 @@ class CodeAgent:
                         mcp_client,
                         read_only_only=normalized_mode == "plan",
                     )
+                if loaded_plugins and normalized_mode != "plan":
+                    register_plugin_tools(
+                        tools,
+                        loaded_plugins,
+                        plugin_resolver,
+                    )
             if mcp_client is not None:
                 _log_session(
                     session,
                     "mcp_tools_registered",
                     tools=[name for name in tools.names() if name.startswith("mcp.")],
+                )
+            if loaded_plugins:
+                configured_plugin_tools = {
+                    definition.name
+                    for plugin in loaded_plugins
+                    for definition in plugin.manifest.tools
+                }
+                _log_session(
+                    session,
+                    "plugin_tools_registered",
+                    tools=[
+                        name
+                        for name in tools.names()
+                        if name in configured_plugin_tools
+                    ],
                 )
             model_client = self.model_client or self._create_model_client()
             system_prompt = build_system_prompt(
@@ -392,17 +428,10 @@ class CodeAgent:
         return result
 
     def _create_model_client(self) -> ModelClient:
-        if self.config.model.provider != "litellm":
-            raise AgentError(
-                f"Unsupported model provider: {self.config.model.provider}. "
-                "This milestone supports LiteLLM only."
-            )
-        return create_litellm_client(
-            api=self.config.model.api,
-            model=self.config.model.model,
-            api_key_env=self.config.model.api_key_env,
-            api_base=self.config.model.api_base,
-        )
+        try:
+            return create_model_client(self.config.model)
+        except ValueError as exc:
+            raise AgentError(str(exc)) from exc
 
 
 def _run_subagent_model_loop(
@@ -518,6 +547,7 @@ def run_agent(
     resumed_from: str | None = None,
     use_subagents: bool | None = None,
     mcp_transport_factory: TransportFactory | None = None,
+    plugin_resolver: EntrypointResolver | None = None,
 ) -> str:
     """Convenience entry point used by the CLI."""
     root = Path(project_root).expanduser().resolve()
@@ -528,6 +558,7 @@ def run_agent(
         max_steps=max_steps,
         approval_callback=approval_callback,
         mcp_transport_factory=mcp_transport_factory,
+        plugin_resolver=plugin_resolver,
     )
     return agent.run(
         prompt,

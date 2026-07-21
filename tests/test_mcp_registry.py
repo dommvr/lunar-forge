@@ -415,6 +415,53 @@ def test_non_serializable_mcp_output_becomes_safe_error():
     }
 
 
+def test_non_finite_mcp_output_becomes_safe_error():
+    transport = FakeTransport(_github_tools(), result={"value": float("nan")})
+    registry = ToolRegistry(
+        permission_manager=PermissionManager(
+            mode="default",
+            approval_callback=lambda request: True,
+        )
+    )
+    register_mcp_tools(
+        registry,
+        MCPClient(_config(enabled=True), lambda server: transport),
+    )
+
+    result = registry.execute(
+        "mcp.github.create_issue",
+        {"title": "Bad output"},
+    )
+
+    assert result == {
+        "ok": False,
+        "error": "MCP tool returned a non-serializable result.",
+    }
+
+
+def test_mcp_transport_exception_does_not_expose_its_message():
+    secret = "transport-secret-value"
+
+    class BrokenTransport(FakeTransport):
+        def call_tool(self, name, arguments):
+            raise ValueError(secret)
+
+    registry = ToolRegistry(
+        permission_manager=PermissionManager(
+            approval_callback=lambda request: True,
+        )
+    )
+    register_mcp_tools(
+        registry,
+        MCPClient(_config(enabled=True), lambda server: BrokenTransport(_github_tools())),
+    )
+
+    result = registry.execute("mcp.github.create_issue", {"title": "Failure"})
+
+    assert result["error"] == "MCP tool call failed with ValueError."
+    assert secret not in json.dumps(result)
+
+
 @pytest.mark.parametrize(
     ("server_name", "tool_name"),
     (("GitHub", "create_issue"), ("github", "create issue")),

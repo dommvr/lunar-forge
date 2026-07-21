@@ -1,3 +1,5 @@
+import json
+
 from lunar_forge.permissions import (
     PermissionDecision,
     PermissionLevel,
@@ -5,7 +7,14 @@ from lunar_forge.permissions import (
     PermissionRequest,
     requires_approval,
 )
-from lunar_forge.tools.registry import create_tool_registry
+from lunar_forge.tools.registry import (
+    MAX_REGISTRY_RESULT_CHARACTERS,
+    MAX_REGISTERED_TOOLS,
+    REDACTED_TOOL_VALUE,
+    Tool,
+    ToolRegistry,
+    create_tool_registry,
+)
 
 
 def test_permission_decision_defaults_to_empty_reason():
@@ -213,3 +222,110 @@ def test_quoted_dangerous_command_is_denied_before_approval():
 
     assert decision.allowed is False
     assert "rm -rf" in decision.reason
+
+
+def test_registry_contains_handler_exceptions_without_exposing_messages():
+    secret = "handler-secret-value"
+
+    def broken():
+        raise RuntimeError(secret)
+
+    registry = ToolRegistry((Tool("broken", "Break.", {"type": "object"}, broken),))
+
+    result = registry.execute("broken", {})
+
+    assert result["error"] == "Tool broken failed with RuntimeError."
+    assert secret not in json.dumps(result)
+
+
+def test_registry_rejects_non_finite_results():
+    registry = ToolRegistry(
+        (
+            Tool(
+                "non_finite",
+                "Return non-finite JSON.",
+                {"type": "object"},
+                lambda: {"ok": True, "value": float("nan")},
+            ),
+        )
+    )
+
+    result = registry.execute("non_finite", {})
+
+    assert result == {
+        "ok": False,
+        "error": "Tool non_finite returned a non-serializable result.",
+    }
+
+
+def test_registry_redacts_sensitive_result_fields_before_model_context():
+    secret = "returned-secret-value"
+    registry = ToolRegistry(
+        (
+            Tool(
+                "credential_result",
+                "Return a credential-shaped result.",
+                {"type": "object"},
+                lambda: {
+                    "ok": True,
+                    "result": {
+                        "access_token": secret,
+                        "nested": [{"password": secret}],
+                        "safe": "visible",
+                    },
+                },
+            ),
+        )
+    )
+
+    result = registry.execute("credential_result", {})
+
+    assert secret not in json.dumps(result)
+    assert result["result"]["access_token"] == REDACTED_TOOL_VALUE
+    assert result["result"]["nested"][0]["password"] == REDACTED_TOOL_VALUE
+    assert result["result"]["safe"] == "visible"
+
+
+def test_registry_bounds_results_from_every_tool_source():
+    registry = ToolRegistry(
+        (
+            Tool(
+                "large",
+                "Return large output.",
+                {"type": "object"},
+                lambda: {"ok": True, "content": "x" * 300_000},
+            ),
+        )
+    )
+
+    result = registry.execute("large", {})
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    assert len(json.dumps(result)) < MAX_REGISTRY_RESULT_CHARACTERS
+
+
+def test_registry_bounds_total_registered_tools():
+    registry = ToolRegistry(
+        Tool(
+            f"tool_{index}",
+            "Bounded tool.",
+            {"type": "object"},
+            lambda: {"ok": True},
+        )
+        for index in range(MAX_REGISTERED_TOOLS)
+    )
+
+    try:
+        registry.register(
+            Tool(
+                "one_too_many",
+                "Rejected tool.",
+                {"type": "object"},
+                lambda: {"ok": True},
+            )
+        )
+    except ValueError as exc:
+        assert "at most" in str(exc)
+    else:
+        raise AssertionError("Registry accepted an unbounded tool definition")

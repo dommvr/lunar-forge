@@ -272,6 +272,34 @@ def test_screenshot_can_be_disabled_without_creating_artifact_directory(tmp_path
     assert not (tmp_path / ".agent").exists()
 
 
+def test_browser_output_redacts_secrets_from_urls_and_logs(tmp_path):
+    secret = "do-not-log-this"
+    page = FakePage(
+        final_url=f"http://localhost:3000/callback?token={secret}&view=ready#fragment",
+        console_messages=[FakeMessage("error", f"api_key={secret}")],
+        failed_requests=[
+            FakeRequest(
+                f"http://localhost:3000/api?access_token={secret}",
+                f"password: {secret}",
+            )
+        ],
+    )
+    _, factory = _factory_for(page)
+
+    result = run_browser_validation(
+        f"http://localhost:3000/start?token={secret}",
+        screenshot=False,
+        project_root=tmp_path,
+        _playwright_factory=factory,
+    )
+
+    serialized = json.dumps(result)
+    assert result["ok"] is True
+    assert secret not in serialized
+    assert "REDACTED" in serialized
+    assert "fragment" not in result["final_url"]
+
+
 def test_oversized_screenshot_is_removed_and_reported(tmp_path):
     page = FakePage(screenshot_bytes=b"x" * (MAX_SCREENSHOT_BYTES + 1))
     _, factory = _factory_for(page)

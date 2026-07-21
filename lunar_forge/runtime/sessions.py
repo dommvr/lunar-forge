@@ -91,6 +91,7 @@ class SessionLogger:
             serialized = json.dumps(
                 record,
                 ensure_ascii=False,
+                allow_nan=False,
                 separators=(",", ":"),
             )
             if len(serialized) > MAX_LOG_RECORD_CHARACTERS:
@@ -104,6 +105,7 @@ class SessionLogger:
                 serialized = json.dumps(
                     record,
                     ensure_ascii=False,
+                    allow_nan=False,
                     separators=(",", ":"),
                 )
             with safe_log_path.open("a", encoding="utf-8", newline="") as handle:

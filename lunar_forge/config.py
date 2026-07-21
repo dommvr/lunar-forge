@@ -47,12 +47,20 @@ class MCPRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class PluginRuntimeConfig:
+    """Experimental plugin integration switch; each plugin opts in separately."""
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
     subagents: SubagentConfig = field(default_factory=SubagentConfig)
     mcp: MCPRuntimeConfig = field(default_factory=MCPRuntimeConfig)
+    plugins: PluginRuntimeConfig = field(default_factory=PluginRuntimeConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -98,6 +106,7 @@ def load_config(
     permissions_data = _section(merged, "permissions")
     subagents_data = _section(merged, "subagents")
     mcp_data = _section(merged, "mcp")
+    plugins_data = _section(merged, "plugins")
 
     if "api_key" in model_data:
         raise ValueError(
@@ -134,6 +143,12 @@ def load_config(
                 "mcp.enabled",
             ),
         ),
+        plugins=PluginRuntimeConfig(
+            enabled=_as_bool(
+                plugins_data["enabled"],
+                "plugins.enabled",
+            ),
+        ),
     )
 
 
@@ -159,6 +174,9 @@ def _default_config() -> dict[str, Any]:
         "mcp": {
             "enabled": False,
         },
+        "plugins": {
+            "enabled": False,
+        },
     }
 
 
@@ -175,6 +193,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_PERMISSION_MODE": ("permissions", "mode"),
         "LUNAR_FORGE_SUBAGENTS": ("subagents", "enabled"),
         "LUNAR_FORGE_MCP_ENABLED": ("mcp", "enabled"),
+        "LUNAR_FORGE_PLUGINS_ENABLED": ("plugins", "enabled"),
     }
 
     for variable, (section, key) in mappings.items():

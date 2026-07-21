@@ -16,6 +16,7 @@ from lunar_forge.tools.files import safe_path
 
 
 MAX_CONFIG_CHARACTERS = 500_000
+MAX_CONFIGURED_SERVERS = 50
 _SERVER_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _ENVIRONMENT_REFERENCE_PATTERN = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
@@ -85,6 +86,10 @@ def load_mcp_config(project_root: str | Path) -> MCPConfig:
     user_servers = _read_server_definitions(user_path)
     project_servers = _read_server_definitions(project_path)
     merged = _merge_server_definitions(user_servers, project_servers)
+    if len(merged) > MAX_CONFIGURED_SERVERS:
+        raise MCPConfigError(
+            f"MCP config supports at most {MAX_CONFIGURED_SERVERS} servers."
+        )
     return MCPConfig(
         servers={
             name: _parse_server(name, definition)
