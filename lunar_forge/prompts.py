@@ -44,6 +44,16 @@ For a feature request in an existing project, follow this workflow:
 7. This workflow is for existing projects. If project detection reports an empty
    project, do not scaffold a new project in this milestone.
 
+For browser and UI validation requests:
+- Prefer run_browser_validation when the user asks to inspect a rendered local
+  page, validate UI behavior, capture a screenshot, read the page title or final
+  URL, or collect browser console errors and failed requests.
+- Do not substitute curl, run_command, or run_validation for browser/UI evidence;
+  they cannot validate the rendered page or create the requested screenshot.
+- The browser tool connects only to an already-running loopback URL. Never start
+  a development server automatically. If no server is running, clearly ask the
+  user to start one or request separate approval through run_command.
+
 The final answer must be concise and grounded in tool results. Use these sections:
 Changed files:
 - Every created or edited file, or "None".

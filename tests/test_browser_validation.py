@@ -168,9 +168,28 @@ def test_unavailable_playwright_returns_clear_error_without_writing(
     )
 
     assert result["ok"] is False
+    assert result["status"] == "failed"
     assert "Playwright is unavailable" in result["error"]
     assert "playwright install chromium" in result["error"]
     assert not (tmp_path / ".agent").exists()
+
+
+def test_missing_chromium_returns_actionable_install_command(tmp_path):
+    def missing_browser_factory():
+        raise RuntimeError("Executable doesn't exist at the configured path")
+
+    result = run_browser_validation(
+        "http://127.0.0.1:8000",
+        project_root=tmp_path,
+        _playwright_factory=missing_browser_factory,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["error"] == (
+        "Playwright's Chromium browser is unavailable. Run "
+        "'python -m playwright install chromium'."
+    )
 
 
 @pytest.mark.parametrize(
@@ -222,6 +241,7 @@ def test_browser_validation_captures_page_data_and_local_screenshot(tmp_path):
     )
 
     assert result["ok"] is True
+    assert result["status"] == "passed"
     assert result["title"] == "Local App"
     assert result["final_url"] == "http://127.0.0.1:8000/dashboard"
     assert result["console_errors"] == ["render failed"]
@@ -253,6 +273,21 @@ def test_browser_validation_captures_page_data_and_local_screenshot(tmp_path):
     assert playwright.browser.closed is True
     assert playwright.exited is True
     json.dumps(result)
+
+
+def test_browser_tool_is_registered_in_normal_tool_schemas(tmp_path):
+    registry = create_tool_registry(
+        tmp_path,
+        mode="default",
+        approval_callback=lambda request: False,
+    )
+
+    schema_names = {
+        schema["function"]["name"] for schema in registry.schemas()
+    }
+
+    assert "run_browser_validation" in registry.names()
+    assert "run_browser_validation" in schema_names
 
 
 def test_screenshot_can_be_disabled_without_creating_artifact_directory(tmp_path):

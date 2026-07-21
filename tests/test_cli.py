@@ -189,3 +189,70 @@ def test_subagents_flag_is_available_and_sets_cli_override():
         True,
     )
     assert overrides == {"subagents": {"enabled": True}}
+
+
+def test_browser_validate_command_is_model_free_and_returns_json(
+    monkeypatch,
+    tmp_path,
+):
+    _forbid_model_and_config(monkeypatch)
+    captured = {}
+    screenshot_path = ".agent/artifacts/browser/browser-test.png"
+
+    def fake_browser_validation(
+        url,
+        screenshot=True,
+        checks=None,
+        *,
+        project_root=".",
+    ):
+        captured.update(
+            url=url,
+            screenshot=screenshot,
+            checks=checks,
+            project_root=project_root,
+        )
+        return {
+            "ok": True,
+            "status": "passed",
+            "title": "CLI App",
+            "final_url": f"{url}/ready",
+            "console_errors": [],
+            "failed_requests": [],
+            "screenshot_path": screenshot_path,
+            "checks": [{"selector": "#root", "passed": True}],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_browser_validation",
+        fake_browser_validation,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "browser-validate",
+            "http://127.0.0.1:5173",
+            "--project",
+            str(tmp_path),
+            "--check",
+            "#root",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["status"] == "passed"
+    assert output["title"] == "CLI App"
+    assert output["final_url"] == "http://127.0.0.1:5173/ready"
+    assert output["screenshot_path"] == screenshot_path
+    assert output["console_errors"] == []
+    assert output["failed_requests"] == []
+    assert captured == {
+        "url": "http://127.0.0.1:5173",
+        "screenshot": True,
+        "checks": ["#root"],
+        "project_root": tmp_path.resolve(),
+    }

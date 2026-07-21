@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -26,6 +27,7 @@ from lunar_forge.workflows.new_project import (
     run_new_project,
     select_template,
 )
+from lunar_forge.workflows.browser_validation import run_browser_validation
 
 
 class DefaultCommandGroup(TyperGroup):
@@ -39,6 +41,7 @@ class DefaultCommandGroup(TyperGroup):
             "rollback",
             "sessions",
             "resume",
+            "browser-validate",
             "--help",
             "-h",
         }
@@ -102,6 +105,53 @@ def run(
         raise typer.Exit(code=1) from exc
 
     typer.echo(response)
+
+
+@app.command("browser-validate")
+def browser_validate_command(
+    url: Annotated[
+        str,
+        typer.Argument(help="Already-running local loopback HTTP(S) URL."),
+    ],
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+    screenshot: Annotated[
+        bool,
+        typer.Option(
+            "--screenshot/--no-screenshot",
+            help="Capture a bounded viewport screenshot.",
+        ),
+    ] = True,
+    checks: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--check",
+            help="CSS selector expected to match; repeat for multiple checks.",
+        ),
+    ] = None,
+) -> None:
+    """Validate an already-running local page without model or API access."""
+    result = run_browser_validation(
+        url,
+        screenshot=screenshot,
+        checks=checks,
+        project_root=project.expanduser().resolve(),
+    )
+    output = dict(result)
+    output.setdefault("status", "passed" if output.get("ok") is True else "failed")
+    typer.echo(
+        json.dumps(
+            output,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if output.get("ok") is not True:
+        raise typer.Exit(code=1)
 
 
 @app.command("new")

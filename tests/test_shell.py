@@ -79,7 +79,11 @@ def test_dangerous_command_is_blocked_before_subprocess(
     def unexpected_run(*args, **kwargs):
         raise AssertionError("subprocess.run must not be reached")
 
+    def unexpected_which(*args, **kwargs):
+        raise AssertionError("executable resolution must not be reached")
+
     monkeypatch.setattr(local_runner.subprocess, "run", unexpected_run)
+    monkeypatch.setattr(local_runner.shutil, "which", unexpected_which)
 
     result = run_command(tmp_path, command)
 
@@ -97,11 +101,106 @@ def test_runner_explicitly_uses_shell_false(monkeypatch, tmp_path):
         return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
     monkeypatch.setattr(local_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        local_runner.shutil,
+        "which",
+        lambda executable, path=None: executable,
+    )
 
     result = run_command(tmp_path, "example-program --version")
 
     assert result["ok"] is True
     assert captured["arguments"] == ["example-program", "--version"]
+    assert captured["cwd"] == tmp_path.resolve()
+    assert captured["shell"] is False
+
+
+def test_windows_resolves_npm_to_cmd_with_pathext(monkeypatch, tmp_path):
+    resolved_npm = r"C:\Program Files\nodejs\npm.cmd"
+    resolution_attempts = []
+    captured = {}
+
+    def fake_which(executable, path=None):
+        resolution_attempts.append((executable, path))
+        if executable.casefold() == "npm.cmd":
+            return resolved_npm
+        return None
+
+    def fake_run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="installed\n", stderr="")
+
+    monkeypatch.setattr(local_runner, "_is_windows", lambda: True)
+    monkeypatch.setenv("PATH", r"C:\Program Files\nodejs;C:\Windows\System32")
+    monkeypatch.setenv("PATHEXT", ".EXE;.CMD")
+    monkeypatch.setattr(local_runner.shutil, "which", fake_which)
+    monkeypatch.setattr(local_runner.subprocess, "run", fake_run)
+
+    result = run_command(tmp_path, "npm install")
+
+    assert result["ok"] is True
+    assert captured["arguments"] == [resolved_npm, "install"]
+    assert captured["shell"] is False
+    assert [attempt[0].casefold() for attempt in resolution_attempts] == [
+        "npm",
+        "npm.exe",
+        "npm.cmd",
+    ]
+
+
+def test_missing_executable_reports_sanitized_path_summary(monkeypatch, tmp_path):
+    secret_path_component = "private-user-directory"
+    secret_extension = "HIDDENVALUE"
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("subprocess.run must not be reached")
+
+    monkeypatch.setattr(local_runner, "_is_windows", lambda: True)
+    monkeypatch.setenv(
+        "PATH",
+        rf"C:\{secret_path_component}\bin;D:\Tools",
+    )
+    monkeypatch.setenv("PATHEXT", f".EXE;.CMD;.{secret_extension}")
+    monkeypatch.setattr(
+        local_runner.shutil,
+        "which",
+        lambda executable, path=None: None,
+    )
+    monkeypatch.setattr(local_runner.subprocess, "run", unexpected_run)
+
+    result = run_command(tmp_path, "missing-tool --version")
+
+    assert result["ok"] is False
+    assert result["exit_code"] is None
+    assert "Executable 'missing-tool' was not found" in result["error"]
+    assert "PATH summary: 2 non-empty entries configured" in result["error"]
+    assert "PATHEXT summary: 3 validated candidates configured" in result["error"]
+    assert secret_path_component not in result["error"]
+    assert secret_extension not in result["error"]
+
+
+def test_posix_relative_executable_resolves_from_project_root(monkeypatch, tmp_path):
+    resolved_script = tmp_path / "scripts" / "validate"
+    captured = {}
+
+    def fake_which(executable, path=None):
+        assert Path(executable) == resolved_script
+        return str(resolved_script)
+
+    def fake_run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="validated\n", stderr="")
+
+    monkeypatch.setattr(local_runner, "_is_windows", lambda: False)
+    monkeypatch.setattr(local_runner.shutil, "which", fake_which)
+    monkeypatch.setattr(local_runner.subprocess, "run", fake_run)
+
+    result = run_command(tmp_path, "./scripts/validate --quick")
+
+    assert result["ok"] is True
+    assert captured["arguments"] == [str(resolved_script), "--quick"]
     assert captured["cwd"] == tmp_path.resolve()
     assert captured["shell"] is False
 

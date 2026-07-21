@@ -352,6 +352,16 @@ def _bounded_text(value: Any, limit: int) -> tuple[str, bool]:
 
 def _safe_exception_message(exc: Exception) -> str:
     redacted = _redacted_text(exc)
+    normalized = redacted.casefold()
+    if (
+        "executable doesn't exist" in normalized
+        or "browser executable" in normalized
+        or "playwright install" in normalized
+    ):
+        return (
+            "Playwright's Chromium browser is unavailable. Run "
+            "'python -m playwright install chromium'."
+        )
     message, _ = _bounded_text(redacted, MAX_LOG_TEXT_CHARACTERS)
     return f"Browser validation failed with {type(exc).__name__}: {message}"
 
@@ -416,6 +426,7 @@ def _result(
 ) -> dict[str, Any]:
     return {
         "ok": ok,
+        "status": "passed" if ok else "failed",
         "title": title,
         "final_url": final_url,
         "console_errors": console_errors,

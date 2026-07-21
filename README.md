@@ -266,6 +266,13 @@ working directory using `subprocess.run(..., shell=False)`. Normal executables
 and quoted arguments are supported; shell built-ins, pipes, redirects, and
 operators such as `&&` are intentionally unsupported.
 
+Executables are resolved from `PATH` with `shutil.which`. On Windows, LunarForge
+also applies validated `PATHEXT` candidates, so commands such as `npm`, `npx`,
+`pnpm`, and `yarn` resolve to their `.cmd` launchers without enabling a shell. A
+missing executable reports its name, the PATH entry count, and a validated
+PATHEXT candidate count without printing potentially sensitive environment
+contents.
+
 Dangerous command patterns are checked before parsing and again after argument
 normalization. The denylist includes recursive destructive operations, privilege
 escalation, SSH/SCP, `.env` and SSH-key access, pipe-to-shell installers, raw
@@ -368,6 +375,17 @@ project-confined, and artifacts are never uploaded.
 Start the application separately through an approved command, then ask
 LunarForge to validate its local URL. Browser validation is hidden in plan mode
 and normal installs and tests do not require Playwright or a real browser.
+
+For deterministic validation without a model or API key, run:
+
+```bash
+lunar-forge browser-validate http://127.0.0.1:8000 --project ./my-app
+lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --check "#root"
+```
+
+The command prints bounded JSON containing status, title, final URL, console
+errors, failed requests, selector results, and the project-relative screenshot
+path. It does not load agent configuration, contact a model, or start a server.
 
 ## Checkpoints, rollback, and sessions
 

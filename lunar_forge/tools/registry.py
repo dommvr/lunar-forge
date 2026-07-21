@@ -494,8 +494,11 @@ def _execution_tools(
         Tool(
             name="run_browser_validation",
             description=(
-                "Inspect an already-running local web page with optional Playwright "
-                "support after approval; this never starts a development server."
+                "Preferred tool for browser/UI validation, rendered-page checks, "
+                "console and request errors, and screenshots of an already-running "
+                "local site. Use this instead of curl or run_validation for UI "
+                "evidence. Requires approval and optional Playwright support; it "
+                "never starts a development server."
             ),
             parameters={
                 "type": "object",

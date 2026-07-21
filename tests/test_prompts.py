@@ -44,6 +44,16 @@ def test_system_prompt_requires_validation_and_bounded_fix_attempt():
     assert "Do not loop through repeated fixes" in prompt
 
 
+def test_system_prompt_routes_ui_validation_to_browser_tool():
+    prompt = build_system_prompt(PROJECT_INFO, "No extra instructions.", "default")
+
+    assert "Prefer run_browser_validation" in prompt
+    assert "Do not substitute curl, run_command, or run_validation" in prompt
+    assert "create the requested screenshot" in prompt
+    assert "Never start" in prompt
+    assert "development server automatically" in prompt
+
+
 def test_system_prompt_requires_final_summary_sections():
     prompt = build_system_prompt(PROJECT_INFO, "No extra instructions.", "default")
 

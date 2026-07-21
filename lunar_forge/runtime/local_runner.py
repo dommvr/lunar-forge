@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Sequence
 
 from lunar_forge.permissions import dangerous_command_reason
@@ -82,6 +83,19 @@ def run_local_command(
             started,
         )
 
+    executable = arguments[0]
+    resolved_executable = _resolve_executable(executable, root)
+    if resolved_executable is None:
+        return _error_result(
+            command,
+            (
+                f"Executable {executable!r} was not found. "
+                f"{_path_summary()}"
+            ),
+            started,
+        )
+    arguments[0] = resolved_executable
+
     try:
         completed = subprocess.run(
             arguments,
@@ -151,6 +165,75 @@ def _split_command(command: str) -> list[str]:
     # shlex is POSIX-oriented. In non-POSIX mode it preserves surrounding
     # quotes, so remove only a single matching pair from each parsed argument.
     return [_strip_matching_quotes(item) for item in shlex.split(command, posix=False)]
+
+
+def _resolve_executable(executable: str, cwd: Path) -> str | None:
+    """Resolve one argv executable without involving a command shell."""
+    path_value = os.environ.get("PATH")
+    lookup_name = executable
+    if "/" in executable or "\\" in executable:
+        executable_path = Path(executable)
+        if not executable_path.is_absolute():
+            executable_path = cwd / executable_path
+        lookup_name = str(executable_path)
+
+    resolved = shutil.which(lookup_name, path=path_value)
+    if resolved is not None:
+        return str(resolved)
+    if not _is_windows() or PureWindowsPath(executable).suffix:
+        return None
+
+    # ``shutil.which`` normally applies PATHEXT on Windows. Trying the validated
+    # candidates explicitly also covers Python/platform combinations where the
+    # extension lookup is not applied to an extensionless command.
+    for extension in _windows_pathext():
+        resolved = shutil.which(f"{lookup_name}{extension}", path=path_value)
+        if resolved is not None:
+            return str(resolved)
+    return None
+
+
+def _windows_pathext() -> tuple[str, ...]:
+    raw_value = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    extensions: list[str] = []
+    seen: set[str] = set()
+    for raw_extension in raw_value.split(";"):
+        extension = raw_extension.strip()
+        if not extension.startswith("."):
+            extension = f".{extension}"
+        if (
+            len(extension) < 2
+            or len(extension) > 16
+            or not extension[1:].isalnum()
+        ):
+            continue
+        normalized = extension.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        extensions.append(extension)
+    return tuple(extensions)
+
+
+def _path_summary() -> str:
+    raw_path = os.environ.get("PATH")
+    if raw_path is None:
+        summary = "PATH summary: PATH is unset."
+    else:
+        separator = ";" if _is_windows() else os.pathsep
+        entry_count = sum(1 for entry in raw_path.split(separator) if entry.strip())
+        summary = f"PATH summary: {entry_count} non-empty entries configured."
+    if _is_windows():
+        extensions = _windows_pathext()
+        summary = (
+            f"{summary} PATHEXT summary: {len(extensions)} validated "
+            "candidates configured."
+        )
+    return summary
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _strip_matching_quotes(value: str) -> str:
