@@ -381,7 +381,12 @@ For deterministic validation without a model or API key, run:
 ```bash
 lunar-forge browser-validate http://127.0.0.1:8000 --project ./my-app
 lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --check "#root"
+lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --full-page --width 1440 --height 1200
 ```
+
+Screenshots use a 1280x720 viewport by default. Pass `--full-page` to capture
+the whole scrollable page; `--width` and `--height` control the browser
+viewport used for layout.
 
 The command prints bounded JSON containing status, title, final URL, console
 errors, failed requests, selector results, and the project-relative screenshot

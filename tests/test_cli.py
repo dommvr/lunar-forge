@@ -204,12 +204,18 @@ def test_browser_validate_command_is_model_free_and_returns_json(
         screenshot=True,
         checks=None,
         *,
+        full_page=False,
+        width=1280,
+        height=720,
         project_root=".",
     ):
         captured.update(
             url=url,
             screenshot=screenshot,
             checks=checks,
+            full_page=full_page,
+            width=width,
+            height=height,
             project_root=project_root,
         )
         return {
@@ -254,5 +260,62 @@ def test_browser_validate_command_is_model_free_and_returns_json(
         "url": "http://127.0.0.1:5173",
         "screenshot": True,
         "checks": ["#root"],
+        "full_page": False,
+        "width": 1280,
+        "height": 720,
+        "project_root": tmp_path.resolve(),
+    }
+
+
+def test_browser_validate_command_accepts_full_page_and_viewport(
+    monkeypatch,
+    tmp_path,
+):
+    _forbid_model_and_config(monkeypatch)
+    captured = {}
+
+    def fake_browser_validation(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return {
+            "ok": True,
+            "status": "passed",
+            "title": "Long page",
+            "final_url": url,
+            "console_errors": [],
+            "failed_requests": [],
+            "screenshot_path": ".agent/artifacts/browser/browser-long.png",
+            "checks": [],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_browser_validation",
+        fake_browser_validation,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "browser-validate",
+            "http://localhost:5173",
+            "--project",
+            str(tmp_path),
+            "--full-page",
+            "--width",
+            "1440",
+            "--height",
+            "1200",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "url": "http://localhost:5173",
+        "screenshot": True,
+        "checks": None,
+        "full_page": True,
+        "width": 1440,
+        "height": 1200,
         "project_root": tmp_path.resolve(),
     }

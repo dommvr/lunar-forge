@@ -27,7 +27,11 @@ from lunar_forge.workflows.new_project import (
     run_new_project,
     select_template,
 )
-from lunar_forge.workflows.browser_validation import run_browser_validation
+from lunar_forge.workflows.browser_validation import (
+    DEFAULT_VIEWPORT_HEIGHT,
+    DEFAULT_VIEWPORT_WIDTH,
+    run_browser_validation,
+)
 
 
 class DefaultCommandGroup(TyperGroup):
@@ -121,9 +125,30 @@ def browser_validate_command(
         bool,
         typer.Option(
             "--screenshot/--no-screenshot",
-            help="Capture a bounded viewport screenshot.",
+            help="Capture a bounded screenshot.",
         ),
     ] = True,
+    full_page: Annotated[
+        bool,
+        typer.Option(
+            "--full-page",
+            help="Capture the whole scrollable page instead of the viewport.",
+        ),
+    ] = False,
+    width: Annotated[
+        int,
+        typer.Option(
+            "--width",
+            help="Browser viewport width in pixels.",
+        ),
+    ] = DEFAULT_VIEWPORT_WIDTH,
+    height: Annotated[
+        int,
+        typer.Option(
+            "--height",
+            help="Browser viewport height in pixels.",
+        ),
+    ] = DEFAULT_VIEWPORT_HEIGHT,
     checks: Annotated[
         list[str] | None,
         typer.Option(
@@ -137,6 +162,9 @@ def browser_validate_command(
         url,
         screenshot=screenshot,
         checks=checks,
+        full_page=full_page,
+        width=width,
+        height=height,
         project_root=project.expanduser().resolve(),
     )
     output = dict(result)

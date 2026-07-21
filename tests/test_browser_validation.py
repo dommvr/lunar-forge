@@ -99,8 +99,9 @@ class FakePage:
         return FakeLocator(self.selectors.get(selector, 0))
 
     def screenshot(self, *, path, full_page):
-        assert full_page is False
-        self.screenshot_calls.append(path)
+        self.screenshot_calls.append(
+            {"path": path, "full_page": full_page}
+        )
         Path(path).write_bytes(self.screenshot_bytes)
 
 
@@ -262,7 +263,12 @@ def test_browser_validation_captures_page_data_and_local_screenshot(tmp_path):
     screenshot_path = result["screenshot_path"]
     assert screenshot_path.startswith(".agent/artifacts/browser/browser-")
     assert screenshot_path.endswith(".png")
-    assert (tmp_path / screenshot_path).read_bytes() == b"fake-png"
+    artifact_path = (tmp_path / screenshot_path).resolve()
+    artifact_path.relative_to(tmp_path.resolve())
+    assert artifact_path.read_bytes() == b"fake-png"
+    assert page.screenshot_calls == [
+        {"path": str(artifact_path), "full_page": False}
+    ]
     assert page.goto_calls == [
         ("http://127.0.0.1:8000", "domcontentloaded", 30_000)
     ]
@@ -273,6 +279,31 @@ def test_browser_validation_captures_page_data_and_local_screenshot(tmp_path):
     assert playwright.browser.closed is True
     assert playwright.exited is True
     json.dumps(result)
+
+
+def test_full_page_screenshot_uses_requested_viewport_and_stays_confined(
+    tmp_path,
+):
+    page = FakePage()
+    playwright, factory = _factory_for(page)
+
+    result = run_browser_validation(
+        "http://localhost:5173",
+        full_page=True,
+        width=1440,
+        height=1200,
+        project_root=tmp_path,
+        _playwright_factory=factory,
+    )
+
+    artifact_path = (tmp_path / result["screenshot_path"]).resolve()
+    artifact_path.relative_to(tmp_path.resolve())
+    assert result["ok"] is True
+    assert artifact_path.is_file()
+    assert playwright.browser.viewport == {"width": 1440, "height": 1200}
+    assert page.screenshot_calls == [
+        {"path": str(artifact_path), "full_page": True}
+    ]
 
 
 def test_browser_tool_is_registered_in_normal_tool_schemas(tmp_path):

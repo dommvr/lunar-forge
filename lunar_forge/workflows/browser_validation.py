@@ -23,7 +23,18 @@ MAX_LOG_ENTRIES = 10
 MAX_CHECKS = 20
 MAX_CHECK_CHARACTERS = 500
 MAX_SCREENSHOT_BYTES = 5_000_000
-VIEWPORT = MappingProxyType({"width": 1280, "height": 720})
+DEFAULT_VIEWPORT_WIDTH = 1280
+DEFAULT_VIEWPORT_HEIGHT = 720
+MIN_VIEWPORT_WIDTH = 320
+MAX_VIEWPORT_WIDTH = 3840
+MIN_VIEWPORT_HEIGHT = 240
+MAX_VIEWPORT_HEIGHT = 2160
+VIEWPORT = MappingProxyType(
+    {
+        "width": DEFAULT_VIEWPORT_WIDTH,
+        "height": DEFAULT_VIEWPORT_HEIGHT,
+    }
+)
 _SENSITIVE_URL_KEY_PARTS = (
     "apikey",
     "authorization",
@@ -45,17 +56,25 @@ def run_browser_validation(
     screenshot: bool = True,
     checks: Sequence[str] | None = None,
     *,
+    full_page: bool = False,
+    width: int = DEFAULT_VIEWPORT_WIDTH,
+    height: int = DEFAULT_VIEWPORT_HEIGHT,
     project_root: str | Path = ".",
     _playwright_factory: PlaywrightFactory | None = None,
 ) -> dict[str, Any]:
     """Inspect an existing loopback URL without starting a development server.
 
     "checks" is an optional list of CSS selectors expected to match at least
-    one element. Playwright is imported only when this function is called.
+    one element. ``full_page`` controls whether the screenshot includes the
+    entire scrollable page. Playwright is imported only when this function is
+    called.
     """
     try:
         local_url = _validated_local_url(url)
         normalized_checks = _validated_checks(checks)
+        if not isinstance(full_page, bool):
+            raise TypeError("Browser full_page must be a boolean.")
+        viewport = _validated_viewport(width, height)
         root = Path(project_root).expanduser().resolve()
         if not root.is_dir():
             raise ValueError("Project root must be an existing directory.")
@@ -82,7 +101,7 @@ def run_browser_validation(
         with factory() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
-                page = browser.new_page(viewport=dict(VIEWPORT))
+                page = browser.new_page(viewport=viewport)
                 page.on(
                     "console",
                     lambda message: _capture_console_error(
@@ -131,7 +150,10 @@ def run_browser_validation(
                 if screenshot:
                     screenshot_file = _screenshot_file(root)
                     screenshot_file.parent.mkdir(parents=True, exist_ok=True)
-                    page.screenshot(path=str(screenshot_file), full_page=False)
+                    page.screenshot(
+                        path=str(screenshot_file),
+                        full_page=full_page,
+                    )
                     if not screenshot_file.is_file():
                         raise RuntimeError("Playwright did not create the screenshot.")
                     if screenshot_file.stat().st_size > MAX_SCREENSHOT_BYTES:
@@ -231,6 +253,39 @@ def _validated_checks(checks: Sequence[str] | None) -> tuple[str, ...]:
             raise ValueError("Browser check selector is too long.")
         normalized.append(selector)
     return tuple(normalized)
+
+
+def _validated_viewport(width: int, height: int) -> dict[str, int]:
+    return {
+        "width": _validated_viewport_dimension(
+            width,
+            name="width",
+            minimum=MIN_VIEWPORT_WIDTH,
+            maximum=MAX_VIEWPORT_WIDTH,
+        ),
+        "height": _validated_viewport_dimension(
+            height,
+            name="height",
+            minimum=MIN_VIEWPORT_HEIGHT,
+            maximum=MAX_VIEWPORT_HEIGHT,
+        ),
+    }
+
+
+def _validated_viewport_dimension(
+    value: int,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"Viewport {name} must be an integer.")
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"Viewport {name} must be between {minimum} and {maximum} pixels."
+        )
+    return value
 
 
 def _route_local_request(
