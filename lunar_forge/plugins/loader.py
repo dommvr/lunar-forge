@@ -63,12 +63,22 @@ class LoadedPlugin:
     manifest_path: Path
 
 
+@dataclass(frozen=True)
+class InspectedPlugin:
+    """One configured plugin inspected without importing its entrypoint code."""
+
+    entry: PluginConfigEntry
+    manifest_path: Path | None
+    manifest: PluginManifest | None
+    error: str | None = None
+
+
 def load_plugin_config(project_root: str | Path) -> PluginConfig:
     """Load only the project's explicit .agent/plugins.yaml configuration."""
     root = Path(project_root).expanduser().resolve()
     if not root.is_dir():
         raise PluginConfigError("Project root must be an existing directory.")
-    config_path = safe_path(root, PLUGIN_CONFIG_PATH)
+    config_path = plugin_config_path(root)
     if not config_path.exists():
         return PluginConfig()
     if not config_path.is_file():
@@ -84,6 +94,14 @@ def load_plugin_config(project_root: str | Path) -> PluginConfig:
     except yaml.YAMLError as exc:
         raise PluginConfigError("Plugin config contains invalid YAML.") from exc
     return parse_plugin_config(document)
+
+
+def plugin_config_path(project_root: str | Path) -> Path:
+    """Return the confined project plugin-config path without reading it."""
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise PluginConfigError("Project root must be an existing directory.")
+    return safe_path(root, PLUGIN_CONFIG_PATH)
 
 
 def parse_plugin_config(document: Any) -> PluginConfig:
@@ -172,6 +190,46 @@ def load_enabled_plugins(
             )
         )
     return tuple(loaded)
+
+
+def inspect_configured_plugins(
+    project_root: str | Path,
+    config: PluginConfig | None = None,
+) -> tuple[InspectedPlugin, ...]:
+    """Validate every explicit manifest without resolving plugin entrypoints."""
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise PluginConfigError("Project root must be an existing directory.")
+    resolved_config = config or load_plugin_config(root)
+    inspected: list[InspectedPlugin] = []
+    for name, entry in sorted(resolved_config.plugins.items()):
+        manifest_path: Path | None = None
+        manifest: PluginManifest | None = None
+        error: str | None = None
+        try:
+            _validate_manifest_reference(entry.manifest)
+            manifest_path = safe_path(root, entry.manifest)
+            manifest = load_plugin_manifest(manifest_path)
+            if manifest.name != name:
+                raise PluginConfigError(
+                    f"Configured plugin '{name}' does not match its manifest name."
+                )
+        except PermissionError:
+            error = (
+                f"Configured plugin '{name}' manifest path escapes "
+                "the project root."
+            )
+        except (PluginConfigError, PluginManifestError) as exc:
+            error = str(exc)
+        inspected.append(
+            InspectedPlugin(
+                entry=entry,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                error=error,
+            )
+        )
+    return tuple(inspected)
 
 
 def _validate_manifest_reference(manifest: str) -> None:

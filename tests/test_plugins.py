@@ -24,6 +24,7 @@ from lunar_forge.plugins.manifest import (
     parse_plugin_manifest,
 )
 from lunar_forge.plugins.registry import (
+    build_plugin_diagnostic,
     register_plugin_tools,
     resolve_local_plugin_entrypoint,
 )
@@ -318,6 +319,145 @@ def test_manifest_loading_does_not_import_plugin_entrypoint(tmp_path):
 
     assert len(loaded) == 1
     assert not marker.exists()
+
+
+def test_plugin_diagnostic_reports_config_manifests_and_safe_tool_names(tmp_path):
+    example_path = _write_manifest(tmp_path)
+    disabled_manifest = copy.deepcopy(_manifest())
+    disabled_manifest["name"] = "disabled"
+    disabled_manifest["tools"][0]["name"] = "disabled.ping"
+    disabled_path = tmp_path / "plugin_packs" / "disabled" / "plugin.yaml"
+    disabled_path.parent.mkdir(parents=True)
+    disabled_path.write_text(
+        yaml.safe_dump(disabled_manifest),
+        encoding="utf-8",
+    )
+    config_directory = tmp_path / ".agent"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.yaml").write_text(
+        "plugins:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    (config_directory / "plugins.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "example": {
+                        "manifest": "plugin_packs/example/plugin.yaml",
+                        "enabled": True,
+                    },
+                    "disabled": {
+                        "manifest": "plugin_packs/disabled/plugin.yaml",
+                        "enabled": False,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "plugin-code-ran.txt"
+    (example_path.parent / "example_plugin.py").write_text(
+        (
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('executed')\n"
+            "def echo(message):\n    return {'ok': True, 'echo': message}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_plugin_diagnostic(tmp_path, globally_enabled=True)
+
+    assert result["ok"] is True
+    assert result["plugins_enabled"] is True
+    assert result["enabled_plugins"] == ["example"]
+    assert result["disabled_plugins"] == ["disabled"]
+    assert result["plugins_config"] == {
+        "path": str((config_directory / "plugins.yaml").resolve()),
+        "loaded": True,
+    }
+    project_config = next(
+        item for item in result["config_files"] if item["scope"] == "project"
+    )
+    assert project_config["loaded"] is True
+    summaries = {item["name"]: item for item in result["plugins"]}
+    assert summaries["example"]["manifest_path"] == str(example_path.resolve())
+    assert summaries["disabled"]["manifest_path"] == str(disabled_path.resolve())
+    tools = {
+        item["internal_tool_name"]: item
+        for item in result["discovered_tools"]
+    }
+    assert tools["example.echo"]["model_tool_name"] == "example_echo"
+    assert tools["disabled.ping"]["model_tool_name"] == "disabled_ping"
+    assert tools["disabled.ping"]["effective_enabled"] is False
+    assert not marker.exists()
+
+
+def test_plugin_diagnostic_rejects_disabled_manifest_path_escape(tmp_path):
+    _write_config(
+        tmp_path,
+        manifest="../outside-plugin.yaml",
+        enabled=False,
+    )
+
+    result = build_plugin_diagnostic(tmp_path, globally_enabled=False)
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["disabled_plugins"] == ["example"]
+    assert "escapes the project root" in result["errors"][0]["error"]
+
+
+def test_plugin_diagnostic_reports_global_disabled_state(tmp_path):
+    _write_manifest(tmp_path)
+    _write_config(tmp_path, enabled=True)
+
+    result = build_plugin_diagnostic(tmp_path, globally_enabled=False)
+
+    assert result["ok"] is True
+    assert result["status"] == "disabled"
+    assert result["plugins_enabled"] is False
+    assert result["enabled_plugins"] == ["example"]
+    assert result["discovered_tools"][0]["effective_enabled"] is False
+    assert "disabled in config.yaml" in result["note"]
+
+
+def test_plugin_diagnostic_reports_unknown_config_and_manifest_keys(tmp_path):
+    config_directory = tmp_path / ".agent"
+    config_directory.mkdir()
+    plugins_path = config_directory / "plugins.yaml"
+    plugins_path.write_text(
+        yaml.safe_dump({"plugins": {}, "unexpected": True}),
+        encoding="utf-8",
+    )
+
+    config_error = build_plugin_diagnostic(tmp_path, globally_enabled=True)
+
+    assert config_error["ok"] is False
+    assert config_error["errors"][0]["stage"] == "config"
+    assert "unknown keys" in config_error["errors"][0]["error"]
+
+    invalid_manifest = _manifest()
+    invalid_manifest["unexpected"] = True
+    _write_manifest(tmp_path, invalid_manifest)
+    plugins_path.write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "example": {
+                        "manifest": "plugin_packs/example/plugin.yaml",
+                        "enabled": False,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest_error = build_plugin_diagnostic(tmp_path, globally_enabled=False)
+
+    assert manifest_error["ok"] is False
+    assert manifest_error["errors"][0]["stage"] == "manifest"
+    assert "unknown keys" in manifest_error["errors"][0]["error"]
 
 
 def test_registered_plugin_tool_is_namespaced_and_registry_compatible(tmp_path):

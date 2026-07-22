@@ -184,8 +184,14 @@ forwarded automatically.
 
 Plugins are experimental and disabled by default. Enabling one requires two
 project-local opt-ins. First set `plugins.enabled: true` in
-`.agent/config.yaml`. Then name each manifest explicitly in
-`.agent/plugins.yaml`:
+`.agent/config.yaml`:
+
+```yaml
+plugins:
+  enabled: true
+```
+
+Then name each manifest explicitly in `.agent/plugins.yaml`:
 
 ```yaml
 plugins:
@@ -194,7 +200,8 @@ plugins:
     enabled: true
 ```
 
-A minimal manifest keeps the model-facing schema and capabilities explicit:
+For example, `plugin_packs/example/plugin.yaml` keeps the model-facing schema
+and capabilities explicit:
 
 ```yaml
 name: example
@@ -216,6 +223,14 @@ tools:
       network: false
 ```
 
+Its bundle-local `plugin_packs/example/example_plugin.py` entrypoint can be as
+small as:
+
+```python
+def echo(message):
+    return {"ok": True, "echo": message}
+```
+
 The referenced module must live beneath the manifest directory. LunarForge does
 not scan arbitrary directories, fetch remote plugin code, or import a handler
 while discovering tools. It validates the manifest, registers the namespaced
@@ -230,6 +245,27 @@ Plugin diagnostics and permission requests use the manifest's dotted internal
 name, such as `example.echo`. Model providers see its safe alias,
 `example_echo`; model calls using that alias are resolved back to
 `example.echo` before approval and execution.
+
+Inspect the complete plugin configuration deterministically, without a model,
+API key, permission prompt, or plugin-code import:
+
+```powershell
+lunar-forge plugins list --project C:\path\to\project
+```
+
+The JSON report includes the loaded user/project `config.yaml` files, the
+project `.agent/plugins.yaml` path, global and per-plugin enablement, manifest
+paths, dotted internal tool names, provider-safe model names, and bounded
+config or manifest errors. Every explicitly configured manifest is validated,
+including disabled plugins, so path escapes and unknown schema keys are
+reported before enablement.
+
+After reviewing the diagnostic, an enabled echo plugin can be exercised through
+the normal model and permission flow:
+
+```powershell
+lunar-forge --project C:\path\to\project "Call example.echo with the message hello"
+```
 
 Plugin capability declarations are a trust contract, not an operating-system
 sandbox. Enable only code you have reviewed. The loader intentionally supports

@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 import lunar_forge.cli as cli_module
 from lunar_forge.cli import app
 from lunar_forge.config import AppConfig
-from lunar_forge.config import MCPRuntimeConfig
+from lunar_forge.config import MCPRuntimeConfig, PluginRuntimeConfig
 from lunar_forge.runtime.checkpoints import create_file_checkpoint
 
 
@@ -378,6 +378,76 @@ def test_mcp_list_command_is_model_free_and_returns_diagnostics(
     assert output["discovered_tools"][0]["name"] == (
         "mcp.playwright.browser_navigate"
     )
+    assert captured == {
+        "project_root": tmp_path.resolve(),
+        "globally_enabled": True,
+    }
+
+
+def test_plugins_list_command_is_model_free_and_returns_diagnostics(
+    monkeypatch,
+    tmp_path,
+):
+    def unexpected_model(*args, **kwargs):
+        raise AssertionError("Plugin diagnostics must not use model APIs")
+
+    captured = {}
+    monkeypatch.setattr(cli_module, "run_agent", unexpected_model)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda project_root: AppConfig(
+            plugins=PluginRuntimeConfig(enabled=True)
+        ),
+    )
+
+    def fake_diagnostic(project_root, *, globally_enabled):
+        captured.update(
+            project_root=project_root,
+            globally_enabled=globally_enabled,
+        )
+        return {
+            "ok": True,
+            "status": "passed",
+            "plugins_enabled": True,
+            "config_files": [],
+            "plugins_config": {
+                "path": str(tmp_path / ".agent/plugins.yaml"),
+                "loaded": True,
+            },
+            "enabled_plugins": ["example"],
+            "disabled_plugins": [],
+            "plugins": [],
+            "discovered_tools": [
+                {
+                    "plugin": "example",
+                    "internal_tool_name": "example.echo",
+                    "model_tool_name": "example_echo",
+                }
+            ],
+            "errors": [],
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_plugin_diagnostic",
+        fake_diagnostic,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["plugins", "list", "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["enabled_plugins"] == ["example"]
+    assert output["discovered_tools"][0] == {
+        "plugin": "example",
+        "internal_tool_name": "example.echo",
+        "model_tool_name": "example_echo",
+    }
     assert captured == {
         "project_root": tmp_path.resolve(),
         "globally_enabled": True,

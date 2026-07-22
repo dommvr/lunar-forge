@@ -13,6 +13,7 @@ from typer.core import TyperGroup
 from lunar_forge.agent import run_agent
 from lunar_forge.config import load_config
 from lunar_forge.mcp.client import build_mcp_diagnostic
+from lunar_forge.plugins.registry import build_plugin_diagnostic
 from lunar_forge.runtime.checkpoints import (
     list_checkpoint_directories,
     rollback_file,
@@ -48,6 +49,7 @@ class DefaultCommandGroup(TyperGroup):
             "resume",
             "browser-validate",
             "mcp",
+            "plugins",
             "--help",
             "-h",
         }
@@ -66,6 +68,11 @@ mcp_app = typer.Typer(
     help="Inspect explicitly configured local MCP servers.",
 )
 app.add_typer(mcp_app, name="mcp")
+plugins_app = typer.Typer(
+    add_completion=False,
+    help="Inspect explicitly configured local plugins without loading code.",
+)
+app.add_typer(plugins_app, name="plugins")
 
 
 @app.command()
@@ -203,6 +210,38 @@ def mcp_list_command(
         result = build_mcp_diagnostic(
             project_root,
             globally_enabled=config.mcp.enabled,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if result.get("ok") is not True:
+        raise typer.Exit(code=1)
+
+
+@plugins_app.command("list")
+def plugins_list_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """Report plugin config and manifest tools without importing plugin code."""
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        result = build_plugin_diagnostic(
+            project_root,
+            globally_enabled=config.plugins.enabled,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)

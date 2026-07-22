@@ -9,19 +9,204 @@ from types import ModuleType
 from typing import Any
 
 from lunar_forge.permissions import PermissionLevel
-from lunar_forge.plugins.loader import LoadedPlugin
+from lunar_forge.plugins.loader import (
+    LoadedPlugin,
+    PluginConfigError,
+    inspect_configured_plugins,
+    load_plugin_config,
+    plugin_config_path,
+)
 from lunar_forge.plugins.manifest import PluginPermissions, PluginToolManifest
 from lunar_forge.plugins.sandbox import PluginHandler, invoke_plugin_handler
 from lunar_forge.tools.files import safe_path
-from lunar_forge.tools.registry import Tool, ToolRegistry
+from lunar_forge.tools.registry import (
+    MAX_REGISTERED_TOOLS,
+    Tool,
+    ToolRegistry,
+    provider_safe_tool_name,
+)
 
 
 EntrypointResolver = Callable[[LoadedPlugin, PluginToolManifest], PluginHandler]
 MAX_PLUGIN_SOURCE_CHARACTERS = 1_000_000
+MAX_PLUGIN_DIAGNOSTIC_ERROR_CHARACTERS = 2_000
 
 
 class PluginRegistrationError(ValueError):
     """Raised before any invalid plugin tool is exposed to the model."""
+
+
+def build_plugin_diagnostic(
+    project_root: str | Path,
+    *,
+    globally_enabled: bool,
+) -> dict[str, Any]:
+    """Inspect explicit plugin manifests without importing or executing code."""
+    root = Path(project_root).expanduser().resolve()
+    try:
+        plugins_path = plugin_config_path(root)
+        config_files = [
+            {
+                "scope": scope,
+                "path": str(path),
+                "loaded": path.is_file(),
+            }
+            for scope, path in (
+                ("user", Path.home() / ".lunar-forge" / "config.yaml"),
+                ("project", safe_path(root, ".agent/config.yaml")),
+            )
+        ]
+    except (OSError, PluginConfigError, PermissionError) as exc:
+        return _plugin_diagnostic_error(exc)
+
+    base: dict[str, Any] = {
+        "ok": True,
+        "status": "passed" if globally_enabled else "disabled",
+        "plugins_enabled": globally_enabled,
+        "config_files": config_files,
+        "plugins_config": {
+            "path": str(plugins_path),
+            "loaded": plugins_path.is_file(),
+        },
+        "enabled_plugins": [],
+        "disabled_plugins": [],
+        "plugins": [],
+        "discovered_tools": [],
+        "errors": [],
+        "truncated": False,
+    }
+    try:
+        config = load_plugin_config(root)
+    except (OSError, PluginConfigError, PermissionError) as exc:
+        base["ok"] = False
+        base["status"] = "failed"
+        base["errors"].append(
+            {
+                "stage": "config",
+                "error": _bounded_plugin_error(exc),
+            }
+        )
+        return base
+
+    base["enabled_plugins"] = [
+        entry.name
+        for _, entry in sorted(config.plugins.items())
+        if entry.enabled
+    ]
+    base["disabled_plugins"] = [
+        entry.name
+        for _, entry in sorted(config.plugins.items())
+        if not entry.enabled
+    ]
+
+    model_names: dict[str, str] = {}
+    for inspected in inspect_configured_plugins(root, config):
+        entry = inspected.entry
+        manifest_path = (
+            str(inspected.manifest_path)
+            if inspected.manifest_path is not None
+            else entry.manifest
+        )
+        plugin_summary: dict[str, Any] = {
+            "name": entry.name,
+            "enabled": entry.enabled,
+            "effective_enabled": globally_enabled and entry.enabled,
+            "manifest_path": manifest_path,
+            "manifest_loaded": inspected.manifest is not None,
+        }
+        base["plugins"].append(plugin_summary)
+        if inspected.error is not None:
+            base["errors"].append(
+                {
+                    "stage": "manifest",
+                    "plugin": entry.name,
+                    "manifest_path": manifest_path,
+                    "error": inspected.error[
+                        :MAX_PLUGIN_DIAGNOSTIC_ERROR_CHARACTERS
+                    ],
+                }
+            )
+            continue
+        assert inspected.manifest is not None
+        for definition in inspected.manifest.tools:
+            if len(base["discovered_tools"]) >= MAX_REGISTERED_TOOLS:
+                base["truncated"] = True
+                base["errors"].append(
+                    {
+                        "stage": "discovery",
+                        "error": (
+                            "Plugin diagnostics support at most "
+                            f"{MAX_REGISTERED_TOOLS} discovered tools."
+                        ),
+                    }
+                )
+                break
+            model_name = provider_safe_tool_name(definition.name)
+            colliding_internal_name = model_names.get(model_name)
+            if (
+                colliding_internal_name is not None
+                and colliding_internal_name != definition.name
+            ):
+                base["errors"].append(
+                    {
+                        "stage": "discovery",
+                        "plugin": entry.name,
+                        "error": (
+                            "Provider-safe tool name collision: "
+                            f"{colliding_internal_name!r} and "
+                            f"{definition.name!r} both map to {model_name!r}."
+                        ),
+                    }
+                )
+            else:
+                model_names[model_name] = definition.name
+            base["discovered_tools"].append(
+                {
+                    "plugin": entry.name,
+                    "plugin_enabled": entry.enabled,
+                    "effective_enabled": globally_enabled and entry.enabled,
+                    "internal_tool_name": definition.name,
+                    "model_tool_name": model_name,
+                }
+            )
+        if base["truncated"]:
+            break
+
+    if base["errors"]:
+        base["ok"] = False
+        base["status"] = "failed"
+    elif not globally_enabled:
+        base["note"] = (
+            "Plugins are disabled in config.yaml; manifests were inspected but "
+            "plugin code was not loaded."
+        )
+    return base
+
+
+def _plugin_diagnostic_error(exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "failed",
+        "plugins_enabled": False,
+        "config_files": [],
+        "plugins_config": {"path": None, "loaded": False},
+        "enabled_plugins": [],
+        "disabled_plugins": [],
+        "plugins": [],
+        "discovered_tools": [],
+        "errors": [
+            {"stage": "config", "error": _bounded_plugin_error(exc)}
+        ],
+        "truncated": False,
+    }
+
+
+def _bounded_plugin_error(exc: Exception) -> str:
+    if isinstance(exc, (PluginConfigError, PermissionError, OSError)):
+        message = str(exc)
+    else:
+        message = f"Plugin diagnostic failed with {type(exc).__name__}."
+    return message[:MAX_PLUGIN_DIAGNOSTIC_ERROR_CHARACTERS]
 
 
 def resolve_local_plugin_entrypoint(
