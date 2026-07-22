@@ -6,7 +6,7 @@ import ipaddress
 import re
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
@@ -204,11 +204,14 @@ def run_browser_validation(
         if not root.is_dir():
             raise ValueError("Project root must be an existing directory.")
     except (TypeError, ValueError) as exc:
-        return _error_result(str(exc))
+        return _error_result(
+            str(exc),
+            full_page=full_page if isinstance(full_page, bool) else None,
+        )
 
     factory = _playwright_factory or _load_playwright_factory()
     if factory is None:
-        return _error_result(_PLAYWRIGHT_SETUP_ERROR)
+        return _error_result(_PLAYWRIGHT_SETUP_ERROR, full_page=full_page)
 
     console_errors: list[str] = []
     failed_requests: list[dict[str, str]] = []
@@ -299,6 +302,7 @@ def run_browser_validation(
             screenshot_path=screenshot_path,
             checks=check_results,
             truncated=state["truncated"],
+            full_page=full_page,
         )
         result["error"] = _safe_exception_message(exc)
         return result
@@ -313,6 +317,7 @@ def run_browser_validation(
         screenshot_path=screenshot_path,
         checks=check_results,
         truncated=state["truncated"],
+        full_page=full_page,
     )
     if not checks_passed:
         result["error"] = "One or more browser checks failed."
@@ -435,12 +440,14 @@ def _run_approved_managed_browser_validation(
     except OSError as exc:
         return _managed_error_result(
             "Could not start the managed dev server: "
-            f"{_safe_process_error(exc)}"
+            f"{_safe_process_error(exc)}",
+            startup_failed=True,
         )
 
     stdout_collector, stdout_thread = _start_output_collector(process.stdout)
     stderr_collector, stderr_thread = _start_output_collector(process.stderr)
     ready = False
+    startup_failed = False
     try:
         deadline = clock() + (startup_timeout_ms / 1000)
         startup_error: str | None = None
@@ -468,6 +475,7 @@ def _run_approved_managed_browser_validation(
             sleep(min(SERVER_PROBE_INTERVAL_SECONDS, remaining))
 
         if startup_error is not None:
+            startup_failed = True
             result = _managed_error_result(startup_error)
         else:
             result = run_browser_validation(
@@ -481,20 +489,21 @@ def _run_approved_managed_browser_validation(
                 _playwright_factory=_playwright_factory,
             )
     except Exception as exc:
+        startup_failed = not ready
         result = _managed_error_result(
             "Managed browser validation failed: "
             f"{_safe_process_error(exc)}"
         )
     finally:
-        stopped = _stop_server_process(process)
+        stop_result = _stop_server_process(process)
         _join_output_thread(stdout_thread, stdout_collector)
         _join_output_thread(stderr_thread, stderr_collector)
     result["managed_server"] = _server_result(
-        process,
         stdout_collector,
         stderr_collector,
         ready=ready,
-        stopped=stopped,
+        startup_failed=startup_failed,
+        stop_result=stop_result,
     )
     return result
 
@@ -595,10 +604,19 @@ def _validated_server_timeout(value: int) -> int:
     return value
 
 
-def _stop_server_process(process: Any) -> bool:
+def _stop_server_process(process: Any) -> dict[str, Any]:
     try:
-        if process.poll() is not None:
-            return True
+        exit_code = process.poll()
+        if exit_code is not None:
+            return {
+                "stopped": True,
+                "terminated_by_lunar_forge": False,
+                "exit_code": exit_code,
+                "stop_note": (
+                    "Managed dev server exited on its own before LunarForge "
+                    "requested shutdown."
+                ),
+            }
         process.terminate()
         process.wait(timeout=SERVER_STOP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -606,30 +624,48 @@ def _stop_server_process(process: Any) -> bool:
             process.kill()
             process.wait(timeout=SERVER_STOP_TIMEOUT_SECONDS)
         except Exception:
-            return False
+            return {
+                "stopped": False,
+                "terminated_by_lunar_forge": False,
+                "exit_code": None,
+                "stop_note": "LunarForge could not confirm managed server shutdown.",
+            }
     except Exception:
         try:
             process.kill()
+            process.wait(timeout=SERVER_STOP_TIMEOUT_SECONDS)
         except Exception:
-            return False
+            return {
+                "stopped": False,
+                "terminated_by_lunar_forge": False,
+                "exit_code": None,
+                "stop_note": "LunarForge could not confirm managed server shutdown.",
+            }
     try:
-        return process.poll() is not None
+        stopped = process.poll() is not None
     except Exception:
-        return False
+        stopped = False
+    return {
+        "stopped": stopped,
+        "terminated_by_lunar_forge": stopped,
+        "exit_code": None,
+        "stop_note": (
+            "Managed dev server was stopped intentionally by LunarForge; "
+            "the stop-related exit code is omitted."
+            if stopped
+            else "LunarForge could not confirm managed server shutdown."
+        ),
+    }
 
 
 def _server_result(
-    process: Any,
     stdout: _BoundedOutputCollector,
     stderr: _BoundedOutputCollector,
     *,
     ready: bool,
-    stopped: bool,
+    startup_failed: bool,
+    stop_result: Mapping[str, Any],
 ) -> dict[str, Any]:
-    try:
-        exit_code = process.poll()
-    except Exception:
-        exit_code = None
     stdout_text, stdout_truncated = _bounded_text(
         _redacted_text(stdout.value()),
         MAX_SERVER_OUTPUT_CHARACTERS,
@@ -641,8 +677,13 @@ def _server_result(
     return {
         "started": True,
         "ready": ready,
-        "stopped": stopped,
-        "exit_code": exit_code,
+        "startup_failed": startup_failed,
+        "terminated_by_lunar_forge": (
+            stop_result.get("terminated_by_lunar_forge") is True
+        ),
+        "stopped": stop_result.get("stopped") is True,
+        "stop_note": str(stop_result.get("stop_note") or ""),
+        "exit_code": stop_result.get("exit_code"),
         "stdout": stdout_text,
         "stderr": stderr_text,
         "output_truncated": (
@@ -654,12 +695,19 @@ def _server_result(
     }
 
 
-def _managed_error_result(error: str) -> dict[str, Any]:
+def _managed_error_result(
+    error: str,
+    *,
+    startup_failed: bool = False,
+) -> dict[str, Any]:
     result = _error_result(error)
     result["managed_server"] = {
         "started": False,
         "ready": False,
+        "startup_failed": startup_failed,
+        "terminated_by_lunar_forge": False,
         "stopped": False,
+        "stop_note": "Managed dev server was not started.",
         "exit_code": None,
         "stdout": "",
         "stderr": "",
@@ -952,7 +1000,11 @@ def _redacted_url(url: str) -> str:
     )
 
 
-def _error_result(error: str) -> dict[str, Any]:
+def _error_result(
+    error: str,
+    *,
+    full_page: bool | None = None,
+) -> dict[str, Any]:
     bounded_error, truncated = _bounded_text(error, MAX_LOG_TEXT_CHARACTERS)
     result = _result(
         ok=False,
@@ -963,6 +1015,7 @@ def _error_result(error: str) -> dict[str, Any]:
         screenshot_path=None,
         checks=[],
         truncated=truncated,
+        full_page=full_page,
     )
     result["error"] = bounded_error
     return result
@@ -1001,6 +1054,7 @@ def _result(
     screenshot_path: str | None,
     checks: list[dict[str, Any]],
     truncated: bool,
+    full_page: bool | None,
 ) -> dict[str, Any]:
     return {
         "ok": ok,
@@ -1012,4 +1066,5 @@ def _result(
         "screenshot_path": screenshot_path,
         "checks": checks,
         "truncated": truncated,
+        "full_page": full_page,
     }

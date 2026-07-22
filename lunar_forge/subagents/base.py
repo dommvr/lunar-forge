@@ -25,6 +25,8 @@ BUILTIN_SUBAGENT_TOOLS = frozenset(
         "run_command",
         "detect_project",
         "run_validation",
+        "run_browser_validation",
+        "run_managed_browser_validation",
     }
 )
 SUBAGENT_WRITE_TOOLS = frozenset(
@@ -47,11 +49,13 @@ class SubagentRole:
     system_prompt_fragment: str
     allowed_tools: frozenset[str]
     blocked_tools: frozenset[str]
+    allowed_tool_prefixes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized_name = self.name.strip().lower()
         allowed_tools = frozenset(self.allowed_tools)
         blocked_tools = frozenset(self.blocked_tools)
+        allowed_tool_prefixes = tuple(self.allowed_tool_prefixes)
         if not normalized_name:
             raise ValueError("Subagent role name must not be empty.")
         if not self.purpose.strip():
@@ -60,6 +64,13 @@ class SubagentRole:
             raise ValueError("Subagent system prompt fragment must not be empty.")
         if any(not tool.strip() for tool in allowed_tools | blocked_tools):
             raise ValueError("Subagent tool names must not be empty.")
+        if any(
+            not prefix.strip() or not prefix.endswith(".")
+            for prefix in allowed_tool_prefixes
+        ):
+            raise ValueError(
+                "Subagent tool prefixes must be non-empty namespace prefixes."
+            )
         overlap = allowed_tools & blocked_tools
         if overlap:
             raise ValueError(
@@ -69,10 +80,18 @@ class SubagentRole:
         object.__setattr__(self, "name", normalized_name)
         object.__setattr__(self, "allowed_tools", allowed_tools)
         object.__setattr__(self, "blocked_tools", blocked_tools)
+        object.__setattr__(self, "allowed_tool_prefixes", allowed_tool_prefixes)
 
     def allows(self, tool_name: str) -> bool:
         """Return whether the role may see and request ``tool_name``."""
-        return tool_name in self.allowed_tools and tool_name not in self.blocked_tools
+        explicitly_allowed = tool_name in self.allowed_tools
+        prefix_allowed = any(
+            tool_name.startswith(prefix) for prefix in self.allowed_tool_prefixes
+        )
+        return (
+            (explicitly_allowed or prefix_allowed)
+            and tool_name not in self.blocked_tools
+        )
 
     @property
     def is_writer(self) -> bool:
@@ -101,8 +120,9 @@ class RestrictedToolRegistry:
         self.role = role
 
     def names(self) -> tuple[str, ...]:
-        available = set(self._registry.names())
-        return tuple(sorted(available & self.role.allowed_tools))
+        return tuple(
+            name for name in self._registry.names() if self.role.allows(name)
+        )
 
     def schemas(
         self,

@@ -88,7 +88,7 @@ def detect_project(project_root: str | Path) -> ProjectInfo:
         build_command = _package_command(package_manager, "build")
 
     dev_command: str | None = None
-    if "dev" in scripts and package_manager:
+    if package_manager and ("dev" in scripts or has_vite):
         dev_command = _package_command(package_manager, "dev")
 
     local_url: str | None = None

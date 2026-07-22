@@ -59,6 +59,8 @@ EXPECTED_ALLOWED_TOOLS = {
     "tester": {
         "run_command",
         "run_validation",
+        "run_browser_validation",
+        "run_managed_browser_validation",
         "read_file",
         "read_file_with_line_numbers",
         "grep",
@@ -81,6 +83,7 @@ def test_role_definitions_have_explicit_deny_by_default_tool_sets():
         assert role.allowed_tools == expected_allowed
         assert role.blocked_tools == BUILTIN_SUBAGENT_TOOLS - expected_allowed
         assert role.allowed_tools.isdisjoint(role.blocked_tools)
+    assert TESTER_ROLE.allowed_tool_prefixes == ("mcp.playwright.",)
 
 
 def test_restricted_registry_exposes_only_role_allowlisted_tools():
@@ -96,6 +99,65 @@ def test_restricted_registry_exposes_only_role_allowlisted_tools():
 
     assert result["ok"] is True
     assert calls == ["read_file"]
+
+
+def test_tester_registry_exposes_browser_and_playwright_mcp_tools():
+    calls: list[str] = []
+
+    def handler(tool_name):
+        def run(**arguments):
+            calls.append(tool_name)
+            return {"ok": True}
+
+        return run
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_managed_browser_validation",
+                description="Run managed browser validation.",
+                parameters={"type": "object"},
+                handler=handler("run_managed_browser_validation"),
+                permission=PermissionLevel.EXECUTE,
+            ),
+            Tool(
+                name="mcp.playwright.browser_navigate",
+                description="Navigate with Playwright MCP.",
+                parameters={"type": "object"},
+                handler=handler("mcp.playwright.browser_navigate"),
+                permission=PermissionLevel.NETWORK,
+            ),
+            Tool(
+                name="mcp.github.search_issues",
+                description="Unrelated MCP tool.",
+                parameters={"type": "object"},
+                handler=handler("mcp.github.search_issues"),
+                permission=PermissionLevel.NETWORK,
+            ),
+        ),
+        permission_manager=PermissionManager(
+            mode="default",
+            approval_callback=lambda request: True,
+        ),
+    )
+
+    restricted = TESTER_ROLE.restrict(registry)
+
+    assert restricted.names() == (
+        "mcp.playwright.browser_navigate",
+        "run_managed_browser_validation",
+    )
+    assert {
+        schema["function"]["name"] for schema in restricted.schemas()
+    } == {
+        "mcp_playwright_browser_navigate",
+        "run_managed_browser_validation",
+    }
+    assert restricted.execute(
+        "mcp_playwright_browser_navigate",
+        {"url": "http://localhost:5173"},
+    )["ok"] is True
+    assert calls == ["mcp.playwright.browser_navigate"]
 
 
 def test_blocked_tool_never_reaches_underlying_registry():
@@ -326,6 +388,132 @@ def test_single_agent_mode_remains_the_default(tmp_path):
     assert output.startswith("Single-agent response.")
 
 
+def test_single_agent_browser_intent_exposes_and_runs_managed_tool(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {"devDependencies": {"vite": "latest"}, "scripts": {"dev": "vite"}}
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_managed_browser_validation",
+                description="Run managed browser validation.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: calls.append(arguments)
+                or {
+                    "ok": True,
+                    "status": "passed",
+                    "console_errors": [],
+                    "screenshot_path": ".agent/artifacts/browser/single.png",
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    class SingleAgentBrowserModel:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                assert "Application-detected browser routing" in messages[0]["content"]
+                assert {
+                    schema["function"]["name"] for schema in (tools or [])
+                } == {"run_managed_browser_validation"}
+                return ModelResponse(
+                    text="",
+                    tool_calls=(
+                        ToolCall(
+                            id="managed",
+                            name="run_managed_browser_validation",
+                            arguments={
+                                "command": "npm run dev",
+                                "url": "http://localhost:5173",
+                                "full_page": True,
+                            },
+                        ),
+                    ),
+                )
+            return ModelResponse(text="UI inspection complete.")
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=SingleAgentBrowserModel(),
+        approval_callback=lambda request: True,
+    ).run(
+        "Start the dev server and capture a full-page browser screenshot",
+        tmp_path,
+        registry=registry,
+    )
+
+    assert calls[0]["command"] == "npm run dev"
+    assert calls[0]["url"] == "http://localhost:5173"
+    assert "run_managed_browser_validation: passed" in output
+    assert ".agent/artifacts/browser/single.png" in output
+    assert "Console errors: 0" in output
+
+
+def test_single_agent_browser_intent_uses_direct_tool_for_running_url(tmp_path):
+    calls = []
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_browser_validation",
+                description="Run browser validation.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: calls.append(arguments)
+                or {
+                    "ok": True,
+                    "status": "passed",
+                    "console_errors": [],
+                    "screenshot_path": ".agent/artifacts/browser/direct.png",
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="direct-browser",
+                        name="run_browser_validation",
+                        arguments={
+                            "url": "http://localhost:5173",
+                            "screenshot": True,
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(text="Direct browser inspection complete."),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run(
+        "Inspect page http://localhost:5173 in a browser and capture a screenshot",
+        tmp_path,
+        registry=registry,
+    )
+
+    assert model.calls[0]["tools"] == {"run_browser_validation"}
+    assert calls == [
+        {"url": "http://localhost:5173", "screenshot": True}
+    ]
+    assert "run_browser_validation: passed" in output
+    assert ".agent/artifacts/browser/direct.png" in output
+
+
 def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
     model = SequenceModel(
         (
@@ -366,6 +554,7 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
 
     assert "Subagents run:\n- planner\n- coder\n- tester\n- reviewer" in output
     assert "Parallel subagent groups:\n- None" in output
+    assert "Browser validation:" not in output
     assert [call["role"] for call in model.calls] == [
         "planner",
         "coder",
@@ -387,6 +576,321 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
         if event["event"] == "subagent_started"
     ]
     assert started == ["planner", "coder", "tester", "reviewer"]
+
+
+@pytest.mark.parametrize("parallel", (False, True))
+def test_browser_success_is_authoritative_over_reviewer_text(tmp_path, parallel):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "devDependencies": {"vite": "latest"},
+                "scripts": {"dev": "vite"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+    approvals = []
+
+    def managed_browser_handler(**arguments):
+        calls.append(arguments)
+        return {
+            "ok": True,
+            "status": "passed",
+            "title": "Vite App",
+            "final_url": arguments["url"],
+            "console_errors": ["one console error"],
+            "failed_requests": [],
+            "screenshot_path": ".agent/artifacts/browser/browser-test.png",
+            "checks": [],
+            "truncated": False,
+            "managed_server": {
+                "started": True,
+                "ready": True,
+                "startup_failed": False,
+                "terminated_by_lunar_forge": True,
+                "stopped": True,
+                "stop_note": "Stopped intentionally.",
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "output_truncated": False,
+            },
+        }
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_managed_browser_validation",
+                description="Run managed browser validation.",
+                parameters={"type": "object"},
+                handler=managed_browser_handler,
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    class BrowserRoutingModel:
+        def __init__(self):
+            self.tester_calls = 0
+
+        def complete(self, messages, tools=None):
+            system_prompt = str(messages[0]["content"])
+            role_line = next(
+                line
+                for line in system_prompt.splitlines()
+                if line.startswith("Active subagent role:")
+            )
+            role = role_line.partition(":")[2].strip()
+            if role == "tester":
+                self.tester_calls += 1
+                if self.tester_calls == 1:
+                    assert "Application-detected browser routing" in system_prompt
+                    assert "inferred_dev_command: npm run dev" in system_prompt
+                    assert "inferred_local_url: http://localhost:5173" in system_prompt
+                    schema_names = {
+                        schema["function"]["name"] for schema in (tools or [])
+                    }
+                    assert "run_managed_browser_validation" in schema_names
+                    assert "run_validation" not in schema_names
+                    return ModelResponse(
+                        text="",
+                        tool_calls=(
+                            ToolCall(
+                                id="browser",
+                                name="run_managed_browser_validation",
+                                arguments={
+                                    "command": "npm run dev",
+                                    "url": "http://localhost:5173",
+                                    "screenshot": True,
+                                    "full_page": True,
+                                },
+                            ),
+                        ),
+                    )
+                return ModelResponse(text="Browser validation completed.")
+            if role == "reviewer":
+                return ModelResponse(
+                    text=(
+                        "Validation:\n- Browser validation did not run; the active "
+                        "reviewer role has no permission to start the dev server or "
+                        "run managed browser validation."
+                    )
+                )
+            return ModelResponse(text=f"{role.title()} completed.")
+
+    request = (
+        "Start the dev server if needed, inspect the UI in a browser, capture a "
+        "full-page screenshot, and report console errors."
+    )
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True, parallel=parallel)),
+        model_client=BrowserRoutingModel(),
+        approval_callback=lambda approval: approvals.append(approval) or True,
+    ).run(request, tmp_path, registry=registry)
+
+    assert calls == [
+        {
+            "command": "npm run dev",
+            "url": "http://localhost:5173",
+            "screenshot": True,
+            "full_page": True,
+        }
+    ]
+    assert len(approvals) == 1
+    assert approvals[0].tool_name == "run_managed_browser_validation"
+    assert "Browser validation did not run" not in output
+    assert "active reviewer role has no permission" not in output
+    assert "Reviewer findings (advisory):" in output
+    assert "this role did not personally run browser validation" in output
+    assert "Browser validation:" in output
+    assert "run_managed_browser_validation: passed" in output
+    assert "authoritative tool result" in output
+    assert "Final URL: http://localhost:5173" in output
+    assert "Page title: Vite App" in output
+    assert ".agent/artifacts/browser/browser-test.png" in output
+    assert "Console errors: 1" in output
+    assert "Failed requests: 0" in output
+    assert "Full-page screenshot: yes" in output
+    assert output.index("Reviewer findings (advisory):") < output.index(
+        "Browser validation:"
+    )
+    if parallel:
+        assert "Parallel subagent groups:\n- post-edit: tester, reviewer" in output
+
+
+def test_browser_intent_plan_mode_does_not_start_server(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"devDependencies": {"vite": "latest"}, "scripts": {"dev": "vite"}}),
+        encoding="utf-8",
+    )
+    model = SequenceModel((ModelResponse(text="Browser validation plan."),))
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: pytest.fail(
+            "Plan mode must not request server approval"
+        ),
+    ).run("Start the dev server and inspect the UI", tmp_path, mode="plan")
+
+    assert len(model.calls) == 1
+    assert model.calls[0]["role"] == "planner"
+    assert "run_managed_browser_validation" not in model.calls[0]["tools"]
+    assert "Browser validation:\n- Not run" in output
+    assert "plan mode" in output
+    assert not (tmp_path / ".agent").exists()
+
+
+def test_browser_intent_no_command_mode_hides_managed_server_tool(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"devDependencies": {"vite": "latest"}, "scripts": {"dev": "vite"}}),
+        encoding="utf-8",
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(text="Plan complete."),
+            ModelResponse(text="No changes needed."),
+            ModelResponse(text="Browser execution is disabled."),
+            ModelResponse(text="Review complete."),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: pytest.fail(
+            "No-command mode must not request server approval"
+        ),
+    ).run("Start the dev server and inspect the UI", tmp_path, mode="no-command")
+
+    tester_call = next(call for call in model.calls if call["role"] == "tester")
+    assert "run_managed_browser_validation" not in tester_call["tools"]
+    assert "run_browser_validation" not in tester_call["tools"]
+    assert "run_validation" not in tester_call["tools"]
+    assert "Browser validation:\n- Not run" in output
+    assert "no-command mode" in output
+
+
+def test_browser_summary_reports_approval_denial(tmp_path):
+    handler_calls = []
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_managed_browser_validation",
+                description="Run managed browser validation.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: handler_calls.append(arguments)
+                or {"ok": True},
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="browser-denied",
+                        name="run_managed_browser_validation",
+                        arguments={
+                            "command": "npm run dev",
+                            "url": "http://localhost:5173",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(text="The command was not approved."),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=model,
+        approval_callback=lambda request: False,
+    ).run("Start the dev server and inspect the UI", tmp_path, registry=registry)
+
+    assert handler_calls == []
+    assert "run_managed_browser_validation: not run" in output
+    assert "Reason: approval denied." in output
+
+
+@pytest.mark.parametrize(
+    ("error", "managed_server", "expected_reason"),
+    (
+        (
+            "Playwright is unavailable. Run python -m playwright install chromium.",
+            {"started": False, "ready": False, "startup_failed": False},
+            "Playwright missing",
+        ),
+        (
+            "Managed dev server exited before the URL responded (exit code 1).",
+            {"started": True, "ready": False, "startup_failed": True},
+            "startup failed",
+        ),
+        (
+            "Managed dev server did not respond within 30000 ms.",
+            {"started": True, "ready": False, "startup_failed": True},
+            "URL readiness timeout",
+        ),
+    ),
+)
+def test_browser_summary_reports_exact_not_run_reason(
+    tmp_path,
+    error,
+    managed_server,
+    expected_reason,
+):
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_managed_browser_validation",
+                description="Run managed browser validation.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {
+                    "ok": False,
+                    "error": error,
+                    "managed_server": managed_server,
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="browser-failed",
+                        name="run_managed_browser_validation",
+                        arguments={
+                            "command": "npm run dev",
+                            "url": "http://localhost:5173",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(text="Browser validation was unavailable."),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Start the dev server and inspect the UI", tmp_path, registry=registry)
+
+    assert "run_managed_browser_validation: not run" in output
+    assert f"Reason: {expected_reason}." in output
+
+
+def test_reviewer_prompt_defers_to_tester_browser_results():
+    prompt = REVIEWER_ROLE.system_prompt_fragment
+
+    assert "Validation status belongs to tester and tool results" in prompt
+    assert "never infer that browser validation did not run" in prompt
 
 
 def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path):

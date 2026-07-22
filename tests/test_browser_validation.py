@@ -417,6 +417,7 @@ def test_browser_validation_captures_page_data_and_local_screenshot(tmp_path):
             "error": "Blocked non-local browser request.",
         },
     ]
+    assert result["full_page"] is False
     assert result["checks"] == [
         {"selector": "h1", "passed": True},
         {"selector": "[data-ready]", "passed": True},
@@ -460,6 +461,7 @@ def test_full_page_screenshot_uses_requested_viewport_and_stays_confined(
     artifact_path = (tmp_path / result["screenshot_path"]).resolve()
     artifact_path.relative_to(tmp_path.resolve())
     assert result["ok"] is True
+    assert result["full_page"] is True
     assert artifact_path.is_file()
     assert playwright.browser.viewport == {"width": 1440, "height": 1200}
     assert page.screenshot_calls == [
@@ -496,6 +498,31 @@ def test_managed_browser_tool_is_not_registered_for_docker_runtime(tmp_path):
     assert "run_managed_browser_validation" not in registry.names()
 
 
+def test_managed_browser_validation_missing_playwright_returns_setup_commands(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(browser_module, "_load_playwright_factory", lambda: None)
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        project_root=tmp_path,
+        approval_callback=lambda request: pytest.fail(
+            "Missing Playwright must be reported before server approval"
+        ),
+        _popen_factory=lambda *args, **kwargs: pytest.fail(
+            "Missing Playwright must not start the server"
+        ),
+    )
+
+    assert result["ok"] is False
+    assert 'python -m pip install -e ".[browser]"' in result["error"]
+    assert "python -m playwright install chromium" in result["error"]
+    assert result["managed_server"]["started"] is False
+    assert result["managed_server"]["startup_failed"] is False
+
+
 def test_managed_browser_validation_requires_approval_before_start(
     tmp_path,
 ):
@@ -516,6 +543,8 @@ def test_managed_browser_validation_requires_approval_before_start(
     assert result["ok"] is False
     assert result["permission_denied"] is True
     assert result["managed_server"]["started"] is False
+    assert result["managed_server"]["startup_failed"] is False
+    assert result["managed_server"]["terminated_by_lunar_forge"] is False
     assert popen_calls == []
     assert requests[0].tool_name == "run_managed_browser_validation"
     assert requests[0].description == "Start managed dev server: npm run dev."
@@ -553,11 +582,18 @@ def test_managed_browser_validation_starts_waits_validates_and_stops(
     )
 
     assert result["ok"] is True
+    assert result["full_page"] is True
     assert result["managed_server"] == {
         "started": True,
         "ready": True,
+        "startup_failed": False,
+        "terminated_by_lunar_forge": True,
         "stopped": True,
-        "exit_code": -15,
+        "stop_note": (
+            "Managed dev server was stopped intentionally by LunarForge; "
+            "the stop-related exit code is omitted."
+        ),
+        "exit_code": None,
         "stdout": "ready\n",
         "stderr": "warning\n",
         "output_truncated": False,
@@ -603,7 +639,10 @@ def test_managed_browser_validation_captures_early_exit_output(
     assert result["ok"] is False
     assert "exited before the URL responded" in result["error"]
     assert result["managed_server"]["ready"] is False
+    assert result["managed_server"]["startup_failed"] is True
+    assert result["managed_server"]["terminated_by_lunar_forge"] is False
     assert result["managed_server"]["stopped"] is True
+    assert result["managed_server"]["exit_code"] == 1
     assert result["managed_server"]["stdout"] == "startup output\n"
     assert result["managed_server"]["stderr"] == "startup failed\n"
 
@@ -638,6 +677,9 @@ def test_managed_browser_validation_times_out_and_stops_server(
     assert result["ok"] is False
     assert "did not respond within 10 ms" in result["error"]
     assert process.terminated is True
+    assert result["managed_server"]["startup_failed"] is True
+    assert result["managed_server"]["terminated_by_lunar_forge"] is True
+    assert result["managed_server"]["exit_code"] is None
     assert result["managed_server"]["stopped"] is True
 
 
@@ -674,6 +716,8 @@ def test_managed_browser_validation_stops_server_when_readiness_loop_errors(
     assert process.terminated is True
     assert result["managed_server"]["started"] is True
     assert result["managed_server"]["ready"] is False
+    assert result["managed_server"]["startup_failed"] is True
+    assert result["managed_server"]["terminated_by_lunar_forge"] is True
     assert result["managed_server"]["stopped"] is True
 
 
@@ -820,6 +864,7 @@ def test_browser_tool_is_permission_gated_and_hidden_in_plan_mode(
     tmp_path,
 ):
     plan_registry = create_tool_registry(tmp_path, mode="plan")
+    no_command_registry = create_tool_registry(tmp_path, mode="no-command")
     requests: list[PermissionRequest] = []
     calls = []
 
@@ -863,6 +908,8 @@ def test_browser_tool_is_permission_gated_and_hidden_in_plan_mode(
     )
 
     assert "run_browser_validation" not in plan_registry.names()
+    assert "run_browser_validation" not in no_command_registry.names()
+    assert "run_managed_browser_validation" not in no_command_registry.names()
     assert "run_browser_validation" in denied_registry.names()
     assert denied_registry.get("run_browser_validation").permission is (
         PermissionLevel.EXECUTE

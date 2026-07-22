@@ -3,13 +3,98 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from lunar_forge.subagents.base import SubagentRole
 
 
 MAX_SUBAGENT_HANDOFF_CHARACTERS = 16_000
+MAX_BROWSER_INTENT_URL_CHARACTERS = 2_000
+
+_LOCAL_URL_PATTERN = re.compile(
+    r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+_START_SERVER_PATTERN = re.compile(
+    r"\b(?:start|launch|run)(?:\s+the)?\s+(?:local\s+)?"
+    r"(?:dev(?:elopment)?\s+)?server\b|\bserver\s+if\s+needed\b",
+    re.IGNORECASE,
+)
+_FULL_PAGE_PATTERN = re.compile(r"\bfull[- ]page\b", re.IGNORECASE)
+_INTERACTIVE_BROWSER_PATTERN = re.compile(
+    r"\b(?:accessibility|click|form)\b|\binspect\s+(?:the\s+)?page\b",
+    re.IGNORECASE,
+)
+_BROWSER_INTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("browser", re.compile(r"\bbrowser\b", re.IGNORECASE)),
+    ("UI", re.compile(r"\bui\b", re.IGNORECASE)),
+    ("screenshot", re.compile(r"\bscreenshots?\b", re.IGNORECASE)),
+    ("full-page screenshot", re.compile(r"\bfull[- ]page\s+screenshots?\b", re.IGNORECASE)),
+    ("visual", re.compile(r"\bvisual\b", re.IGNORECASE)),
+    ("page rendering", re.compile(r"\bpage\s+rendering\b", re.IGNORECASE)),
+    ("console errors", re.compile(r"\bconsole\s+errors?\b", re.IGNORECASE)),
+    ("accessibility", re.compile(r"\baccessibility\b", re.IGNORECASE)),
+    ("inspect page", re.compile(r"\binspect\s+(?:the\s+)?page\b", re.IGNORECASE)),
+    ("click", re.compile(r"\bclick\b", re.IGNORECASE)),
+    ("form", re.compile(r"\bforms?\b", re.IGNORECASE)),
+    ("layout", re.compile(r"\blayout\b", re.IGNORECASE)),
+    ("localhost URL", re.compile(r"\blocalhost\b|https?://127\.0\.0\.1", re.IGNORECASE)),
+    ("start dev server", _START_SERVER_PATTERN),
+)
+
+
+@dataclass(frozen=True)
+class BrowserIntent:
+    """Deterministic browser-routing metadata derived from a user request."""
+
+    detected: bool
+    signals: tuple[str, ...] = ()
+    start_server: bool = False
+    full_page: bool = False
+    url: str | None = None
+    dev_command: str | None = None
+    prefer_playwright_mcp: bool = False
+
+
+def detect_browser_intent(
+    request: str,
+    project_info: Mapping[str, Any] | None = None,
+) -> BrowserIntent:
+    """Detect UI/browser work and attach bounded project execution hints."""
+    text = request if isinstance(request, str) else str(request)
+    signals = tuple(
+        label for label, pattern in _BROWSER_INTENT_PATTERNS if pattern.search(text)
+    )
+    detected = bool(signals)
+    explicit_url_match = _LOCAL_URL_PATTERN.search(text)
+    explicit_url = explicit_url_match.group(0).rstrip(".,;)") if explicit_url_match else None
+    project = project_info or {}
+    inferred_url = project.get("local_url")
+    inferred_command = project.get("dev_command")
+    url = explicit_url or (
+        inferred_url if detected and isinstance(inferred_url, str) else None
+    )
+    if url is not None:
+        url = url[:MAX_BROWSER_INTENT_URL_CHARACTERS]
+    dev_command = (
+        inferred_command
+        if detected and isinstance(inferred_command, str)
+        else None
+    )
+    return BrowserIntent(
+        detected=detected,
+        signals=signals,
+        start_server=detected and _START_SERVER_PATTERN.search(text) is not None,
+        full_page=detected and _FULL_PAGE_PATTERN.search(text) is not None,
+        url=url,
+        dev_command=dev_command,
+        prefer_playwright_mcp=(
+            detected and _INTERACTIVE_BROWSER_PATTERN.search(text) is not None
+        ),
+    )
 
 
 SYSTEM_PROMPT = """You are LunarForge, a local coding agent. Use only the tools
@@ -54,9 +139,9 @@ For a feature request in an existing project, follow this workflow:
    project, do not scaffold a new project in this milestone.
 
 For browser and UI validation requests:
-- Treat requests mentioning browser, UI, screenshot, visual, page rendering,
-  console errors, accessibility, click, form, layout, or a localhost URL as
-  browser/UI work.
+- Treat requests mentioning browser, UI, screenshot, full-page screenshot,
+  visual, page rendering, console errors, accessibility, inspect page, click,
+  form, layout, a localhost URL, or starting a dev server as browser/UI work.
 - Prefer available Playwright MCP tools for interactive browser actions such as
   clicks, forms, and accessibility inspection. Otherwise prefer
   run_browser_validation for an already-running loopback URL.
@@ -67,6 +152,8 @@ For browser and UI validation requests:
   rendered browser/UI evidence. Never start a server without approval and never
   install Playwright or project dependencies without approval.
 - Keep using run_validation normally for non-browser build, test, and lint work.
+- Never write "Run detected validation commands" in the final answer unless a
+  run_validation result proves that at least one command actually ran.
 
 The final answer must be concise and grounded in tool results. Use these sections:
 Changed files:
@@ -94,6 +181,7 @@ def build_system_prompt(
     *,
     runtime_mode: str = "local",
     allow_network: bool = False,
+    browser_intent: BrowserIntent | None = None,
 ) -> str:
     """Build system context from project metadata, instructions, and mode."""
     normalized_mode = mode.strip().lower() or "default"
@@ -133,6 +221,7 @@ def build_system_prompt(
         indent=2,
         sort_keys=True,
     )
+    browser_guidance = _browser_intent_guidance(browser_intent)
     return (
         f"{SYSTEM_PROMPT.strip()}\n\n"
         f"Current mode: {normalized_mode}\n"
@@ -140,8 +229,60 @@ def build_system_prompt(
         f"Runtime mode: {normalized_runtime}\n"
         f"Runtime requirements: {runtime_guidance}\n\n"
         f"Detected project information:\n{project_json}\n\n"
+        f"{browser_guidance}"
         f"Project instruction context:\n{instructions.strip()}"
     )
+
+
+def _browser_intent_guidance(intent: BrowserIntent | None) -> str:
+    if intent is None or not intent.detected:
+        return ""
+    signals = ", ".join(intent.signals)
+    lines = [
+        "Application-detected browser routing:",
+        "- browser_intent: true",
+        f"- matched_signals: {signals}",
+        f"- start_server_requested: {str(intent.start_server).lower()}",
+        f"- full_page_requested: {str(intent.full_page).lower()}",
+        f"- inferred_dev_command: {intent.dev_command or 'unavailable'}",
+        f"- inferred_local_url: {intent.url or 'unavailable'}",
+        (
+            "- preferred_interactive_route: Playwright MCP when available"
+            if intent.prefer_playwright_mcp
+            else "- preferred_interactive_route: built-in browser validation"
+        ),
+        "This detection is authoritative routing context for this task.",
+    ]
+    if intent.start_server and intent.dev_command and intent.url:
+        lines.extend(
+            (
+                "Call run_managed_browser_validation from the Tester or normal "
+                "agent tool loop with the inferred command and URL; set screenshot=true "
+                f"and full_page={str(intent.full_page).lower()}.",
+                "Do not call run_validation as a substitute for this browser task.",
+            )
+        )
+    elif intent.url:
+        lines.append(
+            "Use Playwright MCP when the requested interaction needs it; otherwise "
+            "call run_browser_validation with the inferred URL."
+        )
+    else:
+        lines.append(
+            "Inspect only enough project context to identify a loopback URL. Do not "
+            "fall back to curl or claim browser validation ran without a tool result."
+        )
+    lines.extend(
+        (
+            "If the active mode hides browser execution tools, report that policy "
+            "constraint without starting a server another way.",
+            "The final answer must state whether browser validation actually ran. "
+            "When it ran, include the screenshot path and console error count from "
+            "the tool result.",
+            "\n",
+        )
+    )
+    return "\n".join(lines)
 
 
 def build_user_prompt(request: str) -> str:
@@ -155,7 +296,11 @@ def build_subagent_system_prompt(
     role: SubagentRole,
 ) -> str:
     """Add mandatory role boundaries to the normal safety prompt."""
-    allowed = ", ".join(sorted(role.allowed_tools)) or "None"
+    allowed_entries = [*sorted(role.allowed_tools)]
+    allowed_entries.extend(
+        f"{prefix}*" for prefix in role.allowed_tool_prefixes
+    )
+    allowed = ", ".join(allowed_entries) or "None"
     blocked = ", ".join(sorted(role.blocked_tools)) or "None"
     return (
         f"{base_prompt.rstrip()}\n\n"

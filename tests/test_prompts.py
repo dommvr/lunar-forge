@@ -1,9 +1,12 @@
+import pytest
+
 from lunar_forge.prompts import (
     build_subagent_system_prompt,
     build_subagent_user_prompt,
     build_system_prompt,
+    detect_browser_intent,
 )
-from lunar_forge.subagents import CODER_ROLE, PLANNER_ROLE
+from lunar_forge.subagents import CODER_ROLE, PLANNER_ROLE, TESTER_ROLE
 from lunar_forge.tools.registry import create_tool_registry
 
 
@@ -55,14 +58,17 @@ def test_system_prompt_routes_ui_validation_to_browser_tool():
         "browser",
         "UI",
         "screenshot",
+        "full-page screenshot",
         "visual",
         "page rendering",
         "console errors",
         "accessibility",
+        "inspect page",
         "click",
         "form",
         "layout",
         "localhost URL",
+        "starting a dev server",
     ):
         assert signal in prompt
     assert "Prefer available Playwright MCP tools" in prompt
@@ -72,6 +78,83 @@ def test_system_prompt_routes_ui_validation_to_browser_tool():
     assert "requires explicit approval" in prompt
     assert "Do not substitute curl, basic HTTP checks" in prompt
     assert "Never start a server without approval" in prompt
+    assert "Keep using run_validation normally for non-browser" in prompt
+
+
+def test_browser_intent_detects_natural_request_and_vite_hints():
+    project_info = {
+        **PROJECT_INFO,
+        "frameworks": ["vite", "react"],
+        "package_manager": "npm",
+        "dev_command": "npm run dev",
+        "local_url": "http://localhost:5173",
+    }
+    request = (
+        "Start the dev server if needed, inspect the UI in a browser, capture a "
+        "full-page screenshot, and report console errors."
+    )
+
+    intent = detect_browser_intent(request, project_info)
+    prompt = build_system_prompt(
+        project_info,
+        "No extra instructions.",
+        "default",
+        browser_intent=intent,
+    )
+
+    assert intent.detected is True
+    assert intent.start_server is True
+    assert intent.full_page is True
+    assert intent.dev_command == "npm run dev"
+    assert intent.url == "http://localhost:5173"
+    assert {"browser", "UI", "full-page screenshot", "console errors"}.issubset(
+        intent.signals
+    )
+    assert "Application-detected browser routing" in prompt
+    assert "Call run_managed_browser_validation" in prompt
+    assert "inferred_dev_command: npm run dev" in prompt
+    assert "inferred_local_url: http://localhost:5173" in prompt
+    assert "full_page=true" in prompt
+    assert "Do not call run_validation as a substitute" in prompt
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    (
+        "Open this in a browser",
+        "Inspect the UI",
+        "Capture a screenshot",
+        "Capture a full-page screenshot",
+        "Perform a visual check",
+        "Check page rendering",
+        "Report console errors",
+        "Review accessibility",
+        "Inspect page",
+        "Click the submit button",
+        "Fill the form",
+        "Check the layout",
+        "Validate the localhost URL",
+        "Start the dev server",
+    ),
+)
+def test_each_browser_routing_signal_is_detected(user_request):
+    assert detect_browser_intent(user_request, PROJECT_INFO).detected is True
+
+
+def test_non_browser_intent_keeps_normal_validation_routing():
+    intent = detect_browser_intent(
+        "Run the Python unit tests and report failures.",
+        PROJECT_INFO,
+    )
+    prompt = build_system_prompt(
+        PROJECT_INFO,
+        "No extra instructions.",
+        "default",
+        browser_intent=intent,
+    )
+
+    assert intent.detected is False
+    assert "Application-detected browser routing" not in prompt
     assert "Keep using run_validation normally for non-browser" in prompt
 
 
@@ -150,6 +233,10 @@ def test_subagent_system_prompt_includes_mandatory_role_boundary():
     assert "read_file" in prompt
     assert "write_file" in prompt
     assert "deny-by-default" in prompt
+
+    tester_prompt = build_subagent_system_prompt(base_prompt, TESTER_ROLE)
+    assert "mcp.playwright.*" in tester_prompt
+    assert "run_managed_browser_validation" in tester_prompt
 
 
 def test_subagent_handoff_is_bounded_and_cannot_expand_permissions():

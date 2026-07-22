@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +31,12 @@ from lunar_forge.plugins.registry import (
 )
 from lunar_forge.project_detection import detect_project
 from lunar_forge.prompts import (
+    BrowserIntent,
     build_subagent_system_prompt,
     build_subagent_user_prompt,
     build_system_prompt,
     build_user_prompt,
+    detect_browser_intent,
 )
 from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
 from lunar_forge.subagents import (
@@ -52,6 +55,7 @@ MAX_STEPS = 30
 MAX_TOOL_RESULT_CHARACTERS = 20_000
 MAX_FINAL_OUTPUT_CHARACTERS = 50_000
 MAX_SUBAGENT_ERROR_CHARACTERS = 500
+MAX_BROWSER_VALIDATION_RECORDS = 20
 
 
 class AgentError(RuntimeError):
@@ -62,6 +66,43 @@ class AgentError(RuntimeError):
 class SubagentPhaseResult:
     text: str
     changed_files: tuple[str, ...] = ()
+    browser_validations: tuple[BrowserValidationRecord, ...] = ()
+    browser_validations_truncated: bool = False
+    validation_commands_run: bool = False
+
+
+@dataclass(frozen=True)
+class BrowserValidationRecord:
+    tool_name: str
+    ran: bool
+    ok: bool
+    final_url: str | None
+    title: str | None
+    screenshot_path: str | None
+    console_error_count: int | None
+    failed_request_count: int | None
+    full_page: bool | None
+    not_run_reason: str | None
+    error: str | None
+
+
+@dataclass
+class ValidationEvidence:
+    browser_validations: list[BrowserValidationRecord] = field(default_factory=list)
+    browser_validations_truncated: bool = False
+    validation_commands_run: bool = False
+
+    def merge(self, result: SubagentPhaseResult) -> None:
+        remaining = MAX_BROWSER_VALIDATION_RECORDS - len(self.browser_validations)
+        self.browser_validations.extend(result.browser_validations[:remaining])
+        self.browser_validations_truncated = (
+            self.browser_validations_truncated
+            or result.browser_validations_truncated
+            or len(result.browser_validations) > remaining
+        )
+        self.validation_commands_run = (
+            self.validation_commands_run or result.validation_commands_run
+        )
 
 
 @dataclass(frozen=True)
@@ -190,6 +231,17 @@ class CodeAgent:
                         if name in configured_plugin_tools
                     ],
                 )
+            browser_intent = detect_browser_intent(request, project_info)
+            if browser_intent.detected:
+                _log_session(
+                    session,
+                    "browser_intent_detected",
+                    signals=browser_intent.signals,
+                    start_server=browser_intent.start_server,
+                    full_page=browser_intent.full_page,
+                    dev_command=browser_intent.dev_command,
+                    url=browser_intent.url,
+                )
             model_client = self.model_client or self._create_model_client()
             system_prompt = build_system_prompt(
                 project_info,
@@ -197,6 +249,7 @@ class CodeAgent:
                 mode,
                 runtime_mode=self.config.runtime.mode,
                 allow_network=self.config.runtime.allow_network,
+                browser_intent=browser_intent,
             )
             historical_messages = _resume_history_messages(resume_messages)
             subagents_enabled = (
@@ -213,6 +266,7 @@ class CodeAgent:
                     historical_messages=historical_messages,
                     session=session,
                     mode=normalized_mode,
+                    browser_intent=browser_intent,
                 )
                 return _append_session_note(
                     subagent_output,
@@ -251,6 +305,7 @@ class CodeAgent:
                 read_only=normalized_mode == "plan",
                 allow_execute=normalized_mode not in {"plan", "no-command"},
             )
+            validation_evidence = ValidationEvidence()
 
             for step in range(self.max_steps):
                 response = model_client.complete(messages, tool_schemas)
@@ -284,6 +339,12 @@ class CodeAgent:
                             arguments=tool_call.arguments,
                         )
                         result = tools.execute(tool_call.name, tool_call.arguments)
+                        _record_validation_evidence(
+                            validation_evidence,
+                            internal_tool_name,
+                            tool_call.arguments,
+                            result,
+                        )
                         _log_session(
                             session,
                             "tool_result",
@@ -327,7 +388,12 @@ class CodeAgent:
                     continue
 
                 if response.text.strip():
-                    final_text = _truncate_final_output(response.text.strip())
+                    final_text = _finalize_validation_summary(
+                        _truncate_final_output(response.text.strip()),
+                        browser_intent,
+                        validation_evidence,
+                        mode=normalized_mode,
+                    )
                     return _append_session_note(final_text, session, normalized_mode)
                 raise AgentError("Model returned neither text nor tool calls.")
 
@@ -355,6 +421,7 @@ class CodeAgent:
         historical_messages: Sequence[Mapping[str, Any]],
         session: SessionLogger | None,
         mode: str,
+        browser_intent: BrowserIntent,
     ) -> str:
         if self.config.subagents.parallel:
             return self._run_parallel_subagent_workflow(
@@ -365,6 +432,7 @@ class CodeAgent:
                 historical_messages=historical_messages,
                 session=session,
                 mode=mode,
+                browser_intent=browser_intent,
             )
 
         orchestrator = SubagentOrchestrator()
@@ -378,6 +446,7 @@ class CodeAgent:
         outputs: dict[str, str] = {}
         changed_files: list[str] = []
         roles_run: list[str] = []
+        validation_evidence = ValidationEvidence()
         for phase in phases:
             role = phase.role
             assert role is not None
@@ -397,6 +466,7 @@ class CodeAgent:
             )
             roles_run.append(role.name)
             outputs[role.name] = phase_result.text
+            validation_evidence.merge(phase_result)
             for path in phase_result.changed_files:
                 if path not in changed_files:
                     changed_files.append(path)
@@ -420,12 +490,20 @@ class CodeAgent:
             )
             roles_run.append(security_role.name)
             outputs[security_role.name] = phase_result.text
+            validation_evidence.merge(phase_result)
             security_output = phase_result.text
 
         final_role = "planner" if mode == "plan" else "reviewer"
         final_text = outputs[final_role]
         if security_output:
             final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+        final_text = _finalize_validation_summary(
+            final_text,
+            browser_intent,
+            validation_evidence,
+            mode=mode,
+            reviewer_advisory=final_role == "reviewer",
+        )
         return _append_subagent_report(final_text, roles_run)
 
     def _run_parallel_subagent_workflow(
@@ -438,6 +516,7 @@ class CodeAgent:
         historical_messages: Sequence[Mapping[str, Any]],
         session: SessionLogger | None,
         mode: str,
+        browser_intent: BrowserIntent,
     ) -> str:
         """Run only explicitly safe phase groups with bounded concurrency."""
         orchestrator = SubagentOrchestrator()
@@ -461,6 +540,7 @@ class CodeAgent:
         roles_run: list[str] = []
         failures: list[SubagentPhaseFailure] = []
         parallel_groups: list[tuple[str, tuple[str, ...]]] = []
+        validation_evidence = ValidationEvidence()
 
         analysis_phases = tuple(
             phase
@@ -506,6 +586,7 @@ class CodeAgent:
             changed_files,
             roles_run,
             failures,
+            validation_evidence,
         )
 
         if "planner" not in outputs or mode == "plan":
@@ -516,6 +597,12 @@ class CodeAgent:
             security_output = outputs.get("security")
             if security_output:
                 final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+            final_text = _finalize_validation_summary(
+                final_text,
+                browser_intent,
+                validation_evidence,
+                mode=mode,
+            )
             return _append_subagent_report(
                 final_text,
                 roles_run,
@@ -542,10 +629,17 @@ class CodeAgent:
             changed_files,
             roles_run,
             failures,
+            validation_evidence,
         )
         if "coder" not in outputs:
-            return _append_subagent_report(
+            final_text = _finalize_validation_summary(
                 outputs["planner"],
+                browser_intent,
+                validation_evidence,
+                mode=mode,
+            )
+            return _append_subagent_report(
+                final_text,
                 roles_run,
                 parallel_groups=parallel_groups,
                 failures=failures,
@@ -575,6 +669,7 @@ class CodeAgent:
                 changed_files,
                 roles_run,
                 failures,
+                validation_evidence,
             )
 
         post_edit_phases = tuple(
@@ -606,12 +701,20 @@ class CodeAgent:
             changed_files,
             roles_run,
             failures,
+            validation_evidence,
         )
 
         final_text = outputs.get("reviewer") or outputs.get("tester") or outputs["coder"]
         security_output = outputs.get("security")
         if security_output:
             final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+        final_text = _finalize_validation_summary(
+            final_text,
+            browser_intent,
+            validation_evidence,
+            mode=mode,
+            reviewer_advisory="reviewer" in outputs,
+        )
         return _append_subagent_report(
             final_text,
             roles_run,
@@ -836,6 +939,7 @@ def _run_subagent_model_loop(
         allow_execute=mode not in {"plan", "no-command"},
     )
     changed_files: list[str] = []
+    validation_evidence = ValidationEvidence()
     for step in range(max_steps):
         response = model_client.complete(messages, tool_schemas)
         _log_session(
@@ -876,6 +980,12 @@ def _run_subagent_model_loop(
                     arguments=tool_call.arguments,
                 )
                 result = tools.execute(tool_call.name, tool_call.arguments)
+                _record_validation_evidence(
+                    validation_evidence,
+                    internal_tool_name,
+                    tool_call.arguments,
+                    result,
+                )
                 _log_session(
                     session,
                     "tool_result",
@@ -937,6 +1047,15 @@ def _run_subagent_model_loop(
             return SubagentPhaseResult(
                 text=_truncate_final_output(response.text.strip()),
                 changed_files=tuple(changed_files),
+                browser_validations=tuple(
+                    validation_evidence.browser_validations
+                ),
+                browser_validations_truncated=(
+                    validation_evidence.browser_validations_truncated
+                ),
+                validation_commands_run=(
+                    validation_evidence.validation_commands_run
+                ),
             )
         raise AgentError(
             f"Subagent {role.name!r} returned neither text nor tool calls."
@@ -1059,6 +1178,7 @@ def _merge_subagent_outcomes(
     changed_files: list[str],
     roles_run: list[str],
     failures: list[SubagentPhaseFailure],
+    validation_evidence: ValidationEvidence,
 ) -> None:
     """Merge completed futures in declared phase order, never completion order."""
     for outcome in outcomes:
@@ -1080,6 +1200,7 @@ def _merge_subagent_outcomes(
             )
             continue
         outputs[role_name] = outcome.result.text
+        validation_evidence.merge(outcome.result)
         for path in outcome.result.changed_files:
             if path not in changed_files:
                 changed_files.append(path)
@@ -1112,7 +1233,13 @@ def _append_historical_messages(
 
 
 def _changed_path(tool_name: str, result: Mapping[str, Any]) -> str | None:
-    if tool_name not in {"create_dir", "write_file", "edit_file"}:
+    if tool_name not in {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+    }:
         return None
     if result.get("ok") is not True:
         return None
@@ -1184,6 +1311,190 @@ def _serialize_tool_result(result: dict[str, Any]) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
+
+
+def _record_validation_evidence(
+    evidence: ValidationEvidence,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    if tool_name == "run_validation":
+        results = result.get("results")
+        if isinstance(results, Sequence) and not isinstance(results, (str, bytes)):
+            evidence.validation_commands_run = (
+                evidence.validation_commands_run or bool(results)
+            )
+        return
+    if tool_name not in {
+        "run_browser_validation",
+        "run_managed_browser_validation",
+    } and not tool_name.startswith("mcp.playwright."):
+        return
+
+    screenshot_path = result.get("screenshot_path")
+    final_url = result.get("final_url")
+    title = result.get("title")
+    console_errors = result.get("console_errors")
+    failed_requests = result.get("failed_requests")
+    error = result.get("error")
+    not_run_reason = _browser_not_run_reason(tool_name, result)
+    result_full_page = result.get("full_page")
+    requested_full_page = arguments.get("full_page")
+    full_page = (
+        result_full_page
+        if isinstance(result_full_page, bool)
+        else requested_full_page
+        if isinstance(requested_full_page, bool)
+        else None
+    )
+    if len(evidence.browser_validations) >= MAX_BROWSER_VALIDATION_RECORDS:
+        evidence.browser_validations_truncated = True
+        return
+    evidence.browser_validations.append(
+        BrowserValidationRecord(
+            tool_name=tool_name,
+            ran=not_run_reason is None,
+            ok=result.get("ok") is True,
+            final_url=final_url if isinstance(final_url, str) and final_url else None,
+            title=title if isinstance(title, str) and title else None,
+            screenshot_path=(
+                screenshot_path if isinstance(screenshot_path, str) else None
+            ),
+            console_error_count=(
+                len(console_errors)
+                if isinstance(console_errors, Sequence)
+                and not isinstance(console_errors, (str, bytes))
+                else None
+            ),
+            failed_request_count=(
+                len(failed_requests)
+                if isinstance(failed_requests, Sequence)
+                and not isinstance(failed_requests, (str, bytes))
+                else None
+            ),
+            full_page=full_page,
+            not_run_reason=not_run_reason,
+            error=error if isinstance(error, str) and error else None,
+        )
+    )
+
+
+def _browser_not_run_reason(
+    tool_name: str,
+    result: Mapping[str, Any],
+) -> str | None:
+    if result.get("permission_denied") is True:
+        return "approval denied"
+
+    error = str(result.get("error") or "").lower()
+    if "playwright is unavailable" in error or "playwright install chromium" in error:
+        return "Playwright missing"
+
+    managed_server = result.get("managed_server")
+    if tool_name == "run_managed_browser_validation" and isinstance(
+        managed_server,
+        Mapping,
+    ):
+        if managed_server.get("startup_failed") is True:
+            if "did not respond within" in error:
+                return "URL readiness timeout"
+            return "startup failed"
+        if managed_server.get("ready") is not True and result.get("ok") is not True:
+            return "managed server did not start"
+    return None
+
+
+def _finalize_validation_summary(
+    text: str,
+    browser_intent: BrowserIntent,
+    evidence: ValidationEvidence,
+    *,
+    mode: str = "default",
+    reviewer_advisory: bool = False,
+) -> str:
+    final_text = text.rstrip()
+    if not evidence.validation_commands_run:
+        final_text = re.sub(
+            r"(?i)run detected validation commands\.?",
+            "No detected validation commands were run.",
+            final_text,
+        )
+    if not browser_intent.detected and not evidence.browser_validations:
+        return final_text
+
+    if reviewer_advisory:
+        final_text = _reviewer_advisory_text(final_text)
+        final_text = f"Reviewer findings (advisory):\n{final_text}"
+
+    lines = [final_text, "", "Browser validation:"]
+    if not evidence.browser_validations:
+        if mode == "plan":
+            reason = "plan mode; browser and managed-server execution is disabled"
+        elif mode == "no-command":
+            reason = "no-command mode; managed-server and browser tools are disabled"
+        else:
+            reason = "browser intent was detected, but no browser tool executed"
+        lines.append(f"- Not run: {reason}.")
+        return "\n".join(lines)
+
+    for record in evidence.browser_validations:
+        status = "passed" if record.ok else "failed" if record.ran else "not run"
+        lines.append(f"- {record.tool_name}: {status} (authoritative tool result)")
+        if record.not_run_reason is not None:
+            lines.append(f"  Reason: {record.not_run_reason}.")
+        if record.error is not None and not record.ok:
+            lines.append(f"  Error: {record.error}")
+        if not record.ran:
+            continue
+        lines.append(f"  Final URL: {record.final_url or 'not reported by this tool'}")
+        lines.append(f"  Page title: {record.title or 'not reported by this tool'}")
+        lines.append(f"  Screenshot: {record.screenshot_path or 'None'}")
+        console_count = (
+            str(record.console_error_count)
+            if record.console_error_count is not None
+            else "not reported by this tool"
+        )
+        lines.append(f"  Console errors: {console_count}")
+        failed_count = (
+            str(record.failed_request_count)
+            if record.failed_request_count is not None
+            else "not reported by this tool"
+        )
+        lines.append(f"  Failed requests: {failed_count}")
+        full_page = (
+            "yes"
+            if record.full_page is True
+            else "no"
+            if record.full_page is False
+            else "not reported by this tool"
+        )
+        lines.append(f"  Full-page screenshot: {full_page}")
+    if evidence.browser_validations_truncated:
+        lines.append("- Additional browser validation records were truncated.")
+    return "\n".join(lines)
+
+
+def _reviewer_advisory_text(text: str) -> str:
+    """Keep reviewer findings while making role-local browser limits explicit."""
+    conflict = re.compile(
+        r"(?i)(?:browser(?:/ui)? validation.*(?:did not run|unavailable)|"
+        r"active reviewer role.*(?:no permission|cannot|can't).*browser|"
+        r"reviewer role.*(?:no permission|cannot|can't).*browser)"
+    )
+    lines: list[str] = []
+    inserted_note = False
+    for line in text.splitlines():
+        if conflict.search(line):
+            if not inserted_note:
+                lines.append(
+                    "Reviewer role note: this role did not personally run browser "
+                    "validation; the authoritative tool result is reported below."
+                )
+                inserted_note = True
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _truncate_final_output(text: str) -> str:

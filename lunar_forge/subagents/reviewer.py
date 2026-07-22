@@ -16,7 +16,11 @@ REVIEWER_ROLE = SubagentRole(
     system_prompt_fragment=(
         "Act as the reviewer. Inspect the relevant changed files, report concrete "
         "findings with file references, and do not modify project state. Prioritize "
-        "correctness and maintainability over stylistic preferences."
+        "correctness and maintainability over stylistic preferences. Validation "
+        "status belongs to tester and tool results. In parallel mode the tester may "
+        "still be running, so never infer that browser validation did not run from "
+        "this role's read-only tool restrictions. You may say that the reviewer did "
+        "not personally run it and defer to the authoritative validation summary."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

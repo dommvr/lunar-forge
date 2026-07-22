@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from lunar_forge.project_detection import detect_project, detect_project_type
 
 
@@ -63,6 +65,19 @@ def test_detect_vite_react_npm_project(tmp_path):
     assert project["local_url"] == "http://localhost:5173"
 
 
+def test_detect_vite_infers_npm_dev_command_without_declared_script(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"devDependencies": {"vite": "latest"}}),
+        encoding="utf-8",
+    )
+
+    project = detect_project(tmp_path)
+
+    assert project["package_manager"] == "npm"
+    assert project["dev_command"] == "npm run dev"
+    assert project["local_url"] == "http://localhost:5173"
+
+
 def test_detect_nextjs_pnpm_app_router(tmp_path):
     package_json = {
         "dependencies": {"next": "latest", "react": "latest"},
@@ -104,6 +119,36 @@ def test_detect_yarn_package_manager(tmp_path):
 
     assert project["languages"] == ["javascript"]
     assert project["package_manager"] == "yarn"
+
+
+@pytest.mark.parametrize(
+    ("lock_file", "expected_command"),
+    (
+        ("package-lock.json", "npm run dev"),
+        ("pnpm-lock.yaml", "pnpm dev"),
+        ("yarn.lock", "yarn dev"),
+    ),
+)
+def test_vite_dev_command_uses_detected_package_manager(
+    tmp_path,
+    lock_file,
+    expected_command,
+):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "devDependencies": {"vite": "latest"},
+                "scripts": {"dev": "vite"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / lock_file).write_text("", encoding="utf-8")
+
+    project = detect_project(tmp_path)
+
+    assert project["dev_command"] == expected_command
+    assert project["local_url"] == "http://localhost:5173"
 
 
 def test_detect_django_from_manage_py_and_requirements(tmp_path):

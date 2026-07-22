@@ -525,6 +525,23 @@ project dependencies are installed automatically. In particular,
 `browser-validate` only prints actionable setup instructions when Playwright is
 missing; it never invokes `browser-setup` automatically.
 
+Agent orchestration also performs deterministic browser-intent detection before
+the first model call. Signals include browser/UI language, screenshots and
+full-page screenshots, visual or page-rendering checks, console errors,
+accessibility, page inspection, clicks, forms, layouts, loopback URLs, and
+requests to start a dev server. The detected context is placed in every active
+role prompt. For a Vite project with package metadata, project detection supplies
+`http://localhost:5173` plus `npm run dev`, `pnpm dev`, or `yarn dev` according
+to the detected package manager. A request to start the server routes the Tester
+to `run_managed_browser_validation`; an already-running URL routes to
+`run_browser_validation`. Tester may also use permission-gated tools from an
+enabled MCP server named `playwright`. Non-browser tasks continue to use normal
+project validation. Final browser status comes from the structured Tester/tool
+result, not Reviewer prose. The authoritative section reports status, final URL,
+page title, screenshot path, console-error and failed-request counts, and whether
+full-page mode was used; Reviewer findings remain advisory in both sequential
+and parallel subagent modes.
+
 For deterministic validation without a model or API key, run:
 
 ```bash
@@ -544,6 +561,14 @@ stdout/stderr when startup fails, and uses a `finally` cleanup path after server
 startup so polling and validation failures also trigger termination. Use
 `--startup-timeout-ms` to adjust the URL wait. The command remains deterministic
 and model-free in both modes.
+
+Managed results distinguish startup and validation state from intentional
+cleanup with `ready`, `startup_failed`, `terminated_by_lunar_forge`, `stopped`,
+and `stop_note`. When LunarForge deliberately stops a successfully validated
+server, the stop-related process code is omitted (`exit_code: null`) instead of
+being presented as a runtime failure. Agent summaries are grounded in executed
+tool results and include the browser tool, screenshot path, and console-error
+count; if no browser tool ran, the summary says so explicitly.
 
 If browser support is missing, either run the approved helper or execute its
 commands manually after review:
@@ -652,6 +677,14 @@ start processes.
   a localhost page. Confirm it chooses browser validation or available
   Playwright MCP tools instead of curl/basic HTTP validation. Confirm it does
   not install dependencies or start a server without approval.
+
+  ```bash
+  lunar-forge --project ./frontend "Start the dev server if needed, inspect the UI in a browser, capture a full-page screenshot, and report console errors."
+  ```
+
+  Confirm the final Browser validation section says `passed` and includes the
+  URL, title, screenshot path, both error counts, and `Full-page screenshot: yes`.
+  It must not also claim that browser validation did not run.
 
 - [ ] Enable parallel subagents with either configuration or the CLI flag (both
   are not required), run a disposable change, and confirm the final report lists
