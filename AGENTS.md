@@ -53,17 +53,28 @@ Build the project in this order:
 22. Docker runner.
 23. Final summaries and resume support.
 
-Next feature wave, in order:
+Completed advanced feature wave:
 
 24. Automatically apply nested `AGENTS.md` by file path.
 25. Add session resume.
 26. Improve new-project scaffolding.
 27. Add subagents: planner, coder, reviewer, tester, security, scaffolder.
-28. Add MCP client integration.
+28. Add MCP client integration, including stdio transport and provider-safe tool names.
 29. Add UI/browser validation with Playwright.
-30. Add a safe plugin system.
+30. Add a safe plugin system and plugin diagnostics.
 
-The basic read-plan-edit-validate MVP already exists. Future work must still be staged carefully. Add advanced features incrementally, with tests and safety reviews after every phase.
+Next feature wave, in order:
+
+31. Add better file inspection and edit tools:
+    * `read_file_with_line_numbers`
+    * `replace_lines`
+    * `insert_lines`
+32. Improve browser-tool routing so UI/browser prompts reliably prefer browser validation or Playwright MCP over curl/basic command validation.
+33. Add managed browser-validation server mode so LunarForge can start an approved dev server, wait for a URL, validate the page, and shut the server down.
+34. Add clearer Playwright dependency detection and setup guidance, with optional user-approved installation only when explicitly requested.
+35. Add parallel subagent phases for read-only analysis and validation/review while keeping write-capable work serialized.
+
+The basic read-plan-edit-validate MVP and first advanced tool wave already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
 ---
 
@@ -332,20 +343,26 @@ Each tool must define:
 * JSON schema
 * Python handler
 
-Initial tools:
+Core tools:
 
 ```text
 list_dir
 read_file
+read_file_with_line_numbers
 grep
 glob
 create_dir
 write_file
 edit_file
+replace_lines
+insert_lines
 run_command
 detect_project
 run_validation
+run_browser_validation
 ```
+
+MCP and plugin tools may also be registered through the same central registry. Provider-facing tool names must be API-safe, while internal names may remain human-readable and namespaced.
 
 Tool handlers must return JSON-serializable dictionaries.
 
@@ -404,6 +421,7 @@ Implement:
 ```text
 list_dir(path)
 read_file(path, start_line?, end_line?)
+read_file_with_line_numbers(path, start_line?, end_line?)
 grep(pattern, path?)
 glob(pattern)
 ```
@@ -413,6 +431,7 @@ Behavior:
 * Limit file output to avoid huge context dumps.
 * Return truncation metadata.
 * Use line ranges when possible.
+* `read_file_with_line_numbers` must include stable 1-based line numbers in output so the model can make precise line-range edits.
 * Search should return paths, line numbers, and short snippets.
 * Grep should cap results.
 
@@ -426,6 +445,8 @@ Implement:
 create_dir(path)
 write_file(path, content, overwrite=false)
 edit_file(path, old_text, new_text)
+replace_lines(path, start_line, end_line, new_text)
+insert_lines(path, after_line, new_text)
 ```
 
 Rules:
@@ -435,10 +456,15 @@ Rules:
 * `old_text` must match exactly once.
 * If `old_text` matches zero times, fail.
 * If `old_text` matches more than once, fail.
-* Always return a unified diff.
-* Always checkpoint before modifying an existing file.
+* `replace_lines` must use 1-based inclusive line numbers.
+* `replace_lines` must fail when the range is invalid or outside the file.
+* `insert_lines` must use a 1-based insertion point and insert after the given line; support `after_line=0` to insert at the top.
+* `replace_lines` and `insert_lines` must preserve existing newline style when practical.
+* All edit tools must return a unified diff.
+* All edit tools must checkpoint before modifying an existing file.
+* All edit tools must preserve project-root path safety and plan-mode no-write behavior.
 
-Do not implement vague whole-file rewrites early. Exact replacement first. It is less glamorous and much less likely to turn code into oatmeal.
+Keep `edit_file` for exact replacement and add line-based tools for precision. Do not add a general `apply_patch` tool until line-based edits are stable.
 
 ---
 
@@ -1070,7 +1096,7 @@ lunar_forge/subagents/
   orchestrator.py
 ```
 
-Orchestration flow:
+Default sequential orchestration flow:
 
 ```text
 User task
@@ -1090,7 +1116,22 @@ Security when risky tools/config changed
 Final answer
 ```
 
-Keep orchestration deterministic. Do not build autonomous multi-agent debate loops yet.
+Parallel orchestration may be added after sequential subagents work.
+
+Parallel rules:
+
+* Only read-only subagents may run at the same time.
+* Write-capable subagents must remain serialized.
+* Planner and Security may run in parallel during analysis when both use read-only tools.
+* Tester and Reviewer may run in parallel after edits, because Tester can run validation while Reviewer inspects diffs and files.
+* Coder and Scaffolder must not run in parallel with any other writer.
+* Each subagent must receive its own restricted tool registry view.
+* Session logs must include role name, phase name, and parallel group ID.
+* Final output must merge parallel results deterministically.
+* Parallel failures must be reported clearly without hiding successful sibling results.
+* Use simple synchronous concurrency, such as `ThreadPoolExecutor`, before introducing async.
+
+Do not build autonomous multi-agent debate loops. Parallelism is for independent phases, not for letting six agents argue with each other like a committee discovering tabs versus spaces.
 
 ---
 
@@ -1186,12 +1227,25 @@ run_browser_validation(url, checks?, screenshot=true)
 
 Behavior:
 
-* The user or agent must start the dev server through approved command execution.
-* Browser validation should connect to a local URL, not start arbitrary servers by magic.
-* Capture page title, URL, console errors, failed requests, and screenshot path.
+* Browser validation should connect to a local URL and capture page title, URL, console errors, failed requests, and screenshot path.
+* Support deterministic direct validation:
+  `lunar-forge browser-validate <url>`.
+* Support managed server mode:
+  `lunar-forge browser-validate --serve "npm run dev" --url http://localhost:5173`.
+* Managed server mode must ask approval before starting the server command.
+* Managed server mode must wait for the URL, run validation, and shut the server down best-effort.
+* The agent should be able to choose managed browser validation when the user asks to inspect UI/browser behavior and project detection can infer a dev command and local URL.
+* The agent must prefer browser validation or Playwright MCP over `curl` when the request involves visual rendering, screenshots, accessibility snapshots, console errors, clicking, forms, layout, or frontend localhost pages.
+* Do not start arbitrary servers without approval.
+* Do not auto-install dependencies silently.
+* If Playwright is missing, return a clear setup message:
+  `python -m pip install -e ".[browser]"`
+  and
+  `python -m playwright install chromium`.
+* Optional user-approved installation may be added, but browser dependencies must never install without explicit approval.
 * Bound logs and artifacts.
 * Do not upload screenshots anywhere.
-* Do not require Playwright as a core dependency at first; use an optional extra such as `.[browser]`.
+* Do not require Playwright as a core dependency; keep it behind an optional extra such as `.[browser]`.
 
 ---
 
@@ -1378,7 +1432,7 @@ These are the defaults unless changed deliberately:
 * Use Rich for terminal output.
 * Use LiteLLM as the first model provider layer.
 * Use sync code for the MVP.
-* Use exact-replacement editing before advanced patching.
+* Use exact-replacement editing plus line-based edits before advanced patching.
 * Use local command runner before Docker runner.
 * Use YAML for config.
 * Use JSONL for sessions.

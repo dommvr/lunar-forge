@@ -33,6 +33,10 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "AGENTS.md files are path-scoped" in prompt
     assert "root-to-leaf order" in prompt
     assert "instruction_stack" in prompt
+    assert "Prefer read_file_with_line_numbers" in prompt
+    assert "Use replace_lines" in prompt
+    assert "Use insert_lines" in prompt
+    assert "Keep using edit_file" in prompt
 
 
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():
@@ -72,8 +76,16 @@ def test_plan_prompt_and_registry_remain_read_only(tmp_path):
 
     assert "Use only read/search tools" in prompt
     assert "Do not call mutation, command, or validation tools" in prompt
-    assert schema_names == {"glob", "grep", "list_dir", "read_file"}
+    assert schema_names == {
+        "glob",
+        "grep",
+        "list_dir",
+        "read_file",
+        "read_file_with_line_numbers",
+    }
     assert "write_file" not in registry.names()
+    assert "replace_lines" not in registry.names()
+    assert "insert_lines" not in registry.names()
     assert "run_command" not in registry.names()
     assert "run_validation" not in registry.names()
 
@@ -97,6 +109,9 @@ def test_existing_read_and_execution_tools_remain_available(tmp_path):
         "grep",
         "list_dir",
         "read_file",
+        "read_file_with_line_numbers",
+        "replace_lines",
+        "insert_lines",
         "run_command",
         "run_validation",
         "write_file",

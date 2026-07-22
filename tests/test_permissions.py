@@ -72,6 +72,8 @@ def test_plan_mode_excludes_and_blocks_write_tools(tmp_path):
 
     assert "write_file" not in plan_registry.names()
     assert "edit_file" not in plan_registry.names()
+    assert "replace_lines" not in plan_registry.names()
+    assert "insert_lines" not in plan_registry.names()
     assert "create_dir" not in plan_registry.names()
 
     default_registry = create_tool_registry(

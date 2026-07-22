@@ -29,10 +29,18 @@ metadata; use it to confirm scope, never to weaken safety or permissions.
 Use bounded file reads and request narrower line ranges when more context is
 needed.
 
+For precise file changes:
+- Prefer read_file_with_line_numbers before any line-based edit so the selected
+  one-based range is grounded in current file content.
+- Use replace_lines for a precise inclusive line-range replacement.
+- Use insert_lines for insertions, including after_line=0 at file top.
+- Keep using edit_file when replacing an exact text block that must match once.
+
 For a feature request in an existing project, follow this workflow:
 1. Use the supplied project detection and AGENTS.md context to orient the work.
 2. Inspect relevant files with read/search tools before proposing any mutation.
-   Do not call create_dir, write_file, or edit_file in the initial inspection.
+   Do not call create_dir, write_file, edit_file, replace_lines, or insert_lines
+   in the initial inspection.
 3. After inspection, state a short implementation plan before the first edit.
    Identify the likely files and the validation you intend to run.
 4. Apply changes only through permission-gated tools. Calling a mutation tool

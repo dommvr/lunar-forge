@@ -1,7 +1,13 @@
 import pytest
 
 from lunar_forge.permissions import is_subpath
-from lunar_forge.tools.files import read_file, safe_path
+from lunar_forge.tools.files import (
+    insert_lines,
+    read_file,
+    read_file_with_line_numbers,
+    replace_lines,
+    safe_path,
+)
 
 
 def test_is_subpath_accepts_child(tmp_path):
@@ -45,3 +51,18 @@ def test_read_file_returns_error_for_parent_traversal(tmp_path):
 
     assert result["ok"] is False
     assert "outside the project root" in result["error"]
+
+
+def test_line_tools_reject_parent_traversal(tmp_path):
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("unchanged\n", encoding="utf-8")
+
+    results = (
+        read_file_with_line_numbers(tmp_path, "../outside.txt"),
+        replace_lines(tmp_path, "../outside.txt", 1, 1, "changed"),
+        insert_lines(tmp_path, "../outside.txt", 0, "changed"),
+    )
+
+    assert all(result["ok"] is False for result in results)
+    assert all("outside the project root" in result["error"] for result in results)
+    assert outside.read_text(encoding="utf-8") == "unchanged\n"

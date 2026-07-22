@@ -18,8 +18,11 @@ from lunar_forge.permissions import (
 from lunar_forge.tools.files import (
     create_dir,
     edit_file,
+    insert_lines,
     list_dir,
     read_file,
+    read_file_with_line_numbers,
+    replace_lines,
     write_file,
 )
 from lunar_forge.tools.search import glob_files, grep
@@ -290,6 +293,35 @@ def create_read_only_registry(project_root: str | Path) -> ToolRegistry:
                 handler=partial(read_file, project_root),
             ),
             Tool(
+                name="read_file_with_line_numbers",
+                description=(
+                    "Read a bounded UTF-8 file range with stable one-based line "
+                    "numbers for precise line edits."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Project-relative file path.",
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "First one-based line to return.",
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Last one-based line to return.",
+                        },
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=partial(read_file_with_line_numbers, project_root),
+            ),
+            Tool(
                 name="grep",
                 description="Search project files with a regular expression.",
                 parameters={
@@ -462,6 +494,71 @@ def _write_tools(project_root: str | Path) -> tuple[Tool, ...]:
                 "additionalProperties": False,
             },
             handler=partial(edit_file, project_root),
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            name="replace_lines",
+            description=(
+                "Replace a precise one-based inclusive line range after first "
+                "reading the file with line numbers."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Project-relative file path.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First one-based line to replace.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Last one-based line to replace.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text for the selected lines.",
+                    },
+                },
+                "required": ["path", "start_line", "end_line", "new_text"],
+                "additionalProperties": False,
+            },
+            handler=partial(replace_lines, project_root),
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            name="insert_lines",
+            description=(
+                "Insert text after a one-based line; use after_line=0 for the "
+                "top of the file."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Project-relative file path.",
+                    },
+                    "after_line": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Insert after this one-based line, or zero at file top."
+                        ),
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Text to insert as one or more lines.",
+                    },
+                },
+                "required": ["path", "after_line", "new_text"],
+                "additionalProperties": False,
+            },
+            handler=partial(insert_lines, project_root),
             permission=PermissionLevel.WRITE,
         ),
     )

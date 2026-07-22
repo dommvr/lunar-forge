@@ -111,6 +111,40 @@ def read_file(
     end_line: int | None = None,
 ) -> dict[str, Any]:
     """Read a bounded, one-based inclusive line range from a UTF-8 file."""
+    return _read_file_range(
+        project_root,
+        path,
+        start_line=start_line,
+        end_line=end_line,
+        with_line_numbers=False,
+    )
+
+
+def read_file_with_line_numbers(
+    project_root: str | Path,
+    path: str | Path,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> dict[str, Any]:
+    """Read a bounded range prefixed with stable one-based line numbers."""
+    return _read_file_range(
+        project_root,
+        path,
+        start_line=start_line,
+        end_line=end_line,
+        with_line_numbers=True,
+    )
+
+
+def _read_file_range(
+    project_root: str | Path,
+    path: str | Path,
+    *,
+    start_line: int | None,
+    end_line: int | None,
+    with_line_numbers: bool,
+) -> dict[str, Any]:
+    """Implement bounded plain and numbered reads with identical metadata."""
     try:
         first_line = 1 if start_line is None else start_line
         if first_line < 1:
@@ -142,21 +176,24 @@ def read_file(
                     truncated = True
                     break
 
+                rendered_line = (
+                    f"{line_number}: {line}" if with_line_numbers else line
+                )
                 remaining = MAX_FILE_CHARACTERS - character_count
                 if remaining <= 0:
                     truncated = True
                     break
-                if len(line) > remaining:
-                    content.append(line[:remaining])
+                if len(rendered_line) > remaining:
+                    content.append(rendered_line[:remaining])
                     last_line = line_number
                     truncated = True
                     break
 
-                content.append(line)
-                character_count += len(line)
+                content.append(rendered_line)
+                character_count += len(rendered_line)
                 last_line = line_number
 
-        return {
+        result = {
             "ok": True,
             "path": _display_path(root, file_path),
             "content": "".join(content),
@@ -165,6 +202,9 @@ def read_file(
             "truncated": truncated,
             "instruction_stack": instruction_stack,
         }
+        if with_line_numbers:
+            result["line_numbers"] = True
+        return result
     except (OSError, PermissionError, UnicodeError, ValueError) as exc:
         return _error(exc)
 
@@ -300,6 +340,178 @@ def edit_file(
         }
     except (OSError, PermissionError, UnicodeError, ValueError) as exc:
         return _error(exc)
+
+
+def replace_lines(
+    project_root: str | Path,
+    path: str | Path,
+    start_line: int,
+    end_line: int,
+    new_text: str,
+) -> dict[str, Any]:
+    """Replace a one-based inclusive line range in an existing UTF-8 file."""
+    try:
+        _validate_line_number(start_line, "start_line", minimum=1)
+        _validate_line_number(end_line, "end_line", minimum=1)
+        if end_line < start_line:
+            raise ValueError("end_line must be greater than or equal to start_line.")
+        if not isinstance(new_text, str):
+            raise ValueError("new_text must be a string.")
+
+        root, file_path, instruction_stack, old_content = _editable_file(
+            project_root,
+            path,
+        )
+        lines = old_content.splitlines(keepends=True)
+        if start_line > len(lines) or end_line > len(lines):
+            raise ValueError(
+                "Line range is outside the file; "
+                f"the file has {len(lines)} line(s)."
+            )
+
+        newline = _detect_newline(old_content)
+        replacement = _normalize_newlines(new_text, newline)
+        suffix_exists = end_line < len(lines)
+        selected_ended_with_newline = _ends_with_newline(lines[end_line - 1])
+        if replacement and not _ends_with_newline(replacement) and (
+            suffix_exists or selected_ended_with_newline
+        ):
+            replacement += newline
+
+        new_content = (
+            "".join(lines[: start_line - 1])
+            + replacement
+            + "".join(lines[end_line:])
+        )
+        return _write_existing_edit(
+            root,
+            file_path,
+            old_content,
+            new_content,
+            instruction_stack,
+        )
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _error(exc)
+
+
+def insert_lines(
+    project_root: str | Path,
+    path: str | Path,
+    after_line: int,
+    new_text: str,
+) -> dict[str, Any]:
+    """Insert text after a one-based line, with zero representing file top."""
+    try:
+        _validate_line_number(after_line, "after_line", minimum=0)
+        if not isinstance(new_text, str):
+            raise ValueError("new_text must be a string.")
+
+        root, file_path, instruction_stack, old_content = _editable_file(
+            project_root,
+            path,
+        )
+        lines = old_content.splitlines(keepends=True)
+        if after_line > len(lines):
+            raise ValueError(
+                "after_line is outside the file; "
+                f"the file has {len(lines)} line(s)."
+            )
+
+        newline = _detect_newline(old_content)
+        insertion = _normalize_newlines(new_text, newline)
+        prefix = "".join(lines[:after_line])
+        suffix = "".join(lines[after_line:])
+        if insertion:
+            if prefix and not _ends_with_newline(prefix):
+                prefix += newline
+            if suffix and not _ends_with_newline(insertion):
+                insertion += newline
+            elif (
+                not suffix
+                and _ends_with_newline(old_content)
+                and not _ends_with_newline(insertion)
+            ):
+                insertion += newline
+
+        new_content = prefix + insertion + suffix
+        return _write_existing_edit(
+            root,
+            file_path,
+            old_content,
+            new_content,
+            instruction_stack,
+        )
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _error(exc)
+
+
+def _validate_line_number(value: int, name: str, *, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer.")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+
+
+def _editable_file(
+    project_root: str | Path,
+    path: str | Path,
+) -> tuple[Path, Path, list[dict[str, Any]], str]:
+    root = Path(project_root).expanduser().resolve()
+    file_path = safe_path(root, path)
+    _assert_not_ignored(root, file_path)
+    if not file_path.exists():
+        raise FileNotFoundError("File does not exist.")
+    if not file_path.is_file():
+        raise IsADirectoryError("Path is not a file.")
+    instruction_stack = _instruction_stack(root, file_path)
+    with file_path.open("r", encoding="utf-8", newline="") as handle:
+        content = handle.read()
+    return root, file_path, instruction_stack, content
+
+
+def _write_existing_edit(
+    root: Path,
+    file_path: Path,
+    old_content: str,
+    new_content: str,
+    instruction_stack: list[dict[str, Any]],
+) -> dict[str, Any]:
+    relative_path = _display_path(root, file_path)
+    diff, diff_truncated = _build_diff(
+        relative_path,
+        old_content,
+        new_content,
+        existed=True,
+    )
+    checkpoint_path = _checkpoint_file(root, file_path)
+    with file_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(new_content)
+    return {
+        "ok": True,
+        "path": relative_path,
+        "diff": diff,
+        "diff_truncated": diff_truncated,
+        "checkpoint_path": checkpoint_path,
+        "instruction_stack": instruction_stack,
+    }
+
+
+def _detect_newline(content: str) -> str:
+    for index, character in enumerate(content):
+        if character == "\n":
+            return "\n"
+        if character == "\r":
+            return "\r\n" if content[index : index + 2] == "\r\n" else "\r"
+    return "\n"
+
+
+def _normalize_newlines(text: str, newline: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized if newline == "\n" else normalized.replace("\n", newline)
+
+
+def _ends_with_newline(text: str) -> bool:
+    return text.endswith(("\n", "\r"))
 
 
 def project_path(root: str | Path, relative_path: str | Path) -> Path:
