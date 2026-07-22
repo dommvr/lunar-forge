@@ -1,4 +1,6 @@
 import json
+import time
+from threading import Barrier, Lock
 
 import pytest
 
@@ -17,6 +19,8 @@ from lunar_forge.subagents import (
     TESTER_ROLE,
     RestrictedToolRegistry,
     SubagentOrchestrator,
+    SubagentPhase,
+    SubagentPhasePlan,
     SubagentRole,
     WorkflowKind,
     build_phase_plan,
@@ -190,6 +194,69 @@ def test_new_project_phase_plan_uses_scaffolder_and_optional_security():
     assert plan.phases[-1].role is SECURITY_ROLE
 
 
+def test_parallel_phase_plans_group_only_non_writer_roles():
+    existing = build_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        include_security=True,
+        parallel=True,
+    )
+    new_project = build_phase_plan(
+        WorkflowKind.NEW_PROJECT,
+        parallel=True,
+    )
+
+    assert [phase.name for phase in existing.phases] == [
+        "plan",
+        "security",
+        "approval",
+        "implement",
+        "test",
+        "review",
+    ]
+    assert [
+        (group_id, tuple(phase.role_name for phase in phases))
+        for group_id, phases in existing.parallel_groups
+    ] == [
+        ("analysis", ("planner", "security")),
+        ("post-edit", ("tester", "reviewer")),
+    ]
+    assert existing.phases[3].role is CODER_ROLE
+    assert existing.phases[3].parallel_group_id is None
+    assert new_project.phases[0].role is SCAFFOLDER_ROLE
+    assert new_project.phases[0].parallel_group_id is None
+    assert [
+        tuple(phase.role_name for phase in phases)
+        for _, phases in new_project.parallel_groups
+    ] == [("tester", "reviewer")]
+    assert all(
+        phase.role is not None and phase.role.can_run_in_parallel
+        for plan in (existing, new_project)
+        for _, phases in plan.parallel_groups
+        for phase in phases
+    )
+
+
+def test_parallel_phase_plan_rejects_writer_roles():
+    with pytest.raises(ValueError, match="Writer subagent 'coder'"):
+        SubagentPhasePlan(
+            workflow=WorkflowKind.EXISTING_PROJECT,
+            phases=(
+                SubagentPhase(
+                    name="implement",
+                    description="Unsafe writer group.",
+                    role=CODER_ROLE,
+                    parallel_group_id="unsafe-1",
+                ),
+                SubagentPhase(
+                    name="test",
+                    description="Synthetic sibling.",
+                    role=TESTER_ROLE,
+                    parallel_group_id="unsafe-1",
+                ),
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "path",
     (
@@ -282,6 +349,7 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
     ).run("Update the app", tmp_path, registry=registry)
 
     assert "Subagents run:\n- planner\n- coder\n- tester\n- reviewer" in output
+    assert "Parallel subagent groups:\n- None" in output
     assert [call["role"] for call in model.calls] == [
         "planner",
         "coder",
@@ -303,6 +371,106 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
         if event["event"] == "subagent_started"
     ]
     assert started == ["planner", "coder", "tester", "reviewer"]
+
+
+def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path):
+    model = ParallelRoleModel()
+    config = AppConfig(
+        subagents=SubagentConfig(enabled=True, parallel=True),
+    )
+
+    output = CodeAgent(
+        config,
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update the app", tmp_path, registry=_agent_registry())
+
+    assert "Reviewer completed first." in output
+    assert "Subagents run:\n- planner\n- coder\n- tester\n- reviewer" in output
+    assert "Parallel subagent groups:\n- post-edit: tester, reviewer" in output
+    assert model.message_ids["tester"] != model.message_ids["reviewer"]
+    assert model.tools_by_role["tester"] == {"read_file", "run_validation"}
+    assert model.tools_by_role["reviewer"] == {"read_file"}
+    assert model.writer_overlap is False
+
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    lifecycle = [
+        event
+        for event in events
+        if event["event"] in {
+            "subagent_started",
+            "subagent_completed",
+            "subagent_error",
+        }
+    ]
+    assert lifecycle
+    assert all(
+        {"role", "phase", "parallel_group_id"} <= set(event["data"])
+        for event in lifecycle
+    )
+    post_edit_events = [
+        event
+        for event in lifecycle
+        if event["data"]["role"] in {"tester", "reviewer"}
+    ]
+    assert all(
+        event["data"]["parallel_group_id"] == "post-edit"
+        for event in post_edit_events
+    )
+
+
+def test_parallel_failure_reports_successful_sibling(tmp_path):
+    model = ParallelRoleModel(fail_role="reviewer")
+    config = AppConfig(
+        subagents=SubagentConfig(enabled=True, parallel=True),
+    )
+
+    output = CodeAgent(
+        config,
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update the app", tmp_path, registry=_agent_registry())
+
+    assert output.startswith("Tester completed after review.")
+    assert "Subagent failures:" in output
+    assert "reviewer (phase review, parallel group post-edit)" in output
+    assert "RuntimeError: Subagent execution failed." in output
+    assert "- tester\n- reviewer" in output
+
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    reviewer_errors = [
+        event
+        for event in events
+        if event["event"] == "subagent_error"
+        and event["data"]["role"] == "reviewer"
+    ]
+    assert len(reviewer_errors) == 1
+    assert reviewer_errors[0]["data"]["phase"] == "review"
+    assert reviewer_errors[0]["data"]["parallel_group_id"] == "post-edit"
+    assert any(
+        event["event"] == "subagent_completed"
+        and event["data"]["role"] == "tester"
+        for event in events
+    )
+
+
+def test_parallel_security_analysis_runs_with_planner_when_needed(tmp_path):
+    model = ParallelRoleModel(include_security=True)
+    config = AppConfig(
+        subagents=SubagentConfig(enabled=True, parallel=True),
+    )
+
+    output = CodeAgent(
+        config,
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update permission config", tmp_path, registry=_agent_registry())
+
+    assert "- analysis: planner, security" in output
+    assert "Security review:\nSecurity analysis complete." in output
+    assert model.message_ids["planner"] != model.message_ids["security"]
 
 
 def test_sensitive_existing_project_change_adds_security_subagent(tmp_path):
@@ -370,6 +538,41 @@ def test_new_project_subagents_use_scaffolder_tester_reviewer(tmp_path):
     assert "Subagents run:\n- scaffolder\n- tester\n- reviewer" in (
         format_new_project_result(result)
     )
+    assert "Parallel subagent groups:\n- None" in format_new_project_result(result)
+
+
+def test_new_project_parallelizes_only_test_and_review(tmp_path):
+    result = run_new_project(
+        "Build a simple marketing website",
+        tmp_path,
+        mode="yes",
+        subagents_enabled=True,
+        subagents_parallel=True,
+    )
+
+    assert result["ok"] is True
+    assert result["subagents_run"] == ["scaffolder", "tester", "reviewer"]
+    assert result["parallel_subagent_groups"] == [
+        {
+            "parallel_group_id": "post-edit",
+            "roles": ["tester", "reviewer"],
+        }
+    ]
+    formatted = format_new_project_result(result)
+    assert "Parallel subagent groups:\n- post-edit: tester, reviewer" in formatted
+
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    starts = {
+        event["data"]["role"]: event["data"]["parallel_group_id"]
+        for event in events
+        if event["event"] == "subagent_started"
+    }
+    assert starts == {
+        "scaffolder": None,
+        "tester": "post-edit",
+        "reviewer": "post-edit",
+    }
 
 
 def test_new_project_subagent_plan_mode_remains_no_write(tmp_path):
@@ -453,6 +656,63 @@ class SequenceModel:
             }
         )
         return self.responses.pop(0)
+
+
+class ParallelRoleModel:
+    def __init__(self, *, fail_role=None, include_security=False):
+        self.fail_role = fail_role
+        self.calls: list[str] = []
+        self.message_ids: dict[str, int] = {}
+        self.tools_by_role: dict[str, set[str]] = {}
+        self.writer_overlap = False
+        self._active_roles: set[str] = set()
+        self._lock = Lock()
+        self._post_edit_barrier = Barrier(2)
+        self._analysis_barrier = Barrier(2) if include_security else None
+
+    def complete(self, messages, tools=None):
+        system_prompt = str(messages[0]["content"])
+        role_line = next(
+            line
+            for line in system_prompt.splitlines()
+            if line.startswith("Active subagent role:")
+        )
+        role = role_line.partition(":")[2].strip()
+        with self._lock:
+            if role in {"coder", "scaffolder"} and self._active_roles:
+                self.writer_overlap = True
+            if role not in {"coder", "scaffolder"} and any(
+                active in {"coder", "scaffolder"}
+                for active in self._active_roles
+            ):
+                self.writer_overlap = True
+            self._active_roles.add(role)
+            self.calls.append(role)
+            self.message_ids[role] = id(messages)
+            self.tools_by_role[role] = {
+                schema["function"]["name"] for schema in (tools or [])
+            }
+        try:
+            if role in {"tester", "reviewer"}:
+                self._post_edit_barrier.wait(timeout=3)
+            if role in {"planner", "security"} and self._analysis_barrier is not None:
+                self._analysis_barrier.wait(timeout=3)
+            if role == self.fail_role:
+                raise RuntimeError(f"synthetic {role} failure")
+            if role == "tester":
+                time.sleep(0.05)
+            return ModelResponse(
+                text={
+                    "planner": "Plan complete.",
+                    "security": "Security analysis complete.",
+                    "coder": "Implementation complete.",
+                    "tester": "Tester completed after review.",
+                    "reviewer": "Reviewer completed first.",
+                }[role]
+            )
+        finally:
+            with self._lock:
+                self._active_roles.remove(role)
 
 
 def _agent_registry() -> ToolRegistry:

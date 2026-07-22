@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -65,6 +66,7 @@ class SessionLogger:
     path: Path
     _environment_names: frozenset[str] = field(repr=False)
     _environment_values: tuple[str, ...] = field(repr=False)
+    _write_lock: Any = field(default_factory=Lock, repr=False, compare=False)
     last_error: str | None = field(default=None, init=False)
 
     @property
@@ -108,8 +110,9 @@ class SessionLogger:
                     allow_nan=False,
                     separators=(",", ":"),
                 )
-            with safe_log_path.open("a", encoding="utf-8", newline="") as handle:
-                handle.write(f"{serialized}\n")
+            with self._write_lock:
+                with safe_log_path.open("a", encoding="utf-8", newline="") as handle:
+                    handle.write(f"{serialized}\n")
         except Exception:
             self.last_error = SESSION_ERROR
             return False

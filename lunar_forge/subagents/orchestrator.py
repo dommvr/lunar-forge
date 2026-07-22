@@ -30,6 +30,7 @@ class SubagentPhase:
     description: str
     role: SubagentRole | None = None
     requires_user_approval: bool = False
+    parallel_group_id: str | None = None
 
     @property
     def role_name(self) -> str | None:
@@ -41,6 +42,7 @@ class SubagentPhase:
             "description": self.description,
             "role": self.role_name,
             "requires_user_approval": self.requires_user_approval,
+            "parallel_group_id": self.parallel_group_id,
         }
 
 
@@ -50,6 +52,25 @@ class SubagentPhasePlan:
 
     workflow: WorkflowKind
     phases: tuple[SubagentPhase, ...]
+
+    def __post_init__(self) -> None:
+        grouped: dict[str, list[SubagentPhase]] = {}
+        for phase in self.phases:
+            group_id = phase.parallel_group_id
+            if group_id is None:
+                continue
+            if phase.role is None:
+                raise ValueError("Approval phases cannot join parallel groups.")
+            if not phase.role.can_run_in_parallel:
+                raise ValueError(
+                    f"Writer subagent {phase.role.name!r} cannot run in parallel."
+                )
+            grouped.setdefault(group_id, []).append(phase)
+        for group_id, phases in grouped.items():
+            if len(phases) < 2:
+                raise ValueError(
+                    f"Parallel group {group_id!r} must contain at least two roles."
+                )
 
     @property
     def role_names(self) -> tuple[str, ...]:
@@ -64,6 +85,17 @@ class SubagentPhasePlan:
             "workflow": self.workflow.value,
             "phases": [phase.as_dict() for phase in self.phases],
         }
+
+    @property
+    def parallel_groups(self) -> tuple[tuple[str, tuple[SubagentPhase, ...]], ...]:
+        """Return parallel groups in first-phase order."""
+        groups: dict[str, list[SubagentPhase]] = {}
+        for phase in self.phases:
+            if phase.parallel_group_id is not None:
+                groups.setdefault(phase.parallel_group_id, []).append(phase)
+        return tuple(
+            (group_id, tuple(phases)) for group_id, phases in groups.items()
+        )
 
 
 DEFAULT_ROLES = (
@@ -95,8 +127,10 @@ class SubagentOrchestrator:
         workflow: WorkflowKind | str,
         *,
         include_security: bool = False,
+        parallel: bool = False,
     ) -> SubagentPhasePlan:
         resolved_workflow = _normalize_workflow(workflow)
+        post_edit_group = "post-edit" if parallel else None
         if resolved_workflow is WorkflowKind.NEW_PROJECT:
             phases = [
                 SubagentPhase(
@@ -108,14 +142,17 @@ class SubagentOrchestrator:
                     name="test",
                     role=self._get_role("tester"),
                     description="Run permission-gated, focused validation.",
+                    parallel_group_id=post_edit_group,
                 ),
                 SubagentPhase(
                     name="review",
                     role=self._get_role("reviewer"),
                     description="Review the generated starter without mutating files.",
+                    parallel_group_id=post_edit_group,
                 ),
             ]
         else:
+            analysis_group = "analysis" if parallel and include_security else None
             phases = [
                 SubagentPhase(
                     name="plan",
@@ -123,6 +160,7 @@ class SubagentOrchestrator:
                     description=(
                         "Inspect context and produce a concrete implementation plan."
                     ),
+                    parallel_group_id=analysis_group,
                 ),
                 SubagentPhase(
                     name="approval",
@@ -140,21 +178,30 @@ class SubagentOrchestrator:
                     name="test",
                     role=self._get_role("tester"),
                     description="Run permission-gated, focused validation.",
+                    parallel_group_id=post_edit_group,
                 ),
                 SubagentPhase(
                     name="review",
                     role=self._get_role("reviewer"),
                     description="Review the resulting changes without mutating files.",
+                    parallel_group_id=post_edit_group,
                 ),
             ]
         if include_security:
-            phases.append(
-                SubagentPhase(
-                    name="security",
-                    role=self._get_role("security"),
-                    description="Review changes that affect sensitive trust boundaries.",
-                )
+            security_phase = SubagentPhase(
+                name="security",
+                role=self._get_role("security"),
+                description="Review changes that affect sensitive trust boundaries.",
+                parallel_group_id=(
+                    "analysis"
+                    if parallel and resolved_workflow is WorkflowKind.EXISTING_PROJECT
+                    else None
+                ),
             )
+            if parallel and resolved_workflow is WorkflowKind.EXISTING_PROJECT:
+                phases.insert(1, security_phase)
+            else:
+                phases.append(security_phase)
         return SubagentPhasePlan(resolved_workflow, tuple(phases))
 
     def _get_role(self, name: str) -> SubagentRole:
@@ -168,11 +215,30 @@ def build_phase_plan(
     workflow: WorkflowKind | str,
     *,
     include_security: bool = False,
+    parallel: bool = False,
 ) -> SubagentPhasePlan:
     """Build the default finite phase sequence for a workflow."""
     return SubagentOrchestrator().build_phase_plan(
         workflow,
         include_security=include_security,
+        parallel=parallel,
+    )
+
+
+def requires_security_analysis(request: str) -> bool:
+    """Conservatively detect prompts that name a sensitive trust boundary."""
+    normalized = str(request).casefold()
+    return any(
+        keyword in normalized
+        for keyword in (
+            "permission",
+            "shell",
+            "command runner",
+            "docker",
+            "mcp",
+            "plugin",
+            "config",
+        )
     )
 
 
@@ -224,5 +290,6 @@ __all__ = [
     "SubagentPhasePlan",
     "WorkflowKind",
     "build_phase_plan",
+    "requires_security_analysis",
     "requires_security_review",
 ]

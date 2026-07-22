@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,15 @@ class TemplateSpec:
     validation: tuple[str, ...]
     dependencies: tuple[str, ...]
     run_instructions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ParallelPhaseOutcome:
+    role: str
+    phase: str
+    parallel_group_id: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
 
 
 TEMPLATE_ROOT = Path(__file__).resolve().parents[1] / "templates"
@@ -220,6 +232,7 @@ def run_new_project(
     runtime_mode: str = "local",
     allow_network: bool = False,
     subagents_enabled: bool = False,
+    subagents_parallel: bool = False,
 ) -> dict[str, Any]:
     """Plan or create a starter project without overwriting existing work."""
     root = Path(project_root).expanduser().resolve()
@@ -228,12 +241,20 @@ def run_new_project(
     spec = TEMPLATE_SPECS[selected_template]
     plan = build_new_project_plan(selected_template)
     normalized_mode = mode.strip().lower() or "default"
-    planned_subagents = (
-        list(
-            SubagentOrchestrator()
-            .build_phase_plan(WorkflowKind.NEW_PROJECT)
-            .role_names
-        )
+    parallel_enabled = subagents_enabled and subagents_parallel
+    phase_plan = SubagentOrchestrator().build_phase_plan(
+        WorkflowKind.NEW_PROJECT,
+        parallel=parallel_enabled,
+    )
+    planned_subagents = list(phase_plan.role_names) if subagents_enabled else []
+    planned_parallel_groups = (
+        [
+            {
+                "parallel_group_id": group_id,
+                "roles": [phase.role_name for phase in phases],
+            }
+            for group_id, phases in phase_plan.parallel_groups
+        ]
         if subagents_enabled
         else []
     )
@@ -252,8 +273,12 @@ def run_new_project(
         "run_instructions": list(spec.run_instructions),
         "session_log": None,
         "subagents_enabled": subagents_enabled,
+        "subagents_parallel": parallel_enabled,
         "planned_subagents": planned_subagents,
+        "planned_parallel_subagent_groups": planned_parallel_groups,
         "subagents_run": [],
+        "parallel_subagent_groups": [],
+        "subagent_failures": [],
         "review": [],
     }
 
@@ -299,6 +324,7 @@ def run_new_project(
             registry,
             base_result,
             session,
+            parallel=parallel_enabled,
         )
     else:
         result = _copy_template_files(
@@ -347,6 +373,23 @@ def format_new_project_result(result: dict[str, Any]) -> str:
     _append_list(lines, "Run instructions", result.get("run_instructions"))
     if result.get("subagents_enabled") is True:
         _append_list(lines, "Subagents run", result.get("subagents_run"))
+        lines.extend(("", "Parallel subagent groups:"))
+        groups = result.get("parallel_subagent_groups") or []
+        if groups:
+            for group in groups:
+                roles = ", ".join(group.get("roles", []))
+                lines.append(f"- {group.get('parallel_group_id')}: {roles}")
+        else:
+            lines.append("- None")
+        if result.get("subagents_parallel") is True:
+            failures = result.get("subagent_failures") or []
+            if failures:
+                lines.extend(("", "Subagent failures:"))
+                for failure in failures:
+                    lines.append(
+                        f"- {failure.get('role')} (phase {failure.get('phase')}): "
+                        f"{failure.get('error')}"
+                    )
     lines.extend(("", "Notes:", f"- {result.get('message', '')}"))
     session_log = result.get("session_log") or "disabled or unavailable"
     lines.append(f"- Session log: {session_log}")
@@ -367,9 +410,17 @@ def _run_subagent_new_project(
     registry: ToolRegistry,
     result: dict[str, Any],
     session: SessionLogger | None,
+    *,
+    parallel: bool,
 ) -> dict[str, Any]:
     scaffolder_registry = SCAFFOLDER_ROLE.restrict(registry)
-    _start_subagent(result, session, SCAFFOLDER_ROLE.name)
+    _start_subagent(
+        result,
+        session,
+        SCAFFOLDER_ROLE.name,
+        phase="scaffold",
+        parallel_group_id=None,
+    )
     result = _copy_template_files(
         spec,
         scaffolder_registry,
@@ -383,30 +434,219 @@ def _run_subagent_new_project(
             result,
             session,
         )
-    _complete_subagent(result, session, SCAFFOLDER_ROLE.name)
+    _complete_subagent(
+        result,
+        session,
+        SCAFFOLDER_ROLE.name,
+        phase="scaffold",
+        parallel_group_id=None,
+    )
     if result.get("ok") is not True:
         return result
 
+    if parallel:
+        return _run_parallel_new_project_post_phases(
+            spec,
+            registry,
+            result,
+            session,
+        )
+
     tester_registry = TESTER_ROLE.restrict(registry)
-    _start_subagent(result, session, TESTER_ROLE.name)
+    _start_subagent(
+        result,
+        session,
+        TESTER_ROLE.name,
+        phase="test",
+        parallel_group_id=None,
+    )
     result = _run_validation_commands(
         spec,
         tester_registry,
         result,
         session,
     )
-    _complete_subagent(result, session, TESTER_ROLE.name)
+    _complete_subagent(
+        result,
+        session,
+        TESTER_ROLE.name,
+        phase="test",
+        parallel_group_id=None,
+    )
 
     reviewer_registry = REVIEWER_ROLE.restrict(registry)
-    _start_subagent(result, session, REVIEWER_ROLE.name)
+    _start_subagent(
+        result,
+        session,
+        REVIEWER_ROLE.name,
+        phase="review",
+        parallel_group_id=None,
+    )
     result = _review_generated_project(
         spec,
         reviewer_registry,
         result,
         session,
     )
-    _complete_subagent(result, session, REVIEWER_ROLE.name)
+    _complete_subagent(
+        result,
+        session,
+        REVIEWER_ROLE.name,
+        phase="review",
+        parallel_group_id=None,
+    )
     return result
+
+
+def _run_parallel_new_project_post_phases(
+    spec: TemplateSpec,
+    registry: ToolRegistry,
+    result: dict[str, Any],
+    session: SessionLogger | None,
+) -> dict[str, Any]:
+    group_id = "post-edit"
+    result["subagents_run"].extend((TESTER_ROLE.name, REVIEWER_ROLE.name))
+    result["parallel_subagent_groups"].append(
+        {
+            "parallel_group_id": group_id,
+            "roles": [TESTER_ROLE.name, REVIEWER_ROLE.name],
+        }
+    )
+    snapshot = deepcopy(result)
+
+    def run_tester() -> dict[str, Any]:
+        local_result = deepcopy(snapshot)
+        tester_registry = TESTER_ROLE.restrict(registry)
+        return _run_validation_commands(
+            spec,
+            tester_registry,
+            local_result,
+            session,
+        )
+
+    def run_reviewer() -> dict[str, Any]:
+        local_result = deepcopy(snapshot)
+        reviewer_registry = REVIEWER_ROLE.restrict(registry)
+        return _review_generated_project(
+            spec,
+            reviewer_registry,
+            local_result,
+            session,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="lunar-forge-new-project",
+    ) as executor:
+        tester_future = executor.submit(
+            _run_new_project_parallel_phase,
+            role_name=TESTER_ROLE.name,
+            phase="test",
+            parallel_group_id=group_id,
+            operation=run_tester,
+            session=session,
+        )
+        reviewer_future = executor.submit(
+            _run_new_project_parallel_phase,
+            role_name=REVIEWER_ROLE.name,
+            phase="review",
+            parallel_group_id=group_id,
+            operation=run_reviewer,
+            session=session,
+        )
+        outcomes = (tester_future.result(), reviewer_future.result())
+
+    tester_outcome, reviewer_outcome = outcomes
+    if tester_outcome.result is not None:
+        tester_result = tester_outcome.result
+        result["commands_run"] = tester_result["commands_run"]
+        result["command_results"] = tester_result["command_results"]
+        result["validation"] = tester_result["validation"]
+    if reviewer_outcome.result is not None:
+        result["review"] = reviewer_outcome.result["review"]
+
+    for outcome in outcomes:
+        if outcome.error is not None:
+            result["subagent_failures"].append(
+                {
+                    "role": outcome.role,
+                    "phase": outcome.phase,
+                    "parallel_group_id": outcome.parallel_group_id,
+                    "error": outcome.error,
+                }
+            )
+
+    tester_ok = (
+        tester_outcome.result is not None
+        and tester_outcome.result.get("ok") is True
+    )
+    reviewer_ok = (
+        reviewer_outcome.result is not None
+        and reviewer_outcome.result.get("ok") is True
+    )
+    result["ok"] = tester_ok and reviewer_ok
+    if not tester_ok:
+        result["message"] = (
+            tester_outcome.error
+            or str(tester_outcome.result.get("message"))
+        )
+    elif not reviewer_ok:
+        result["message"] = (
+            reviewer_outcome.error
+            or str(reviewer_outcome.result.get("message"))
+        )
+    return result
+
+
+def _run_new_project_parallel_phase(
+    *,
+    role_name: str,
+    phase: str,
+    parallel_group_id: str,
+    operation: Callable[[], dict[str, Any]],
+    session: SessionLogger | None,
+) -> _ParallelPhaseOutcome:
+    _log(
+        session,
+        "subagent_started",
+        role=role_name,
+        phase=phase,
+        parallel_group_id=parallel_group_id,
+    )
+    try:
+        result = operation()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: Subagent execution failed."
+        _log(
+            session,
+            "subagent_error",
+            role=role_name,
+            phase=phase,
+            parallel_group_id=parallel_group_id,
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+        return _ParallelPhaseOutcome(
+            role=role_name,
+            phase=phase,
+            parallel_group_id=parallel_group_id,
+            error=error,
+        )
+    _log(
+        session,
+        "subagent_completed",
+        role=role_name,
+        phase=phase,
+        parallel_group_id=parallel_group_id,
+        ok=result.get("ok"),
+        message=result.get("message"),
+    )
+    return _ParallelPhaseOutcome(
+        role=role_name,
+        phase=phase,
+        parallel_group_id=parallel_group_id,
+        result=result,
+    )
 
 
 def _review_generated_project(
@@ -459,20 +699,34 @@ def _start_subagent(
     result: dict[str, Any],
     session: SessionLogger | None,
     role_name: str,
+    *,
+    phase: str,
+    parallel_group_id: str | None,
 ) -> None:
     result["subagents_run"].append(role_name)
-    _log(session, "subagent_started", role=role_name)
+    _log(
+        session,
+        "subagent_started",
+        role=role_name,
+        phase=phase,
+        parallel_group_id=parallel_group_id,
+    )
 
 
 def _complete_subagent(
     result: dict[str, Any],
     session: SessionLogger | None,
     role_name: str,
+    *,
+    phase: str,
+    parallel_group_id: str | None,
 ) -> None:
     _log(
         session,
         "subagent_completed",
         role=role_name,
+        phase=phase,
+        parallel_group_id=parallel_group_id,
         ok=result.get("ok"),
         message=result.get("message"),
     )

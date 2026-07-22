@@ -66,6 +66,10 @@ runtime:
 permissions:
   mode: default
 
+subagents:
+  enabled: false
+  parallel: false
+
 # Experimental and disabled unless explicitly enabled.
 mcp:
   enabled: false
@@ -92,6 +96,7 @@ Supported environment overrides are:
 - `LUNAR_FORGE_ALLOW_NETWORK`
 - `LUNAR_FORGE_PERMISSION_MODE`
 - `LUNAR_FORGE_SUBAGENTS`
+- `LUNAR_FORGE_PARALLEL_SUBAGENTS`
 - `LUNAR_FORGE_MCP_ENABLED`
 - `LUNAR_FORGE_PLUGINS_ENABLED`
 
@@ -302,17 +307,37 @@ one focused fix.
 ### Optional subagent mode
 
 Single-agent execution remains the default. Pass `--subagents`, or set
-`subagents.enabled: true`, to use a finite specialist sequence. Existing-project
-work uses Planner -> approval -> Coder -> Tester -> Reviewer. New-project work
-uses Scaffolder -> Tester -> Reviewer. A read-only Security phase is added when
-the changed paths touch permissions, shell execution, Docker, MCP, plugins, or
-configuration.
+`subagents.enabled: true`, to use a finite specialist sequence. Sequential
+subagent execution also remains the default. Parallel phases require the
+additional `--parallel-subagents` flag or `subagents.parallel: true` setting:
+
+```yaml
+subagents:
+  enabled: true
+  parallel: true
+```
+
+```bash
+lunar-forge --project ../my-app --parallel-subagents "Add a pricing page"
+lunar-forge new "Build a Vite site" --project ../new-app --parallel-subagents
+```
+
+Existing-project work keeps Coder serialized. Planner and the read-only Security
+role run together when the request names permissions, shell execution, Docker,
+MCP, plugins, or configuration. After edits, Tester and Reviewer may run
+together. New-project work keeps Scaffolder serialized, then may run Tester and
+Reviewer together. Tester can use only its existing permission-gated validation
+tools; no parallel role receives file mutation tools.
 
 Each role receives an explicit tool allowlist and cannot obtain tools outside
-it. All allowed mutations and commands still pass through the central registry,
-normal permission prompts, and session logging. This is deterministic role
-handoff, not an autonomous debate or self-spawning agent loop. Final output lists
-the roles that actually ran.
+it. Every concurrent role receives a separate restricted registry view and
+conversation list. All allowed mutations and commands still pass through the
+central registry, normal permission prompts, and session logging. Session
+lifecycle events include role, phase, parallel group, and start/completion/error
+state. Successful sibling results remain visible when one parallel role fails,
+and final merge/report order follows the declared phase order rather than thread
+completion order. This is deterministic role handoff, not an autonomous debate
+or self-spawning agent loop.
 
 ## Project instructions (`AGENTS.md`)
 
@@ -560,8 +585,10 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
 - Docker image building, dependency downloads, and network access are never
   automatic.
 - The new-project workflow intentionally supports six focused starters.
-- Subagents are role-specific model calls in a fixed sequence, not independent
-  processes or autonomous collaborators.
+- Subagents are role-specific model calls, not independent processes or
+  autonomous collaborators. Optional parallelism is limited to two fixed,
+  synchronous thread groups; it does not schedule arbitrary roles or debate
+  loops, and provider clients must tolerate concurrent requests when enabled.
 - MCP currently supports local stdio servers only. Streamable HTTP, server
   sampling/elicitation requests, dynamic tool-list refresh, and OS-level server
   sandboxing are not implemented.

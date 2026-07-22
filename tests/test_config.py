@@ -57,7 +57,10 @@ def test_subagents_default_to_disabled(monkeypatch, tmp_path):
     project = tmp_path / "project"
     project.mkdir()
 
-    assert load_config(project).subagents.enabled is False
+    subagents = load_config(project).subagents
+
+    assert subagents.enabled is False
+    assert subagents.parallel is False
 
 
 def test_subagents_can_be_enabled_by_project_config(monkeypatch, tmp_path):
@@ -73,6 +76,22 @@ def test_subagents_can_be_enabled_by_project_config(monkeypatch, tmp_path):
     assert load_config(project).subagents.enabled is True
 
 
+def test_parallel_subagents_require_explicit_project_config(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    config_directory = project / ".agent"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.yaml").write_text(
+        "subagents:\n  enabled: true\n  parallel: true\n",
+        encoding="utf-8",
+    )
+
+    subagents = load_config(project).subagents
+
+    assert subagents.enabled is True
+    assert subagents.parallel is True
+
+
 def test_subagents_can_be_enabled_by_environment(monkeypatch, tmp_path):
     _isolate_user_config(monkeypatch, tmp_path / "home")
     monkeypatch.setenv("LUNAR_FORGE_SUBAGENTS", "true")
@@ -80,6 +99,19 @@ def test_subagents_can_be_enabled_by_environment(monkeypatch, tmp_path):
     project.mkdir()
 
     assert load_config(project).subagents.enabled is True
+
+
+def test_parallel_subagents_can_be_enabled_by_environment(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("LUNAR_FORGE_SUBAGENTS", "true")
+    monkeypatch.setenv("LUNAR_FORGE_PARALLEL_SUBAGENTS", "true")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    subagents = load_config(project).subagents
+
+    assert subagents.enabled is True
+    assert subagents.parallel is True
 
 
 def test_mcp_integration_defaults_to_disabled(monkeypatch, tmp_path):

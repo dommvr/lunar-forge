@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,8 +39,10 @@ from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
 from lunar_forge.subagents import (
     RestrictedToolRegistry,
     SubagentOrchestrator,
+    SubagentPhase,
     SubagentRole,
     WorkflowKind,
+    requires_security_analysis,
     requires_security_review,
 )
 from lunar_forge.tools.registry import ToolRegistry, create_tool_registry
@@ -48,6 +51,7 @@ from lunar_forge.tools.registry import ToolRegistry, create_tool_registry
 MAX_STEPS = 30
 MAX_TOOL_RESULT_CHARACTERS = 20_000
 MAX_FINAL_OUTPUT_CHARACTERS = 50_000
+MAX_SUBAGENT_ERROR_CHARACTERS = 500
 
 
 class AgentError(RuntimeError):
@@ -58,6 +62,21 @@ class AgentError(RuntimeError):
 class SubagentPhaseResult:
     text: str
     changed_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SubagentPhaseFailure:
+    role: str
+    phase: str
+    parallel_group_id: str | None
+    error: str
+
+
+@dataclass(frozen=True)
+class SubagentPhaseOutcome:
+    phase: SubagentPhase
+    result: SubagentPhaseResult | None = None
+    failure: SubagentPhaseFailure | None = None
 
 
 @dataclass
@@ -337,21 +356,36 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
     ) -> str:
+        if self.config.subagents.parallel:
+            return self._run_parallel_subagent_workflow(
+                request=request,
+                model_client=model_client,
+                registry=registry,
+                system_prompt=system_prompt,
+                historical_messages=historical_messages,
+                session=session,
+                mode=mode,
+            )
+
         orchestrator = SubagentOrchestrator()
         phase_plan = orchestrator.build_phase_plan(WorkflowKind.EXISTING_PROJECT)
-        roles = tuple(
-            phase.role for phase in phase_plan.phases if phase.role is not None
+        phases = tuple(
+            phase for phase in phase_plan.phases if phase.role is not None
         )
         if mode == "plan":
-            roles = roles[:1]
+            phases = phases[:1]
 
         outputs: dict[str, str] = {}
         changed_files: list[str] = []
         roles_run: list[str] = []
-        for role in roles:
+        for phase in phases:
+            role = phase.role
+            assert role is not None
             phase_result = self._run_subagent_phase(
                 request=request,
                 role=role,
+                phase=phase.name,
+                parallel_group_id=None,
                 model_client=model_client,
                 registry=registry,
                 system_prompt=system_prompt,
@@ -373,6 +407,8 @@ class CodeAgent:
             phase_result = self._run_subagent_phase(
                 request=request,
                 role=security_role,
+                phase="security",
+                parallel_group_id=None,
                 model_client=model_client,
                 registry=registry,
                 system_prompt=system_prompt,
@@ -392,11 +428,299 @@ class CodeAgent:
             final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
         return _append_subagent_report(final_text, roles_run)
 
+    def _run_parallel_subagent_workflow(
+        self,
+        *,
+        request: str,
+        model_client: ModelClient,
+        registry: ToolRegistry,
+        system_prompt: str,
+        historical_messages: Sequence[Mapping[str, Any]],
+        session: SessionLogger | None,
+        mode: str,
+    ) -> str:
+        """Run only explicitly safe phase groups with bounded concurrency."""
+        orchestrator = SubagentOrchestrator()
+        include_security = requires_security_analysis(request)
+        phase_plan = orchestrator.build_phase_plan(
+            WorkflowKind.EXISTING_PROJECT,
+            include_security=include_security,
+            parallel=True,
+        )
+        role_phases = tuple(
+            phase for phase in phase_plan.phases if phase.role is not None
+        )
+        phase_by_role = {
+            phase.role_name: phase
+            for phase in role_phases
+            if phase.role_name is not None
+        }
+
+        outputs: dict[str, str] = {}
+        changed_files: list[str] = []
+        roles_run: list[str] = []
+        failures: list[SubagentPhaseFailure] = []
+        parallel_groups: list[tuple[str, tuple[str, ...]]] = []
+
+        analysis_phases = tuple(
+            phase
+            for phase in role_phases
+            if phase.name in {"plan", "security"}
+        )
+        if len(analysis_phases) > 1:
+            analysis_outcomes = self._run_parallel_phase_group(
+                phases=analysis_phases,
+                request=request,
+                model_client=model_client,
+                registry=registry,
+                system_prompt=system_prompt,
+                historical_messages=historical_messages,
+                prior_outputs=outputs,
+                changed_files=changed_files,
+                session=session,
+                mode=mode,
+            )
+            group_id = analysis_phases[0].parallel_group_id
+            assert group_id is not None
+            parallel_groups.append(
+                (group_id, tuple(phase.role_name or "" for phase in analysis_phases))
+            )
+        else:
+            analysis_outcomes = (
+                self._run_subagent_phase_outcome(
+                    phase=analysis_phases[0],
+                    request=request,
+                    model_client=model_client,
+                    registry=registry,
+                    system_prompt=system_prompt,
+                    historical_messages=historical_messages,
+                    prior_outputs=outputs,
+                    changed_files=changed_files,
+                    session=session,
+                    mode=mode,
+                ),
+            )
+        _merge_subagent_outcomes(
+            analysis_outcomes,
+            outputs,
+            changed_files,
+            roles_run,
+            failures,
+        )
+
+        if "planner" not in outputs or mode == "plan":
+            final_text = outputs.get(
+                "planner",
+                "Parallel subagent analysis did not produce a planner result.",
+            )
+            security_output = outputs.get("security")
+            if security_output:
+                final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+            return _append_subagent_report(
+                final_text,
+                roles_run,
+                parallel_groups=parallel_groups,
+                failures=failures,
+            )
+
+        implement_phase = phase_by_role["coder"]
+        implement_outcome = self._run_subagent_phase_outcome(
+            phase=implement_phase,
+            request=request,
+            model_client=model_client,
+            registry=registry,
+            system_prompt=system_prompt,
+            historical_messages=historical_messages,
+            prior_outputs=outputs,
+            changed_files=changed_files,
+            session=session,
+            mode=mode,
+        )
+        _merge_subagent_outcomes(
+            (implement_outcome,),
+            outputs,
+            changed_files,
+            roles_run,
+            failures,
+        )
+        if "coder" not in outputs:
+            return _append_subagent_report(
+                outputs["planner"],
+                roles_run,
+                parallel_groups=parallel_groups,
+                failures=failures,
+            )
+
+        if not include_security and requires_security_review(changed_files):
+            security_phase = SubagentPhase(
+                name="security",
+                role=orchestrator.roles["security"],
+                description="Review a newly detected sensitive trust boundary.",
+            )
+            security_outcome = self._run_subagent_phase_outcome(
+                phase=security_phase,
+                request=request,
+                model_client=model_client,
+                registry=registry,
+                system_prompt=system_prompt,
+                historical_messages=historical_messages,
+                prior_outputs=outputs,
+                changed_files=changed_files,
+                session=session,
+                mode=mode,
+            )
+            _merge_subagent_outcomes(
+                (security_outcome,),
+                outputs,
+                changed_files,
+                roles_run,
+                failures,
+            )
+
+        post_edit_phases = tuple(
+            phase for phase in role_phases if phase.name in {"test", "review"}
+        )
+        post_edit_outcomes = self._run_parallel_phase_group(
+            phases=post_edit_phases,
+            request=request,
+            model_client=model_client,
+            registry=registry,
+            system_prompt=system_prompt,
+            historical_messages=historical_messages,
+            prior_outputs=outputs,
+            changed_files=changed_files,
+            session=session,
+            mode=mode,
+        )
+        post_group_id = post_edit_phases[0].parallel_group_id
+        assert post_group_id is not None
+        parallel_groups.append(
+            (
+                post_group_id,
+                tuple(phase.role_name or "" for phase in post_edit_phases),
+            )
+        )
+        _merge_subagent_outcomes(
+            post_edit_outcomes,
+            outputs,
+            changed_files,
+            roles_run,
+            failures,
+        )
+
+        final_text = outputs.get("reviewer") or outputs.get("tester") or outputs["coder"]
+        security_output = outputs.get("security")
+        if security_output:
+            final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+        return _append_subagent_report(
+            final_text,
+            roles_run,
+            parallel_groups=parallel_groups,
+            failures=failures,
+        )
+
+    def _run_parallel_phase_group(
+        self,
+        *,
+        phases: Sequence[SubagentPhase],
+        request: str,
+        model_client: ModelClient,
+        registry: ToolRegistry,
+        system_prompt: str,
+        historical_messages: Sequence[Mapping[str, Any]],
+        prior_outputs: Mapping[str, str],
+        changed_files: Sequence[str],
+        session: SessionLogger | None,
+        mode: str,
+    ) -> tuple[SubagentPhaseOutcome, ...]:
+        if len(phases) < 2:
+            raise ValueError("Parallel subagent groups require at least two phases.")
+        group_ids = {phase.parallel_group_id for phase in phases}
+        if len(group_ids) != 1 or None in group_ids:
+            raise ValueError("Parallel subagent phases must share one group ID.")
+        if any(
+            phase.role is None or not phase.role.can_run_in_parallel
+            for phase in phases
+        ):
+            raise ValueError("Writer subagents cannot run in parallel.")
+
+        output_snapshot = dict(prior_outputs)
+        changed_snapshot = tuple(changed_files)
+        history_snapshot = tuple(dict(message) for message in historical_messages)
+        with ThreadPoolExecutor(
+            max_workers=len(phases),
+            thread_name_prefix="lunar-forge-subagent",
+        ) as executor:
+            futures = tuple(
+                executor.submit(
+                    self._run_subagent_phase_outcome,
+                    phase=phase,
+                    request=request,
+                    model_client=model_client,
+                    registry=registry,
+                    system_prompt=system_prompt,
+                    historical_messages=history_snapshot,
+                    prior_outputs=output_snapshot,
+                    changed_files=changed_snapshot,
+                    session=session,
+                    mode=mode,
+                )
+                for phase in phases
+            )
+            return tuple(future.result() for future in futures)
+
+    def _run_subagent_phase_outcome(
+        self,
+        *,
+        phase: SubagentPhase,
+        request: str,
+        model_client: ModelClient,
+        registry: ToolRegistry,
+        system_prompt: str,
+        historical_messages: Sequence[Mapping[str, Any]],
+        prior_outputs: Mapping[str, str],
+        changed_files: Sequence[str],
+        session: SessionLogger | None,
+        mode: str,
+    ) -> SubagentPhaseOutcome:
+        role = phase.role
+        if role is None:
+            raise ValueError("Subagent execution phases require a role.")
+        try:
+            result = self._run_subagent_phase(
+                request=request,
+                role=role,
+                phase=phase.name,
+                parallel_group_id=phase.parallel_group_id,
+                model_client=model_client,
+                registry=registry,
+                system_prompt=system_prompt,
+                historical_messages=historical_messages,
+                prior_outputs=prior_outputs,
+                changed_files=changed_files,
+                session=session,
+                mode=mode,
+            )
+            return SubagentPhaseOutcome(phase=phase, result=result)
+        except Exception as exc:
+            error = _bounded_subagent_error(exc)
+            return SubagentPhaseOutcome(
+                phase=phase,
+                failure=SubagentPhaseFailure(
+                    role=role.name,
+                    phase=phase.name,
+                    parallel_group_id=phase.parallel_group_id,
+                    error=error,
+                ),
+            )
+
     def _run_subagent_phase(
         self,
         *,
         request: str,
         role: SubagentRole,
+        phase: str,
+        parallel_group_id: str | None,
         model_client: ModelClient,
         registry: ToolRegistry,
         system_prompt: str,
@@ -406,7 +730,13 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
     ) -> SubagentPhaseResult:
-        _log_session(session, "subagent_started", role=role.name)
+        _log_session(
+            session,
+            "subagent_started",
+            role=role.name,
+            phase=phase,
+            parallel_group_id=parallel_group_id,
+        )
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -425,19 +755,35 @@ class CodeAgent:
                 ),
             }
         )
-        result = _run_subagent_model_loop(
-            model_client=model_client,
-            messages=messages,
-            tools=role.restrict(registry),
-            role=role,
-            session=session,
-            mode=mode,
-            max_steps=self.max_steps,
-        )
+        try:
+            result = _run_subagent_model_loop(
+                model_client=model_client,
+                messages=messages,
+                tools=role.restrict(registry),
+                role=role,
+                phase=phase,
+                parallel_group_id=parallel_group_id,
+                session=session,
+                mode=mode,
+                max_steps=self.max_steps,
+            )
+        except Exception as exc:
+            _log_session(
+                session,
+                "subagent_error",
+                role=role.name,
+                phase=phase,
+                parallel_group_id=parallel_group_id,
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
         _log_session(
             session,
             "subagent_completed",
             role=role.name,
+            phase=phase,
+            parallel_group_id=parallel_group_id,
             text=result.text,
             changed_files=result.changed_files,
         )
@@ -456,6 +802,8 @@ def _run_subagent_model_loop(
     messages: list[dict[str, Any]],
     tools: RestrictedToolRegistry,
     role: SubagentRole,
+    phase: str,
+    parallel_group_id: str | None,
     session: SessionLogger | None,
     mode: str,
     max_steps: int,
@@ -472,6 +820,9 @@ def _run_subagent_model_loop(
             "assistant_message",
             step=step,
             subagent=role.name,
+            role=role.name,
+            phase=phase,
+            parallel_group_id=parallel_group_id,
             text=response.text,
             model=response.model,
             tool_call_count=len(response.tool_calls),
@@ -492,6 +843,9 @@ def _run_subagent_model_loop(
                     "tool_call",
                     step=step,
                     subagent=role.name,
+                    role=role.name,
+                    phase=phase,
+                    parallel_group_id=parallel_group_id,
                     id=call_id,
                     name=internal_tool_name,
                     model_tool_name=tool_call.name,
@@ -504,6 +858,9 @@ def _run_subagent_model_loop(
                     "tool_result",
                     step=step,
                     subagent=role.name,
+                    role=role.name,
+                    phase=phase,
+                    parallel_group_id=parallel_group_id,
                     id=call_id,
                     name=internal_tool_name,
                     model_tool_name=tool_call.name,
@@ -516,6 +873,9 @@ def _run_subagent_model_loop(
                         "permission_denial",
                         step=step,
                         subagent=role.name,
+                        role=role.name,
+                        phase=phase,
+                        parallel_group_id=parallel_group_id,
                         id=call_id,
                         name=internal_tool_name,
                         model_tool_name=tool_call.name,
@@ -529,6 +889,9 @@ def _run_subagent_model_loop(
                         source="tool",
                         step=step,
                         subagent=role.name,
+                        role=role.name,
+                        phase=phase,
+                        parallel_group_id=parallel_group_id,
                         name=internal_tool_name,
                         model_tool_name=tool_call.name,
                         internal_tool_name=internal_tool_name,
@@ -635,10 +998,73 @@ def _append_session_note(
     return f"{text}\n\nSession log: {note}"
 
 
-def _append_subagent_report(text: str, roles_run: Sequence[str]) -> str:
+def _append_subagent_report(
+    text: str,
+    roles_run: Sequence[str],
+    *,
+    parallel_groups: Sequence[tuple[str, Sequence[str]]] = (),
+    failures: Sequence[SubagentPhaseFailure] = (),
+) -> str:
     lines = [text.rstrip(), "", "Subagents run:"]
     lines.extend(f"- {role_name}" for role_name in roles_run)
+    lines.extend(("", "Parallel subagent groups:"))
+    if parallel_groups:
+        lines.extend(
+            f"- {group_id}: {', '.join(role_names)}"
+            for group_id, role_names in parallel_groups
+        )
+    else:
+        lines.append("- None")
+    if failures:
+        lines.extend(("", "Subagent failures:"))
+        for failure in failures:
+            group = (
+                f", parallel group {failure.parallel_group_id}"
+                if failure.parallel_group_id is not None
+                else ""
+            )
+            lines.append(
+                f"- {failure.role} (phase {failure.phase}{group}): "
+                f"{failure.error}"
+            )
     return "\n".join(lines)
+
+
+def _merge_subagent_outcomes(
+    outcomes: Sequence[SubagentPhaseOutcome],
+    outputs: dict[str, str],
+    changed_files: list[str],
+    roles_run: list[str],
+    failures: list[SubagentPhaseFailure],
+) -> None:
+    """Merge completed futures in declared phase order, never completion order."""
+    for outcome in outcomes:
+        role_name = outcome.phase.role_name
+        if role_name is None:
+            continue
+        roles_run.append(role_name)
+        if outcome.failure is not None:
+            failures.append(outcome.failure)
+            continue
+        if outcome.result is None:
+            failures.append(
+                SubagentPhaseFailure(
+                    role=role_name,
+                    phase=outcome.phase.name,
+                    parallel_group_id=outcome.phase.parallel_group_id,
+                    error="Subagent produced no result.",
+                )
+            )
+            continue
+        outputs[role_name] = outcome.result.text
+        for path in outcome.result.changed_files:
+            if path not in changed_files:
+                changed_files.append(path)
+
+
+def _bounded_subagent_error(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: Subagent execution failed."
+    return text[:MAX_SUBAGENT_ERROR_CHARACTERS]
 
 
 def _append_historical_messages(

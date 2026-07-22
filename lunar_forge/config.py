@@ -37,6 +37,7 @@ class PermissionConfig:
 @dataclass(frozen=True)
 class SubagentConfig:
     enabled: bool = False
+    parallel: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,10 @@ def load_config(
                 subagents_data["enabled"],
                 "subagents.enabled",
             ),
+            parallel=_as_bool(
+                subagents_data["parallel"],
+                "subagents.parallel",
+            ),
         ),
         mcp=MCPRuntimeConfig(
             enabled=_as_bool(
@@ -170,6 +175,7 @@ def _default_config() -> dict[str, Any]:
         },
         "subagents": {
             "enabled": False,
+            "parallel": False,
         },
         "mcp": {
             "enabled": False,
@@ -192,6 +198,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_ALLOW_NETWORK": ("runtime", "allow_network"),
         "LUNAR_FORGE_PERMISSION_MODE": ("permissions", "mode"),
         "LUNAR_FORGE_SUBAGENTS": ("subagents", "enabled"),
+        "LUNAR_FORGE_PARALLEL_SUBAGENTS": ("subagents", "parallel"),
         "LUNAR_FORGE_MCP_ENABLED": ("mcp", "enabled"),
         "LUNAR_FORGE_PLUGINS_ENABLED": ("plugins", "enabled"),
     }

@@ -14,6 +14,7 @@ from lunar_forge.subagents.orchestrator import (
     SubagentPhasePlan,
     WorkflowKind,
     build_phase_plan,
+    requires_security_analysis,
     requires_security_review,
 )
 from lunar_forge.subagents.planner import PLANNER_ROLE
@@ -64,5 +65,6 @@ __all__ = [
     "WorkflowKind",
     "build_phase_plan",
     "get_subagent_role",
+    "requires_security_analysis",
     "requires_security_review",
 ]

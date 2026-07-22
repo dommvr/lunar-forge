@@ -109,10 +109,23 @@ def run(
             help="Use the deterministic specialist subagent workflow.",
         ),
     ] = False,
+    parallel_subagents: Annotated[
+        bool,
+        typer.Option(
+            "--parallel-subagents",
+            help="Enable safe concurrent read-only specialist phases.",
+        ),
+    ] = False,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
-    cli_overrides = _runtime_overrides(plan, docker, allow_network, subagents)
+    cli_overrides = _runtime_overrides(
+        plan,
+        docker,
+        allow_network,
+        subagents,
+        parallel_subagents,
+    )
 
     try:
         config = load_config(project_root, cli_overrides=cli_overrides)
@@ -381,10 +394,23 @@ def new_project(
             help="Use specialist phases for scaffolding, testing, and review.",
         ),
     ] = False,
+    parallel_subagents: Annotated[
+        bool,
+        typer.Option(
+            "--parallel-subagents",
+            help="Run safe testing and review phases concurrently.",
+        ),
+    ] = False,
 ) -> None:
     """Create a small starter project from a built-in template."""
     project_root = project.expanduser().resolve()
-    cli_overrides = _runtime_overrides(plan, docker, allow_network, subagents)
+    cli_overrides = _runtime_overrides(
+        plan,
+        docker,
+        allow_network,
+        subagents,
+        parallel_subagents,
+    )
     template = select_template(prompt)
 
     try:
@@ -399,6 +425,7 @@ def new_project(
             runtime_mode=config.runtime.mode,
             allow_network=config.runtime.allow_network,
             subagents_enabled=config.subagents.enabled,
+            subagents_parallel=config.subagents.parallel,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -533,6 +560,13 @@ def resume_command(
             help="Continue with the deterministic specialist workflow.",
         ),
     ] = False,
+    parallel_subagents: Annotated[
+        bool,
+        typer.Option(
+            "--parallel-subagents",
+            help="Continue with safe concurrent read-only specialist phases.",
+        ),
+    ] = False,
 ) -> None:
     """Safely summarize or continue a previous project session."""
     project_root = project.expanduser().resolve()
@@ -547,6 +581,7 @@ def resume_command(
             docker,
             allow_network,
             subagents,
+            parallel_subagents,
         )
         config = load_config(project_root, cli_overrides=cli_overrides)
         _validate_network_flag(allow_network, config.runtime.mode)
@@ -570,6 +605,7 @@ def _runtime_overrides(
     docker: bool,
     allow_network: bool,
     subagents: bool = False,
+    parallel_subagents: bool = False,
 ) -> dict[str, dict[str, object]] | None:
     overrides: dict[str, dict[str, object]] = {}
     if plan:
@@ -581,8 +617,11 @@ def _runtime_overrides(
         runtime["allow_network"] = True
     if runtime:
         overrides["runtime"] = runtime
-    if subagents:
-        overrides["subagents"] = {"enabled": True}
+    if subagents or parallel_subagents:
+        subagent_overrides: dict[str, object] = {"enabled": True}
+        if parallel_subagents:
+            subagent_overrides["parallel"] = True
+        overrides["subagents"] = subagent_overrides
     return overrides or None
 
 

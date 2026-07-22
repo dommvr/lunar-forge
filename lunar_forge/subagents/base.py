@@ -24,6 +24,15 @@ BUILTIN_SUBAGENT_TOOLS = frozenset(
         "run_validation",
     }
 )
+SUBAGENT_WRITE_TOOLS = frozenset(
+    {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,16 @@ class SubagentRole:
     def allows(self, tool_name: str) -> bool:
         """Return whether the role may see and request ``tool_name``."""
         return tool_name in self.allowed_tools and tool_name not in self.blocked_tools
+
+    @property
+    def is_writer(self) -> bool:
+        """Return whether the role can mutate project files."""
+        return bool(self.allowed_tools & SUBAGENT_WRITE_TOOLS)
+
+    @property
+    def can_run_in_parallel(self) -> bool:
+        """Only roles without file mutation tools are parallel-safe."""
+        return not self.is_writer
 
     def restrict(self, registry: ToolRegistry) -> RestrictedToolRegistry:
         """Create a role-scoped view without replacing registry permissions."""
@@ -141,5 +160,6 @@ def _schema_tool_name(schema: Mapping[str, Any]) -> str | None:
 __all__ = [
     "BUILTIN_SUBAGENT_TOOLS",
     "RestrictedToolRegistry",
+    "SUBAGENT_WRITE_TOOLS",
     "SubagentRole",
 ]

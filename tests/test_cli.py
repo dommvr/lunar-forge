@@ -184,6 +184,7 @@ def test_subagents_flag_is_available_and_sets_cli_override():
 
         assert result.exit_code == 0
         assert "--subagents" in result.stdout
+        assert "--parallel-subagents" in result.stdout
 
     overrides = cli_module._runtime_overrides(
         False,
@@ -192,6 +193,17 @@ def test_subagents_flag_is_available_and_sets_cli_override():
         True,
     )
     assert overrides == {"subagents": {"enabled": True}}
+
+    parallel_overrides = cli_module._runtime_overrides(
+        False,
+        False,
+        False,
+        False,
+        True,
+    )
+    assert parallel_overrides == {
+        "subagents": {"enabled": True, "parallel": True}
+    }
 
 
 def test_browser_setup_is_model_free_lists_commands_and_uses_approvals(
