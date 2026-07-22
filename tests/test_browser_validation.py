@@ -641,6 +641,42 @@ def test_managed_browser_validation_times_out_and_stops_server(
     assert result["managed_server"]["stopped"] is True
 
 
+def test_managed_browser_validation_stops_server_when_readiness_loop_errors(
+    monkeypatch,
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    process = FakeManagedProcess()
+    monkeypatch.setattr(
+        browser_module,
+        "resolve_executable",
+        lambda executable, cwd: str(tmp_path / "npm.cmd"),
+    )
+
+    def fail_sleep(_seconds):
+        raise RuntimeError("readiness polling failed")
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        project_root=tmp_path,
+        approval_callback=lambda request: True,
+        _playwright_factory=factory,
+        _popen_factory=lambda *args, **kwargs: process,
+        _url_probe=lambda url, timeout: False,
+        _clock=lambda: 0.0,
+        _sleep=fail_sleep,
+    )
+
+    assert result["ok"] is False
+    assert "readiness polling failed" in result["error"]
+    assert process.terminated is True
+    assert result["managed_server"]["started"] is True
+    assert result["managed_server"]["ready"] is False
+    assert result["managed_server"]["stopped"] is True
+
+
 def test_screenshot_can_be_disabled_without_creating_artifact_directory(tmp_path):
     page = FakePage()
     _, factory = _factory_for(page)
@@ -656,6 +692,30 @@ def test_screenshot_can_be_disabled_without_creating_artifact_directory(tmp_path
     assert result["screenshot_path"] is None
     assert page.screenshot_calls == []
     assert not (tmp_path / ".agent").exists()
+
+
+def test_browser_artifact_directory_cannot_escape_project(
+    monkeypatch,
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    monkeypatch.setattr(
+        browser_module,
+        "ARTIFACT_DIRECTORY",
+        "../escaped-browser-artifacts",
+    )
+
+    result = run_browser_validation(
+        "http://localhost:3000",
+        project_root=tmp_path,
+        _playwright_factory=factory,
+    )
+
+    assert result["ok"] is False
+    assert "outside the project root" in result["error"]
+    assert result["screenshot_path"] is None
+    assert page.screenshot_calls == []
 
 
 def test_browser_output_redacts_secrets_from_urls_and_logs(tmp_path):

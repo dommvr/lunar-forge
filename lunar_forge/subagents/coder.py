@@ -7,11 +7,14 @@ _ALLOWED_TOOLS = frozenset(
     {
         "list_dir",
         "read_file",
+        "read_file_with_line_numbers",
         "grep",
         "glob",
         "create_dir",
         "write_file",
         "edit_file",
+        "replace_lines",
+        "insert_lines",
     }
 )
 
@@ -23,8 +26,9 @@ CODER_ROLE = SubagentRole(
     ),
     system_prompt_fragment=(
         "Act as the coder. Implement only the approved plan, keep changes focused, "
-        "and follow the instruction stack for every target file. Do not run shell "
-        "commands or validation; leave those actions to the tester."
+        "and follow the instruction stack for every target file. Read stable line "
+        "numbers before precise line edits. Do not run shell commands or validation; "
+        "leave those actions to the tester."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

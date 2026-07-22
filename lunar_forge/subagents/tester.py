@@ -4,7 +4,13 @@ from lunar_forge.subagents.base import BUILTIN_SUBAGENT_TOOLS, SubagentRole
 
 
 _ALLOWED_TOOLS = frozenset(
-    {"run_command", "run_validation", "read_file", "grep"}
+    {
+        "run_command",
+        "run_validation",
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+    }
 )
 
 TESTER_ROLE = SubagentRole(

@@ -4,7 +4,14 @@ from lunar_forge.subagents.base import BUILTIN_SUBAGENT_TOOLS, SubagentRole
 
 
 _ALLOWED_TOOLS = frozenset(
-    {"list_dir", "read_file", "grep", "glob", "detect_project"}
+    {
+        "list_dir",
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "detect_project",
+    }
 )
 
 PLANNER_ROLE = SubagentRole(

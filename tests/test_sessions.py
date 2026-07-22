@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,33 @@ def test_session_logger_redacts_api_keys_and_environment_values(tmp_path):
     assert api_key not in raw_log
     assert REDACTED in raw_log
     json.loads(raw_log)
+
+
+def test_parallel_session_events_remain_atomic_and_redacted(tmp_path):
+    secret = "parallel-session-secret-123"
+    logger = create_session_logger(tmp_path, environ={"PARALLEL_SECRET": secret})
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = tuple(
+            executor.map(
+                lambda index: logger.log(
+                    "subagent_completed",
+                    role=f"reader-{index}",
+                    message=f"completed with {secret}",
+                ),
+                range(32),
+            )
+        )
+
+    raw_log = logger.path.read_text(encoding="utf-8")
+    events = _events(logger.path)
+    assert all(results)
+    assert len(events) == 32
+    assert secret not in raw_log
+    assert all(
+        event["data"]["message"] == f"completed with {REDACTED}"
+        for event in events
+    )
 
 
 def test_session_logging_failure_is_generic_and_cannot_escape_root(

@@ -304,6 +304,32 @@ a short plan before the first edit, permission-gated changes, and validation
 when practical. If validation fails, the agent is instructed to attempt at most
 one focused fix.
 
+### Bounded file inspection and precise edits
+
+The model-facing file tools include three line-oriented operations in addition
+to exact-text `edit_file`:
+
+```text
+read_file_with_line_numbers({"path": "src/app.py", "start_line": 20, "end_line": 60})
+replace_lines({"path": "src/app.py", "start_line": 31, "end_line": 34, "new_text": "..."})
+insert_lines({"path": "src/app.py", "after_line": 34, "new_text": "..."})
+```
+
+Line numbers are stable, one-based source line numbers. `replace_lines` uses an
+inclusive range, while `insert_lines` inserts after the selected line and
+accepts `after_line: 0` for insertion at file top. Numbered reads are bounded by
+the same line and character limits as ordinary reads and report truncation.
+Before a precise edit, the prompt tells the model to refresh the target range
+with `read_file_with_line_numbers`; exact block replacement still uses
+`edit_file`.
+
+All paths pass through project-root confinement. Invalid and out-of-file ranges
+fail before a write, every successful change to an existing file creates a
+checkpoint, newline style is preserved when practical, and edit results include
+a bounded unified diff. The mutation tools are not registered in plan mode.
+Coder subagents can use all three tools through their own restricted registry;
+read-only roles receive only the numbered reader.
+
 ### Optional subagent mode
 
 Single-agent execution remains the default. Pass `--subagents`, or set
@@ -336,8 +362,11 @@ central registry, normal permission prompts, and session logging. Session
 lifecycle events include role, phase, parallel group, and start/completion/error
 state. Successful sibling results remain visible when one parallel role fails,
 and final merge/report order follows the declared phase order rather than thread
-completion order. This is deterministic role handoff, not an autonomous debate
-or self-spawning agent loop.
+completion order. Production parallel roles receive separate model-client
+instances so mutable provider response state is not shared. Explicit custom
+clients injected through the Python API cannot be cloned generically and must
+be thread-safe. This is deterministic role handoff, not an autonomous debate or
+self-spawning agent loop.
 
 ## Project instructions (`AGENTS.md`)
 
@@ -511,9 +540,10 @@ viewport used for layout.
 
 Managed mode prompts with the exact redacted server command before starting it,
 uses `shell=False`, applies a bounded startup timeout, captures bounded
-stdout/stderr when startup fails, and shuts the subprocess down after validation.
-Use `--startup-timeout-ms` to adjust the URL wait. The command remains
-deterministic and model-free in both modes.
+stdout/stderr when startup fails, and uses a `finally` cleanup path after server
+startup so polling and validation failures also trigger termination. Use
+`--startup-timeout-ms` to adjust the URL wait. The command remains deterministic
+and model-free in both modes.
 
 If browser support is missing, either run the approved helper or execute its
 commands manually after review:
@@ -526,8 +556,8 @@ python -m playwright install chromium
 
 ## Checkpoints, rollback, and sessions
 
-Before an exact edit or an explicit overwrite of an existing file, LunarForge
-copies the original to:
+Before an exact edit, line replacement, line insertion, or explicit overwrite
+of an existing file, LunarForge copies the original to:
 
 ```text
 .agent/checkpoints/<timestamp>/<project-relative-path>
@@ -573,6 +603,69 @@ The package layout keeps provider response parsing in `model_clients/`, tool
 permissions in the central registry, filesystem operations in `tools/`, runtime
 execution and state in `runtime/`, and small project workflows in `workflows/`.
 
+## Manual testing checklist
+
+Use a disposable target project for checks that intentionally edit files or
+start processes.
+
+- [ ] Run the automated baseline from the LunarForge repository:
+
+  ```bash
+  python -m pytest -q
+  python -B -m compileall lunar_forge
+  git diff --check
+  ```
+
+- [ ] Ask LunarForge to read a disposable file with line numbers, replace an
+  inclusive range, and insert once with `after_line: 0`. Confirm the reported
+  diff is bounded, the file keeps its newline convention, and the original is
+  present under `.agent/checkpoints/`.
+
+- [ ] Repeat the edit request with `--plan`. Confirm no file changes, command
+  execution, checkpoint, or session artifact is created.
+
+- [ ] Review and run optional browser setup. Confirm both commands are printed
+  before approval, denial stops immediately, and no install command runs under
+  `permissions.mode: no-command`:
+
+  ```bash
+  lunar-forge browser-setup --project .
+  ```
+
+- [ ] With a local site already running, exercise viewport and full-page modes
+  and confirm the returned screenshot stays under the selected project:
+
+  ```bash
+  lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend
+  lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --full-page --width 1440 --height 1200
+  ```
+
+- [ ] Exercise managed mode. Confirm the exact dev command requires approval,
+  startup failures include only bounded stdout/stderr, and the process is no
+  longer listening after success, timeout, validation failure, or interruption:
+
+  ```bash
+  lunar-forge browser-validate --serve "npm run dev" --url http://localhost:5173 --project ./frontend
+  ```
+
+- [ ] Ask the model to check a screenshot, layout, console errors, a click, and
+  a localhost page. Confirm it chooses browser validation or available
+  Playwright MCP tools instead of curl/basic HTTP validation. Confirm it does
+  not install dependencies or start a server without approval.
+
+- [ ] Enable parallel subagents with either configuration or the CLI flag (both
+  are not required), run a disposable change, and confirm the final report lists
+  serialized Coder/Scaffolder work and the `post-edit: tester, reviewer` group:
+
+  ```bash
+  lunar-forge --project ./my-app --parallel-subagents "Make a small documented change"
+  ```
+
+- [ ] Inspect the resulting project-local session JSONL. Confirm each subagent
+  lifecycle event has `role`, `phase`, and `parallel_group_id`, records are valid
+  one-line JSON under concurrent completion, and test environment secret values
+  do not appear in the file.
+
 ## Known limitations
 
 - Local command mode confines `cwd`, not OS-level filesystem or process access.
@@ -580,19 +673,29 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
   parser or substitute for sandboxing and human approval.
 - LiteLLM is the only active model adapter; other provider modules are
   placeholders.
-- File edits use exact, single-match text replacement rather than a general
-  patch engine.
+- File edits support exact single-match replacement and explicit line ranges,
+  but not a general patch engine or optimistic locking against simultaneous
+  external edits.
 - Docker image building, dependency downloads, and network access are never
   automatic.
 - The new-project workflow intentionally supports six focused starters.
 - Subagents are role-specific model calls, not independent processes or
   autonomous collaborators. Optional parallelism is limited to two fixed,
   synchronous thread groups; it does not schedule arbitrary roles or debate
-  loops, and provider clients must tolerate concurrent requests when enabled.
+  loops. Approved Tester commands can create build/test artifacts while the
+  Reviewer reads the project, although file-writer roles never overlap.
+  Explicitly injected custom model clients must tolerate concurrent requests.
 - MCP currently supports local stdio servers only. Streamable HTTP, server
   sampling/elicitation requests, dynamic tool-list refresh, and OS-level server
   sandboxing are not implemented.
-- Browser validation requires the optional Playwright extra and a separately
-  started local server.
+- Browser validation requires the optional Playwright extra. Managed process
+  termination is best-effort; operating-system child processes spawned by a dev
+  command may require manual cleanup if they ignore or outlive the parent.
+- Browser request interception is defense in depth, not an operating-system
+  network sandbox. Screenshots and logs are bounded and project-local, but a
+  rendered page is still untrusted content.
+- Session redaction covers configured environment values, sensitive keys,
+  bearer tokens, and common API-key patterns; arbitrary secret-looking prose
+  that matches none of those signals cannot be identified reliably.
 - Plugins run reviewed local Python in-process after approval. Capability
   declarations and output containment do not provide OS-level isolation.

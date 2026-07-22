@@ -647,6 +647,10 @@ class CodeAgent:
         output_snapshot = dict(prior_outputs)
         changed_snapshot = tuple(changed_files)
         history_snapshot = tuple(dict(message) for message in historical_messages)
+        phase_model_clients = self._model_clients_for_parallel_group(
+            model_client,
+            len(phases),
+        )
         with ThreadPoolExecutor(
             max_workers=len(phases),
             thread_name_prefix="lunar-forge-subagent",
@@ -656,7 +660,7 @@ class CodeAgent:
                     self._run_subagent_phase_outcome,
                     phase=phase,
                     request=request,
-                    model_client=model_client,
+                    model_client=phase_model_client,
                     registry=registry,
                     system_prompt=system_prompt,
                     historical_messages=history_snapshot,
@@ -665,9 +669,28 @@ class CodeAgent:
                     session=session,
                     mode=mode,
                 )
-                for phase in phases
+                for phase, phase_model_client in zip(
+                    phases,
+                    phase_model_clients,
+                    strict=True,
+                )
             )
             return tuple(future.result() for future in futures)
+
+    def _model_clients_for_parallel_group(
+        self,
+        fallback: ModelClient,
+        count: int,
+    ) -> tuple[ModelClient, ...]:
+        """Avoid sharing mutable provider state between production role calls.
+
+        Explicitly injected clients cannot be cloned generically and remain the
+        caller's thread-safety responsibility, which also keeps deterministic
+        test clients and custom adapters supported.
+        """
+        if self.model_client is not None:
+            return (fallback,) * count
+        return tuple(self._create_model_client() for _ in range(count))
 
     def _run_subagent_phase_outcome(
         self,

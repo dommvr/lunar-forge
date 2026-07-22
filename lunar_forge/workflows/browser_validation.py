@@ -440,56 +440,50 @@ def _run_approved_managed_browser_validation(
 
     stdout_collector, stdout_thread = _start_output_collector(process.stdout)
     stderr_collector, stderr_thread = _start_output_collector(process.stderr)
-    deadline = clock() + (startup_timeout_ms / 1000)
     ready = False
-    startup_error: str | None = None
-    while True:
-        exit_code = process.poll()
-        if exit_code is not None:
-            startup_error = (
-                "Managed dev server exited before the URL responded "
-                f"(exit code {exit_code})."
-            )
-            break
-        remaining = deadline - clock()
-        if remaining <= 0:
-            startup_error = (
-                "Managed dev server did not respond within "
-                f"{startup_timeout_ms} ms."
-            )
-            break
-        try:
-            ready = probe(url, min(SERVER_PROBE_TIMEOUT_SECONDS, remaining))
-        except Exception:
-            ready = False
-        if ready:
-            break
-        sleep(min(SERVER_PROBE_INTERVAL_SECONDS, remaining))
-
-    if startup_error is not None:
-        stopped = _stop_server_process(process)
-        _join_output_thread(stdout_thread, stdout_collector)
-        _join_output_thread(stderr_thread, stderr_collector)
-        result = _managed_error_result(startup_error)
-        result["managed_server"] = _server_result(
-            process,
-            stdout_collector,
-            stderr_collector,
-            ready=False,
-            stopped=stopped,
-        )
-        return result
-
     try:
-        result = run_browser_validation(
-            url,
-            screenshot=screenshot,
-            checks=checks,
-            full_page=full_page,
-            width=width,
-            height=height,
-            project_root=project_root,
-            _playwright_factory=_playwright_factory,
+        deadline = clock() + (startup_timeout_ms / 1000)
+        startup_error: str | None = None
+        while True:
+            exit_code = process.poll()
+            if exit_code is not None:
+                startup_error = (
+                    "Managed dev server exited before the URL responded "
+                    f"(exit code {exit_code})."
+                )
+                break
+            remaining = deadline - clock()
+            if remaining <= 0:
+                startup_error = (
+                    "Managed dev server did not respond within "
+                    f"{startup_timeout_ms} ms."
+                )
+                break
+            try:
+                ready = probe(url, min(SERVER_PROBE_TIMEOUT_SECONDS, remaining))
+            except Exception:
+                ready = False
+            if ready:
+                break
+            sleep(min(SERVER_PROBE_INTERVAL_SECONDS, remaining))
+
+        if startup_error is not None:
+            result = _managed_error_result(startup_error)
+        else:
+            result = run_browser_validation(
+                url,
+                screenshot=screenshot,
+                checks=checks,
+                full_page=full_page,
+                width=width,
+                height=height,
+                project_root=project_root,
+                _playwright_factory=_playwright_factory,
+            )
+    except Exception as exc:
+        result = _managed_error_result(
+            "Managed browser validation failed: "
+            f"{_safe_process_error(exc)}"
         )
     finally:
         stopped = _stop_server_process(process)
@@ -499,7 +493,7 @@ def _run_approved_managed_browser_validation(
         process,
         stdout_collector,
         stderr_collector,
-        ready=True,
+        ready=ready,
         stopped=stopped,
     )
     return result

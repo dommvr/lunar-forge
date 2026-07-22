@@ -3,7 +3,9 @@
 from lunar_forge.subagents.base import BUILTIN_SUBAGENT_TOOLS, SubagentRole
 
 
-_ALLOWED_TOOLS = frozenset({"read_file", "grep", "glob"})
+_ALLOWED_TOOLS = frozenset(
+    {"read_file", "read_file_with_line_numbers", "grep", "glob"}
+)
 
 REVIEWER_ROLE = SubagentRole(
     name="reviewer",

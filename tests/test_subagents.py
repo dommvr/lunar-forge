@@ -35,19 +35,35 @@ from lunar_forge.workflows.new_project import (
 
 
 EXPECTED_ALLOWED_TOOLS = {
-    "planner": {"list_dir", "read_file", "grep", "glob", "detect_project"},
+    "planner": {
+        "list_dir",
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "detect_project",
+    },
     "coder": {
         "list_dir",
         "read_file",
+        "read_file_with_line_numbers",
         "grep",
         "glob",
         "create_dir",
         "write_file",
         "edit_file",
+        "replace_lines",
+        "insert_lines",
     },
-    "reviewer": {"read_file", "grep", "glob"},
-    "tester": {"run_command", "run_validation", "read_file", "grep"},
-    "security": {"read_file", "grep", "glob"},
+    "reviewer": {"read_file", "read_file_with_line_numbers", "grep", "glob"},
+    "tester": {
+        "run_command",
+        "run_validation",
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+    },
+    "security": {"read_file", "read_file_with_line_numbers", "grep", "glob"},
     "scaffolder": {"create_dir", "write_file", "run_command", "run_validation"},
 }
 
@@ -417,6 +433,33 @@ def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path)
     assert all(
         event["data"]["parallel_group_id"] == "post-edit"
         for event in post_edit_events
+    )
+
+
+def test_parallel_production_roles_receive_distinct_model_clients(monkeypatch):
+    agent = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True, parallel=True)),
+    )
+    created = [object(), object()]
+    monkeypatch.setattr(agent, "_create_model_client", lambda: created.pop(0))
+
+    clients = agent._model_clients_for_parallel_group(object(), 2)
+
+    assert len(clients) == 2
+    assert clients[0] is not clients[1]
+    assert created == []
+
+
+def test_parallel_injected_model_client_remains_supported():
+    injected = object()
+    agent = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True, parallel=True)),
+        model_client=injected,
+    )
+
+    assert agent._model_clients_for_parallel_group(injected, 2) == (
+        injected,
+        injected,
     )
 
 
