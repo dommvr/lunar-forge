@@ -51,11 +51,28 @@ def test_system_prompt_requires_validation_and_bounded_fix_attempt():
 def test_system_prompt_routes_ui_validation_to_browser_tool():
     prompt = build_system_prompt(PROJECT_INFO, "No extra instructions.", "default")
 
-    assert "Prefer run_browser_validation" in prompt
-    assert "Do not substitute curl, run_command, or run_validation" in prompt
-    assert "create the requested screenshot" in prompt
-    assert "Never start" in prompt
-    assert "development server automatically" in prompt
+    for signal in (
+        "browser",
+        "UI",
+        "screenshot",
+        "visual",
+        "page rendering",
+        "console errors",
+        "accessibility",
+        "click",
+        "form",
+        "layout",
+        "localhost URL",
+    ):
+        assert signal in prompt
+    assert "Prefer available Playwright MCP tools" in prompt
+    assert "run_browser_validation for an already-running" in prompt
+    assert "run_managed_browser_validation" in prompt
+    assert "dev_command and local_url" in prompt
+    assert "requires explicit approval" in prompt
+    assert "Do not substitute curl, basic HTTP checks" in prompt
+    assert "Never start a server without approval" in prompt
+    assert "Keep using run_validation normally for non-browser" in prompt
 
 
 def test_system_prompt_requires_final_summary_sections():

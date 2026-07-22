@@ -430,24 +430,46 @@ every result. No detected commands is a successful, explicit no-op.
 
 ### Optional browser validation
 
-Install Playwright support separately, including its Chromium browser:
+From a LunarForge checkout, install Playwright support and its Chromium browser
+with the deterministic helper:
+
+```bash
+lunar-forge browser-setup --project .
+```
+
+The helper does not contact a model or API. It lists these exact commands before
+prompting for each one, then runs approved commands through the existing local
+runner with `shell=False` and platform executable resolution:
 
 ```bash
 python -m pip install -e ".[browser]"
 python -m playwright install chromium
 ```
 
-The permission-gated `run_browser_validation` tool connects only to a provided
-loopback HTTP(S) URL. It does not start a development server. It captures a
-bounded page title, final URL, console errors, failed requests, optional CSS
-selector checks, and an optional screenshot beneath
+Setup stops on the first denial or failure and reports the bounded command
+results. Configured `permissions.mode: no-command` or
+`runtime.mode: no-command` blocks setup without executing anything. A configured
+Docker runtime does not move browser setup into a container because direct
+browser validation uses the host Python environment.
+
+The permission-gated `run_browser_validation` tool connects to an already
+running loopback HTTP(S) URL. The separate
+`run_managed_browser_validation` tool may start an inferred project dev command
+only after approval, wait for its local URL, validate it, and stop it
+best-effort. Both capture a bounded page title, final URL, console errors,
+failed requests, optional CSS selector checks, and an optional screenshot beneath
 `.agent/artifacts/browser/`. Requests leaving loopback are blocked, obvious
 credential query values and log assignments are redacted, screenshot paths are
 project-confined, and artifacts are never uploaded.
 
-Start the application separately through an approved command, then ask
-LunarForge to validate its local URL. Browser validation is hidden in plan mode
-and normal installs and tests do not require Playwright or a real browser.
+For browser, UI, screenshot, visual rendering, console-error, accessibility,
+click, form, layout, and localhost requests, LunarForge is instructed to prefer
+browser validation or available Playwright MCP tools over curl or basic command
+validation. Managed mode uses detected `dev_command` and `local_url` hints when
+available. Browser tools are hidden in plan mode, and neither Playwright nor
+project dependencies are installed automatically. In particular,
+`browser-validate` only prints actionable setup instructions when Playwright is
+missing; it never invokes `browser-setup` automatically.
 
 For deterministic validation without a model or API key, run:
 
@@ -455,15 +477,27 @@ For deterministic validation without a model or API key, run:
 lunar-forge browser-validate http://127.0.0.1:8000 --project ./my-app
 lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --check "#root"
 lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --full-page --width 1440 --height 1200
+lunar-forge browser-validate --serve "npm run dev" --url http://localhost:5173 --project ./frontend
 ```
 
 Screenshots use a 1280x720 viewport by default. Pass `--full-page` to capture
 the whole scrollable page; `--width` and `--height` control the browser
 viewport used for layout.
 
-The command prints bounded JSON containing status, title, final URL, console
-errors, failed requests, selector results, and the project-relative screenshot
-path. It does not load agent configuration, contact a model, or start a server.
+Managed mode prompts with the exact redacted server command before starting it,
+uses `shell=False`, applies a bounded startup timeout, captures bounded
+stdout/stderr when startup fails, and shuts the subprocess down after validation.
+Use `--startup-timeout-ms` to adjust the URL wait. The command remains
+deterministic and model-free in both modes.
+
+If browser support is missing, either run the approved helper or execute its
+commands manually after review:
+
+```bash
+lunar-forge browser-setup --project .
+python -m pip install -e ".[browser]"
+python -m playwright install chromium
+```
 
 ## Checkpoints, rollback, and sessions
 

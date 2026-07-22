@@ -4,15 +4,34 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import subprocess
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Thread
 from types import MappingProxyType
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
+from lunar_forge.permissions import (
+    ApprovalCallback,
+    PermissionLevel,
+    PermissionManager,
+    dangerous_command_reason,
+    normalized_dangerous_command_reason,
+)
+from lunar_forge.runtime.local_runner import (
+    DEFAULT_TIMEOUT_MS,
+    executable_path_summary,
+    resolve_executable,
+    split_command,
+)
 from lunar_forge.tools.files import safe_path
+from lunar_forge.tools.shell import run_command
 
 
 ARTIFACT_DIRECTORY = ".agent/artifacts/browser"
@@ -29,6 +48,16 @@ MIN_VIEWPORT_WIDTH = 320
 MAX_VIEWPORT_WIDTH = 3840
 MIN_VIEWPORT_HEIGHT = 240
 MAX_VIEWPORT_HEIGHT = 2160
+DEFAULT_SERVER_STARTUP_TIMEOUT_MS = 30_000
+MAX_SERVER_STARTUP_TIMEOUT_MS = 300_000
+SERVER_STOP_TIMEOUT_SECONDS = 5
+SERVER_PROBE_INTERVAL_SECONDS = 0.1
+SERVER_PROBE_TIMEOUT_SECONDS = 1.0
+MAX_SERVER_OUTPUT_CHARACTERS = 4_000
+BROWSER_SETUP_COMMANDS = (
+    'python -m pip install -e ".[browser]"',
+    "python -m playwright install chromium",
+)
 VIEWPORT = MappingProxyType(
     {
         "width": DEFAULT_VIEWPORT_WIDTH,
@@ -49,6 +78,102 @@ _SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
 )
 
 PlaywrightFactory = Callable[[], Any]
+PopenFactory = Callable[..., Any]
+URLProbe = Callable[[str, float], bool]
+SetupCommandRunner = Callable[..., dict[str, Any]]
+_PLAYWRIGHT_SETUP_ERROR = (
+    "Playwright is unavailable. Install browser support with "
+    "'python -m pip install -e \".[browser]\"', then run "
+    "'python -m playwright install chromium'."
+)
+
+
+def run_browser_setup(
+    project_root: str | Path = ".",
+    *,
+    permission_mode: str = "default",
+    runtime_mode: str = "local",
+    approval_callback: ApprovalCallback | None = None,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    _command_runner: SetupCommandRunner | None = None,
+) -> dict[str, Any]:
+    """Install optional browser support through approved local commands."""
+    commands = list(BROWSER_SETUP_COMMANDS)
+    try:
+        root = Path(project_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError("Project root must be an existing directory.")
+        normalized_runtime = runtime_mode.strip().lower()
+        if normalized_runtime not in {"local", "docker", "no-command"}:
+            raise ValueError(f"Unsupported runtime mode: {runtime_mode}")
+    except (AttributeError, TypeError, ValueError) as exc:
+        return _setup_result(
+            ok=False,
+            commands=commands,
+            results=[],
+            error=str(exc),
+        )
+
+    effective_permission_mode = permission_mode
+    if normalized_runtime == "no-command":
+        effective_permission_mode = "no-command"
+    permissions = PermissionManager(
+        mode=effective_permission_mode,
+        approval_callback=approval_callback,
+    )
+    command_runner = _command_runner or run_command
+    results: list[dict[str, Any]] = []
+
+    for command in commands:
+        decision = permissions.authorize(
+            PermissionLevel.EXECUTE,
+            "run_command",
+            {"command": command},
+        )
+        if not decision.allowed:
+            error = decision.reason or "Browser setup command was not approved."
+            results.append(
+                {
+                    "ok": False,
+                    "command": command,
+                    "permission_denied": True,
+                    "error": error,
+                }
+            )
+            return _setup_result(
+                ok=False,
+                commands=commands,
+                results=results,
+                error=error,
+                permission_denied=True,
+            )
+
+        # Browser validation runs on the host, so its optional Python package
+        # and Chromium binary must be installed through the local runner. A
+        # configured no-command runtime has already been denied above.
+        command_result = command_runner(
+            root,
+            command,
+            timeout_ms,
+            runtime_mode="local",
+            allow_network=False,
+        )
+        result = dict(command_result)
+        results.append(result)
+        if result.get("ok") is not True:
+            error = str(result.get("error") or "Browser setup command failed.")
+            return _setup_result(
+                ok=False,
+                commands=commands,
+                results=results,
+                error=error,
+            )
+
+    return _setup_result(
+        ok=True,
+        commands=commands,
+        results=results,
+    )
 
 
 def run_browser_validation(
@@ -83,10 +208,7 @@ def run_browser_validation(
 
     factory = _playwright_factory or _load_playwright_factory()
     if factory is None:
-        return _error_result(
-            "Playwright is unavailable. Install lunar-forge[browser], then run "
-            "'python -m playwright install chromium'."
-        )
+        return _error_result(_PLAYWRIGHT_SETUP_ERROR)
 
     console_errors: list[str] = []
     failed_requests: list[dict[str, str]] = []
@@ -195,6 +317,390 @@ def run_browser_validation(
     if not checks_passed:
         result["error"] = "One or more browser checks failed."
     return result
+
+
+def run_managed_browser_validation(
+    command: str,
+    url: str,
+    screenshot: bool = True,
+    checks: Sequence[str] | None = None,
+    *,
+    full_page: bool = False,
+    width: int = DEFAULT_VIEWPORT_WIDTH,
+    height: int = DEFAULT_VIEWPORT_HEIGHT,
+    startup_timeout_ms: int = DEFAULT_SERVER_STARTUP_TIMEOUT_MS,
+    project_root: str | Path = ".",
+    approval_callback: ApprovalCallback | None = None,
+    _playwright_factory: PlaywrightFactory | None = None,
+    _popen_factory: PopenFactory | None = None,
+    _url_probe: URLProbe | None = None,
+    _clock: Callable[[], float] | None = None,
+    _sleep: Callable[[float], None] | None = None,
+) -> dict[str, Any]:
+    """Approve, start, validate, and stop one project-local dev server."""
+    try:
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("Managed server command must be a non-empty string.")
+        normalized_command = command.strip()
+        if len(normalized_command) > MAX_SERVER_OUTPUT_CHARACTERS:
+            raise ValueError("Managed server command is too long.")
+        local_url = _validated_local_url(url)
+        _validated_checks(checks)
+        if not isinstance(full_page, bool):
+            raise TypeError("Browser full_page must be a boolean.")
+        _validated_viewport(width, height)
+        timeout_ms = _validated_server_timeout(startup_timeout_ms)
+        root = Path(project_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError("Project root must be an existing directory.")
+    except (TypeError, ValueError) as exc:
+        return _managed_error_result(str(exc))
+
+    factory = _playwright_factory or _load_playwright_factory()
+    if factory is None:
+        return _managed_error_result(_PLAYWRIGHT_SETUP_ERROR)
+
+    decision = PermissionManager(
+        mode="default",
+        approval_callback=approval_callback,
+    ).authorize(
+        PermissionLevel.EXECUTE,
+        "run_managed_browser_validation",
+        {"command": normalized_command},
+    )
+    if not decision.allowed:
+        result = _managed_error_result(
+            decision.reason or "Managed server command was not approved."
+        )
+        result["permission_denied"] = True
+        return result
+
+    return _run_approved_managed_browser_validation(
+        normalized_command,
+        local_url,
+        screenshot=screenshot,
+        checks=checks,
+        full_page=full_page,
+        width=width,
+        height=height,
+        startup_timeout_ms=timeout_ms,
+        project_root=root,
+        _playwright_factory=factory,
+        _popen_factory=_popen_factory,
+        _url_probe=_url_probe,
+        _clock=_clock,
+        _sleep=_sleep,
+    )
+
+
+def _run_approved_managed_browser_validation(
+    command: str,
+    url: str,
+    *,
+    screenshot: bool,
+    checks: Sequence[str] | None,
+    full_page: bool,
+    width: int,
+    height: int,
+    startup_timeout_ms: int,
+    project_root: Path,
+    _playwright_factory: PlaywrightFactory,
+    _popen_factory: PopenFactory | None,
+    _url_probe: URLProbe | None,
+    _clock: Callable[[], float] | None,
+    _sleep: Callable[[float], None] | None,
+) -> dict[str, Any]:
+    """Run a managed server only after its caller has obtained approval."""
+    try:
+        arguments = _server_arguments(command, project_root)
+    except ValueError as exc:
+        return _managed_error_result(str(exc))
+
+    popen_factory = _popen_factory or subprocess.Popen
+    clock = _clock or time.monotonic
+    sleep = _sleep or time.sleep
+    probe = _url_probe or _probe_local_url
+    try:
+        process = popen_factory(
+            arguments,
+            cwd=project_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+    except OSError as exc:
+        return _managed_error_result(
+            "Could not start the managed dev server: "
+            f"{_safe_process_error(exc)}"
+        )
+
+    stdout_collector, stdout_thread = _start_output_collector(process.stdout)
+    stderr_collector, stderr_thread = _start_output_collector(process.stderr)
+    deadline = clock() + (startup_timeout_ms / 1000)
+    ready = False
+    startup_error: str | None = None
+    while True:
+        exit_code = process.poll()
+        if exit_code is not None:
+            startup_error = (
+                "Managed dev server exited before the URL responded "
+                f"(exit code {exit_code})."
+            )
+            break
+        remaining = deadline - clock()
+        if remaining <= 0:
+            startup_error = (
+                "Managed dev server did not respond within "
+                f"{startup_timeout_ms} ms."
+            )
+            break
+        try:
+            ready = probe(url, min(SERVER_PROBE_TIMEOUT_SECONDS, remaining))
+        except Exception:
+            ready = False
+        if ready:
+            break
+        sleep(min(SERVER_PROBE_INTERVAL_SECONDS, remaining))
+
+    if startup_error is not None:
+        stopped = _stop_server_process(process)
+        _join_output_thread(stdout_thread, stdout_collector)
+        _join_output_thread(stderr_thread, stderr_collector)
+        result = _managed_error_result(startup_error)
+        result["managed_server"] = _server_result(
+            process,
+            stdout_collector,
+            stderr_collector,
+            ready=False,
+            stopped=stopped,
+        )
+        return result
+
+    try:
+        result = run_browser_validation(
+            url,
+            screenshot=screenshot,
+            checks=checks,
+            full_page=full_page,
+            width=width,
+            height=height,
+            project_root=project_root,
+            _playwright_factory=_playwright_factory,
+        )
+    finally:
+        stopped = _stop_server_process(process)
+        _join_output_thread(stdout_thread, stdout_collector)
+        _join_output_thread(stderr_thread, stderr_collector)
+    result["managed_server"] = _server_result(
+        process,
+        stdout_collector,
+        stderr_collector,
+        ready=True,
+        stopped=stopped,
+    )
+    return result
+
+
+class _BoundedOutputCollector:
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._length = 0
+        self.truncated = False
+
+    def drain(self, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.read(1_024)
+                if not chunk:
+                    break
+                text = chunk if isinstance(chunk, str) else str(chunk)
+                remaining = MAX_SERVER_OUTPUT_CHARACTERS - self._length
+                if remaining > 0:
+                    kept = text[:remaining]
+                    self._parts.append(kept)
+                    self._length += len(kept)
+                if len(text) > remaining:
+                    self.truncated = True
+        except Exception:
+            self.truncated = True
+
+    def value(self) -> str:
+        return "".join(self._parts)
+
+
+def _start_output_collector(
+    stream: Any,
+) -> tuple[_BoundedOutputCollector, Thread | None]:
+    collector = _BoundedOutputCollector()
+    if stream is None:
+        return collector, None
+    thread = Thread(target=collector.drain, args=(stream,), daemon=True)
+    thread.start()
+    return collector, thread
+
+
+def _join_output_thread(
+    thread: Thread | None,
+    collector: _BoundedOutputCollector,
+) -> None:
+    if thread is None:
+        return
+    thread.join(timeout=1)
+    if thread.is_alive():
+        collector.truncated = True
+
+
+def _server_arguments(command: str, project_root: Path) -> list[str]:
+    dangerous_pattern = dangerous_command_reason(command)
+    if dangerous_pattern is None:
+        dangerous_pattern = normalized_dangerous_command_reason(command)
+    if dangerous_pattern is not None:
+        raise ValueError(
+            "Managed server command blocked by safety policy: matched "
+            f"prohibited pattern {dangerous_pattern!r}."
+        )
+    try:
+        arguments = split_command(command)
+    except ValueError as exc:
+        raise ValueError(f"Could not parse managed server command: {exc}") from exc
+    if not arguments:
+        raise ValueError("Managed server command must not be empty.")
+    normalized_pattern = dangerous_command_reason(" ".join(arguments))
+    if normalized_pattern is not None:
+        raise ValueError(
+            "Managed server command blocked after argument normalization: "
+            f"matched prohibited pattern {normalized_pattern!r}."
+        )
+    executable = arguments[0]
+    resolved = resolve_executable(executable, project_root)
+    if resolved is None:
+        safe_executable, _ = _bounded_text(
+            _redacted_text(executable),
+            MAX_LOG_TEXT_CHARACTERS,
+        )
+        raise ValueError(
+            f"Managed server executable {safe_executable!r} was not found. "
+            f"{executable_path_summary()}"
+        )
+    arguments[0] = resolved
+    return arguments
+
+
+def _validated_server_timeout(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("Managed server startup_timeout_ms must be an integer.")
+    if not 1 <= value <= MAX_SERVER_STARTUP_TIMEOUT_MS:
+        raise ValueError(
+            "Managed server startup_timeout_ms must be between 1 and "
+            f"{MAX_SERVER_STARTUP_TIMEOUT_MS}."
+        )
+    return value
+
+
+def _stop_server_process(process: Any) -> bool:
+    try:
+        if process.poll() is not None:
+            return True
+        process.terminate()
+        process.wait(timeout=SERVER_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=SERVER_STOP_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            return False
+    try:
+        return process.poll() is not None
+    except Exception:
+        return False
+
+
+def _server_result(
+    process: Any,
+    stdout: _BoundedOutputCollector,
+    stderr: _BoundedOutputCollector,
+    *,
+    ready: bool,
+    stopped: bool,
+) -> dict[str, Any]:
+    try:
+        exit_code = process.poll()
+    except Exception:
+        exit_code = None
+    stdout_text, stdout_truncated = _bounded_text(
+        _redacted_text(stdout.value()),
+        MAX_SERVER_OUTPUT_CHARACTERS,
+    )
+    stderr_text, stderr_truncated = _bounded_text(
+        _redacted_text(stderr.value()),
+        MAX_SERVER_OUTPUT_CHARACTERS,
+    )
+    return {
+        "started": True,
+        "ready": ready,
+        "stopped": stopped,
+        "exit_code": exit_code,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "output_truncated": (
+            stdout.truncated
+            or stderr.truncated
+            or stdout_truncated
+            or stderr_truncated
+        ),
+    }
+
+
+def _managed_error_result(error: str) -> dict[str, Any]:
+    result = _error_result(error)
+    result["managed_server"] = {
+        "started": False,
+        "ready": False,
+        "stopped": False,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "output_truncated": False,
+    }
+    return result
+
+
+def _safe_process_error(exc: Exception) -> str:
+    message, _ = _bounded_text(
+        _redacted_text(exc),
+        MAX_LOG_TEXT_CHARACTERS,
+    )
+    return f"{type(exc).__name__}: {message}"
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, url):
+        return None
+
+
+def _probe_local_url(url: str, timeout_seconds: float) -> bool:
+    request = Request(url, method="GET")
+    opener = build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=max(0.001, timeout_seconds)) as response:
+            response.read(1)
+        return True
+    except HTTPError:
+        # Any HTTP response proves that the local server is listening. Redirects
+        # are deliberately not followed, so a local page cannot make this probe
+        # contact a non-loopback host.
+        return True
+    except (OSError, URLError, ValueError):
+        return False
 
 
 def _load_playwright_factory() -> PlaywrightFactory | None:
@@ -465,6 +971,29 @@ def _error_result(error: str) -> dict[str, Any]:
         truncated=truncated,
     )
     result["error"] = bounded_error
+    return result
+
+
+def _setup_result(
+    *,
+    ok: bool,
+    commands: list[str],
+    results: list[dict[str, Any]],
+    error: str | None = None,
+    permission_denied: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "status": "passed" if ok else "failed",
+        "commands": commands,
+        "completed_commands": sum(item.get("ok") is True for item in results),
+        "results": results,
+    }
+    if error is not None:
+        bounded_error, _ = _bounded_text(error, MAX_LOG_TEXT_CHARACTERS)
+        result["error"] = bounded_error
+    if permission_denied:
+        result["permission_denied"] = True
     return result
 
 

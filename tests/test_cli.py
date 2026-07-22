@@ -1,11 +1,13 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
 from typer.testing import CliRunner
 
 import lunar_forge.cli as cli_module
+import lunar_forge.workflows.browser_validation as browser_module
 from lunar_forge.cli import app
-from lunar_forge.config import AppConfig
+from lunar_forge.config import AppConfig, RuntimeConfig
 from lunar_forge.config import MCPRuntimeConfig, PluginRuntimeConfig
 from lunar_forge.runtime.checkpoints import create_file_checkpoint
 
@@ -192,6 +194,87 @@ def test_subagents_flag_is_available_and_sets_cli_override():
     assert overrides == {"subagents": {"enabled": True}}
 
 
+def test_browser_setup_is_model_free_lists_commands_and_uses_approvals(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def unexpected_model(*args, **kwargs):
+        raise AssertionError("Browser setup must not use model APIs")
+
+    def fake_command_runner(
+        project_root,
+        command,
+        timeout_ms,
+        *,
+        runtime_mode,
+        allow_network,
+    ):
+        calls.append(command)
+        return {
+            "ok": True,
+            "command": command,
+            "exit_code": 0,
+            "stdout": "installed\n",
+            "stderr": "",
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(cli_module, "run_agent", unexpected_model)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda project_root: AppConfig(),
+    )
+    monkeypatch.setattr(browser_module, "run_command", fake_command_runner)
+
+    result = CliRunner().invoke(
+        app,
+        ["browser-setup", "--project", str(tmp_path)],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        'python -m pip install -e ".[browser]"',
+        "python -m playwright install chromium",
+    ]
+    assert result.stdout.index("Browser setup will run these commands:") < (
+        result.stdout.index("Allow? [y/N]")
+    )
+    for command in calls:
+        assert f"- {command}" in result.stdout
+    assert '"status": "passed"' in result.stdout
+
+
+def test_browser_setup_honors_configured_no_command_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("No-command setup must not use model or command APIs")
+
+    monkeypatch.setattr(cli_module, "run_agent", unexpected)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda project_root: AppConfig(
+            runtime=RuntimeConfig(mode="no-command"),
+        ),
+    )
+    monkeypatch.setattr(browser_module, "run_command", unexpected)
+
+    result = CliRunner().invoke(
+        app,
+        ["browser-setup", "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "No-command mode blocks command execution" in result.stdout
+    assert "Allow? [y/N]" not in result.stdout
+
+
 def test_browser_validate_command_is_model_free_and_returns_json(
     monkeypatch,
     tmp_path,
@@ -318,6 +401,82 @@ def test_browser_validate_command_accepts_full_page_and_viewport(
         "full_page": True,
         "width": 1440,
         "height": 1200,
+        "project_root": tmp_path.resolve(),
+    }
+
+
+def test_browser_validate_managed_server_mode_is_model_free_and_routed(
+    monkeypatch,
+    tmp_path,
+):
+    _forbid_model_and_config(monkeypatch)
+    captured = {}
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_browser_validation",
+        lambda *args, **kwargs: pytest.fail(
+            "Managed mode must not use direct browser validation routing"
+        ),
+    )
+
+    def fake_managed_validation(command, url, **kwargs):
+        captured.update(command=command, url=url, **kwargs)
+        return {
+            "ok": True,
+            "status": "passed",
+            "title": "Managed app",
+            "final_url": url,
+            "console_errors": [],
+            "failed_requests": [],
+            "screenshot_path": None,
+            "checks": [],
+            "truncated": False,
+            "managed_server": {
+                "started": True,
+                "ready": True,
+                "stopped": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        cli_module,
+        "run_managed_browser_validation",
+        fake_managed_validation,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "browser-validate",
+            "--serve",
+            "npm run dev",
+            "--url",
+            "http://localhost:5173",
+            "--project",
+            str(tmp_path),
+            "--full-page",
+            "--width",
+            "1440",
+            "--height",
+            "1200",
+            "--startup-timeout-ms",
+            "45000",
+        ],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["managed_server"]["stopped"] is True
+    assert captured == {
+        "command": "npm run dev",
+        "url": "http://localhost:5173",
+        "screenshot": True,
+        "checks": None,
+        "full_page": True,
+        "width": 1440,
+        "height": 1200,
+        "startup_timeout_ms": 45000,
         "project_root": tmp_path.resolve(),
     }
 

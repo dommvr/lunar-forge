@@ -1,4 +1,5 @@
 import json
+from io import StringIO
 import tomllib
 from pathlib import Path
 
@@ -8,11 +9,14 @@ import lunar_forge.workflows.browser_validation as browser_module
 from lunar_forge.permissions import PermissionLevel, PermissionRequest
 from lunar_forge.tools.registry import create_tool_registry
 from lunar_forge.workflows.browser_validation import (
+    BROWSER_SETUP_COMMANDS,
     MAX_LOG_ENTRIES,
     MAX_LOG_TEXT_CHARACTERS,
     MAX_SCREENSHOT_BYTES,
     VIEWPORT,
+    run_browser_setup,
     run_browser_validation,
+    run_managed_browser_validation,
 )
 
 
@@ -147,6 +151,29 @@ def _factory_for(page):
     return playwright, lambda: playwright
 
 
+class FakeManagedProcess:
+    def __init__(self, *, returncode=None, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = StringIO(stdout)
+        self.stderr = StringIO(stderr)
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 def test_browser_extra_is_optional_and_declares_playwright():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
@@ -157,11 +184,144 @@ def test_browser_extra_is_optional_and_declares_playwright():
     assert any(dependency.startswith("playwright") for dependency in browser_extra)
 
 
+def test_browser_setup_approves_and_runs_each_exact_command(tmp_path):
+    requests = []
+    calls = []
+
+    def fake_command_runner(
+        project_root,
+        command,
+        timeout_ms,
+        *,
+        runtime_mode,
+        allow_network,
+    ):
+        calls.append(
+            {
+                "project_root": project_root,
+                "command": command,
+                "timeout_ms": timeout_ms,
+                "runtime_mode": runtime_mode,
+                "allow_network": allow_network,
+            }
+        )
+        return {
+            "ok": True,
+            "command": command,
+            "exit_code": 0,
+            "stdout": "installed\n",
+            "stderr": "",
+            "truncated": False,
+        }
+
+    result = run_browser_setup(
+        tmp_path,
+        approval_callback=lambda request: requests.append(request) or True,
+        _command_runner=fake_command_runner,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "passed"
+    assert result["commands"] == list(BROWSER_SETUP_COMMANDS)
+    assert result["completed_commands"] == 2
+    assert [request.tool_name for request in requests] == [
+        "run_command",
+        "run_command",
+    ]
+    assert [request.description for request in requests] == [
+        f"Run command: {command}." for command in BROWSER_SETUP_COMMANDS
+    ]
+    assert [call["command"] for call in calls] == list(BROWSER_SETUP_COMMANDS)
+    assert all(call["project_root"] == tmp_path.resolve() for call in calls)
+    assert all(call["runtime_mode"] == "local" for call in calls)
+    assert all(call["allow_network"] is False for call in calls)
+
+
+def test_browser_setup_denial_prevents_command_execution(tmp_path):
+    calls = []
+
+    result = run_browser_setup(
+        tmp_path,
+        approval_callback=lambda request: False,
+        _command_runner=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["permission_denied"] is True
+    assert result["completed_commands"] == 0
+    assert result["results"][0]["command"] == BROWSER_SETUP_COMMANDS[0]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "runtime_mode"),
+    (("no-command", "local"), ("default", "no-command")),
+)
+def test_browser_setup_preserves_no_command_mode_without_prompting(
+    permission_mode,
+    runtime_mode,
+    tmp_path,
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("No-command mode must not prompt or execute")
+
+    result = run_browser_setup(
+        tmp_path,
+        permission_mode=permission_mode,
+        runtime_mode=runtime_mode,
+        approval_callback=unexpected,
+        _command_runner=unexpected,
+    )
+
+    assert result["ok"] is False
+    assert result["permission_denied"] is True
+    assert "No-command mode blocks command execution" in result["error"]
+
+
+def test_browser_setup_stops_after_failed_command(tmp_path):
+    calls = []
+
+    def failing_command_runner(
+        project_root,
+        command,
+        timeout_ms,
+        **kwargs,
+    ):
+        calls.append(command)
+        return {
+            "ok": False,
+            "command": command,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "installation failed",
+            "truncated": False,
+            "error": "Command exited with code 1.",
+        }
+
+    result = run_browser_setup(
+        tmp_path,
+        approval_callback=lambda request: True,
+        _command_runner=failing_command_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["error"] == "Command exited with code 1."
+    assert calls == [BROWSER_SETUP_COMMANDS[0]]
+
+
 def test_unavailable_playwright_returns_clear_error_without_writing(
     monkeypatch,
     tmp_path,
 ):
+    def unexpected_setup(*args, **kwargs):
+        raise AssertionError(
+            "Browser validation must never auto-install dependencies"
+        )
+
     monkeypatch.setattr(browser_module, "_load_playwright_factory", lambda: None)
+    monkeypatch.setattr(browser_module, "run_command", unexpected_setup)
 
     result = run_browser_validation(
         "http://127.0.0.1:8000",
@@ -171,6 +331,7 @@ def test_unavailable_playwright_returns_clear_error_without_writing(
     assert result["ok"] is False
     assert result["status"] == "failed"
     assert "Playwright is unavailable" in result["error"]
+    assert 'python -m pip install -e ".[browser]"' in result["error"]
     assert "playwright install chromium" in result["error"]
     assert not (tmp_path / ".agent").exists()
 
@@ -319,6 +480,165 @@ def test_browser_tool_is_registered_in_normal_tool_schemas(tmp_path):
 
     assert "run_browser_validation" in registry.names()
     assert "run_browser_validation" in schema_names
+    assert "run_managed_browser_validation" in registry.names()
+    assert "run_managed_browser_validation" in schema_names
+
+
+def test_managed_browser_tool_is_not_registered_for_docker_runtime(tmp_path):
+    registry = create_tool_registry(
+        tmp_path,
+        mode="docker",
+        runtime_mode="docker",
+        approval_callback=lambda request: True,
+    )
+
+    assert "run_browser_validation" in registry.names()
+    assert "run_managed_browser_validation" not in registry.names()
+
+
+def test_managed_browser_validation_requires_approval_before_start(
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    requests = []
+    popen_calls = []
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        project_root=tmp_path,
+        approval_callback=lambda request: requests.append(request) or False,
+        _playwright_factory=factory,
+        _popen_factory=lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+
+    assert result["ok"] is False
+    assert result["permission_denied"] is True
+    assert result["managed_server"]["started"] is False
+    assert popen_calls == []
+    assert requests[0].tool_name == "run_managed_browser_validation"
+    assert requests[0].description == "Start managed dev server: npm run dev."
+
+
+def test_managed_browser_validation_starts_waits_validates_and_stops(
+    monkeypatch,
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    process = FakeManagedProcess(stdout="ready\n", stderr="warning\n")
+    popen_calls = []
+    monkeypatch.setattr(
+        browser_module,
+        "resolve_executable",
+        lambda executable, cwd: str(tmp_path / "npm.cmd"),
+    )
+
+    def popen_factory(arguments, **kwargs):
+        popen_calls.append((arguments, kwargs))
+        return process
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        full_page=True,
+        width=1440,
+        height=1200,
+        project_root=tmp_path,
+        approval_callback=lambda request: True,
+        _playwright_factory=factory,
+        _popen_factory=popen_factory,
+        _url_probe=lambda url, timeout: True,
+    )
+
+    assert result["ok"] is True
+    assert result["managed_server"] == {
+        "started": True,
+        "ready": True,
+        "stopped": True,
+        "exit_code": -15,
+        "stdout": "ready\n",
+        "stderr": "warning\n",
+        "output_truncated": False,
+    }
+    assert process.terminated is True
+    assert process.killed is False
+    arguments, kwargs = popen_calls[0]
+    assert arguments == [str(tmp_path / "npm.cmd"), "run", "dev"]
+    assert kwargs["cwd"] == tmp_path.resolve()
+    assert kwargs["shell"] is False
+    assert page.screenshot_calls[0]["full_page"] is True
+
+
+def test_managed_browser_validation_captures_early_exit_output(
+    monkeypatch,
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    process = FakeManagedProcess(
+        returncode=1,
+        stdout="startup output\n",
+        stderr="startup failed\n",
+    )
+    monkeypatch.setattr(
+        browser_module,
+        "resolve_executable",
+        lambda executable, cwd: str(tmp_path / "npm.cmd"),
+    )
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        project_root=tmp_path,
+        approval_callback=lambda request: True,
+        _playwright_factory=factory,
+        _popen_factory=lambda *args, **kwargs: process,
+        _url_probe=lambda url, timeout: pytest.fail(
+            "Exited process must be detected before probing"
+        ),
+    )
+
+    assert result["ok"] is False
+    assert "exited before the URL responded" in result["error"]
+    assert result["managed_server"]["ready"] is False
+    assert result["managed_server"]["stopped"] is True
+    assert result["managed_server"]["stdout"] == "startup output\n"
+    assert result["managed_server"]["stderr"] == "startup failed\n"
+
+
+def test_managed_browser_validation_times_out_and_stops_server(
+    monkeypatch,
+    tmp_path,
+):
+    page = FakePage()
+    _, factory = _factory_for(page)
+    process = FakeManagedProcess()
+    times = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(
+        browser_module,
+        "resolve_executable",
+        lambda executable, cwd: str(tmp_path / "npm.cmd"),
+    )
+
+    result = run_managed_browser_validation(
+        "npm run dev",
+        "http://localhost:5173",
+        startup_timeout_ms=10,
+        project_root=tmp_path,
+        approval_callback=lambda request: True,
+        _playwright_factory=factory,
+        _popen_factory=lambda *args, **kwargs: process,
+        _url_probe=lambda url, timeout: False,
+        _clock=lambda: next(times),
+        _sleep=lambda seconds: None,
+    )
+
+    assert result["ok"] is False
+    assert "did not respond within 10 ms" in result["error"]
+    assert process.terminated is True
+    assert result["managed_server"]["stopped"] is True
 
 
 def test_screenshot_can_be_disabled_without_creating_artifact_directory(tmp_path):
@@ -443,8 +763,27 @@ def test_browser_tool_is_permission_gated_and_hidden_in_plan_mode(
     requests: list[PermissionRequest] = []
     calls = []
 
-    def fake_validation(url, screenshot=True, checks=None, *, project_root="."):
-        calls.append((url, screenshot, checks, project_root))
+    def fake_validation(
+        url,
+        screenshot=True,
+        checks=None,
+        *,
+        full_page=False,
+        width=1280,
+        height=720,
+        project_root=".",
+    ):
+        calls.append(
+            (
+                url,
+                screenshot,
+                checks,
+                full_page,
+                width,
+                height,
+                project_root,
+            )
+        )
         return {
             "ok": True,
             "title": "Mock",
@@ -494,5 +833,59 @@ def test_browser_tool_is_permission_gated_and_hidden_in_plan_mode(
 
     assert approved["ok"] is True
     assert calls == [
-        ("http://localhost:8000", False, ["main"], tmp_path)
+        (
+            "http://localhost:8000",
+            False,
+            ["main"],
+            False,
+            1280,
+            720,
+            tmp_path,
+        )
     ]
+
+
+def test_managed_browser_tool_uses_registry_command_approval(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    requests = []
+
+    def fake_managed(command, url, **kwargs):
+        calls.append((command, url, kwargs))
+        return {"ok": True, "status": "passed"}
+
+    monkeypatch.setattr(
+        browser_module,
+        "run_managed_browser_validation",
+        fake_managed,
+    )
+    denied_registry = create_tool_registry(
+        tmp_path,
+        mode="default",
+        approval_callback=lambda request: requests.append(request) or False,
+    )
+
+    denied = denied_registry.execute(
+        "run_managed_browser_validation",
+        {"command": "npm run dev", "url": "http://localhost:5173"},
+    )
+
+    assert denied["permission_denied"] is True
+    assert calls == []
+    assert requests[0].description == "Start managed dev server: npm run dev."
+
+    approved_registry = create_tool_registry(
+        tmp_path,
+        mode="default",
+        approval_callback=lambda request: True,
+    )
+    approved = approved_registry.execute(
+        "run_managed_browser_validation",
+        {"command": "npm run dev", "url": "http://localhost:5173"},
+    )
+
+    assert approved["ok"] is True
+    assert calls[0][0:2] == ("npm run dev", "http://localhost:5173")
+    assert callable(calls[0][2]["approval_callback"])

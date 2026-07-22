@@ -13,6 +13,8 @@ def test_detect_empty_project(tmp_path):
         "routing": None,
         "test_command": None,
         "build_command": None,
+        "dev_command": None,
+        "local_url": None,
         "is_empty": True,
     }
     assert detect_project_type(tmp_path) == "empty"
@@ -34,7 +36,11 @@ def test_detect_vite_react_npm_project(tmp_path):
     package_json = {
         "dependencies": {"react": "latest"},
         "devDependencies": {"vite": "latest"},
-        "scripts": {"test": "vitest", "build": "vite build"},
+        "scripts": {
+            "test": "vitest",
+            "build": "vite build",
+            "dev": "vite",
+        },
     }
     (tmp_path / "package.json").write_text(
         json.dumps(package_json),
@@ -53,12 +59,14 @@ def test_detect_vite_react_npm_project(tmp_path):
     assert project["package_manager"] == "npm"
     assert project["test_command"] == "npm test"
     assert project["build_command"] == "npm run build"
+    assert project["dev_command"] == "npm run dev"
+    assert project["local_url"] == "http://localhost:5173"
 
 
 def test_detect_nextjs_pnpm_app_router(tmp_path):
     package_json = {
         "dependencies": {"next": "latest", "react": "latest"},
-        "scripts": {"build": "next build"},
+        "scripts": {"build": "next build", "dev": "next dev"},
     }
     (tmp_path / "package.json").write_text(
         json.dumps(package_json),
@@ -74,6 +82,8 @@ def test_detect_nextjs_pnpm_app_router(tmp_path):
     assert project["package_manager"] == "pnpm"
     assert project["routing"] == "app_router"
     assert project["build_command"] == "pnpm build"
+    assert project["dev_command"] == "pnpm dev"
+    assert project["local_url"] == "http://localhost:3000"
 
 
 def test_detect_nextjs_pages_router(tmp_path):

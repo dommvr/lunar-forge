@@ -570,7 +570,7 @@ def _execution_tools(
     runtime_mode: str,
     allow_network: bool,
 ) -> tuple[Tool, ...]:
-    return (
+    tools = [
         Tool(
             name="run_command",
             description=(
@@ -661,6 +661,25 @@ def _execution_tools(
                         "items": {"type": "string", "maxLength": 500},
                         "maxItems": 20,
                     },
+                    "full_page": {
+                        "type": "boolean",
+                        "description": "Capture the entire scrollable page.",
+                        "default": False,
+                    },
+                    "width": {
+                        "type": "integer",
+                        "minimum": 320,
+                        "maximum": 3840,
+                        "description": "Browser viewport width in pixels.",
+                        "default": 1280,
+                    },
+                    "height": {
+                        "type": "integer",
+                        "minimum": 240,
+                        "maximum": 2160,
+                        "description": "Browser viewport height in pixels.",
+                        "default": 720,
+                    },
                 },
                 "required": ["url"],
                 "additionalProperties": False,
@@ -668,7 +687,72 @@ def _execution_tools(
             handler=partial(_run_browser_validation, project_root),
             permission=PermissionLevel.EXECUTE,
         ),
-    )
+    ]
+    if runtime_mode.strip().lower() == "local":
+        tools.append(
+            Tool(
+                name="run_managed_browser_validation",
+                description=(
+                    "After approval, start a project dev server with shell disabled, "
+                    "wait for its loopback URL, validate it in Playwright, and stop "
+                    "the server. Use only when project detection supplies a likely "
+                    "dev command and local URL."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Project dev command requiring approval.",
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Expected local loopback HTTP(S) URL.",
+                        },
+                        "screenshot": {
+                            "type": "boolean",
+                            "description": "Capture a screenshot.",
+                            "default": True,
+                        },
+                        "checks": {
+                            "type": "array",
+                            "description": "Optional CSS selectors that must match.",
+                            "items": {"type": "string", "maxLength": 500},
+                            "maxItems": 20,
+                        },
+                        "full_page": {
+                            "type": "boolean",
+                            "description": "Capture the entire scrollable page.",
+                            "default": False,
+                        },
+                        "width": {
+                            "type": "integer",
+                            "minimum": 320,
+                            "maximum": 3840,
+                            "default": 1280,
+                        },
+                        "height": {
+                            "type": "integer",
+                            "minimum": 240,
+                            "maximum": 2160,
+                            "default": 720,
+                        },
+                        "startup_timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 300000,
+                            "description": "Maximum wait for the URL to respond.",
+                            "default": 30000,
+                        },
+                    },
+                    "required": ["command", "url"],
+                    "additionalProperties": False,
+                },
+                handler=partial(_run_managed_browser_validation, project_root),
+                permission=PermissionLevel.EXECUTE,
+            )
+        )
+    return tuple(tools)
 
 
 def _run_validation(
@@ -694,6 +778,9 @@ def _run_browser_validation(
     url: str,
     screenshot: bool = True,
     checks: list[str] | None = None,
+    full_page: bool = False,
+    width: int = 1280,
+    height: int = 720,
 ) -> dict[str, Any]:
     """Import the optional browser workflow only after tool approval."""
     from lunar_forge.workflows.browser_validation import run_browser_validation
@@ -702,5 +789,38 @@ def _run_browser_validation(
         url,
         screenshot=screenshot,
         checks=checks,
+        full_page=full_page,
+        width=width,
+        height=height,
         project_root=project_root,
+    )
+
+
+def _run_managed_browser_validation(
+    project_root: str | Path,
+    command: str,
+    url: str,
+    screenshot: bool = True,
+    checks: list[str] | None = None,
+    full_page: bool = False,
+    width: int = 1280,
+    height: int = 720,
+    startup_timeout_ms: int = 30_000,
+) -> dict[str, Any]:
+    """Run the managed workflow after ToolRegistry has approved the command."""
+    from lunar_forge.workflows.browser_validation import (
+        run_managed_browser_validation,
+    )
+
+    return run_managed_browser_validation(
+        command,
+        url,
+        screenshot=screenshot,
+        checks=checks,
+        full_page=full_page,
+        width=width,
+        height=height,
+        startup_timeout_ms=startup_timeout_ms,
+        project_root=project_root,
+        approval_callback=lambda request: True,
     )

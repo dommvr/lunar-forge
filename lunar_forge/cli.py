@@ -30,9 +30,13 @@ from lunar_forge.workflows.new_project import (
     select_template,
 )
 from lunar_forge.workflows.browser_validation import (
+    BROWSER_SETUP_COMMANDS,
+    DEFAULT_SERVER_STARTUP_TIMEOUT_MS,
     DEFAULT_VIEWPORT_HEIGHT,
     DEFAULT_VIEWPORT_WIDTH,
+    run_browser_setup,
     run_browser_validation,
+    run_managed_browser_validation,
 )
 
 
@@ -47,6 +51,7 @@ class DefaultCommandGroup(TyperGroup):
             "rollback",
             "sessions",
             "resume",
+            "browser-setup",
             "browser-validate",
             "mcp",
             "plugins",
@@ -125,12 +130,68 @@ def run(
     typer.echo(response)
 
 
+@app.command("browser-setup")
+def browser_setup_command(
+    project: Annotated[
+        Path,
+        typer.Option(
+            "--project",
+            "-p",
+            help="LunarForge checkout where browser support will be installed.",
+        ),
+    ] = Path("."),
+) -> None:
+    """Install optional browser dependencies after explicit approvals."""
+    typer.echo("Browser setup will run these commands:")
+    for command in BROWSER_SETUP_COMMANDS:
+        typer.echo(f"- {command}")
+
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        result = run_browser_setup(
+            project_root,
+            permission_mode=config.permissions.mode,
+            runtime_mode=config.runtime.mode,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Browser setup result:")
+    typer.echo(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if result.get("ok") is not True:
+        raise typer.Exit(code=1)
+
+
 @app.command("browser-validate")
 def browser_validate_command(
     url: Annotated[
-        str,
+        str | None,
         typer.Argument(help="Already-running local loopback HTTP(S) URL."),
-    ],
+    ] = None,
+    managed_url: Annotated[
+        str | None,
+        typer.Option(
+            "--url",
+            help="Loopback URL used with --serve, or instead of the argument.",
+        ),
+    ] = None,
+    serve: Annotated[
+        str | None,
+        typer.Option(
+            "--serve",
+            help="Approved project-local dev server command to manage.",
+        ),
+    ] = None,
     project: Annotated[
         Path,
         typer.Option("--project", "-p", help="Target project directory."),
@@ -163,6 +224,13 @@ def browser_validate_command(
             help="Browser viewport height in pixels.",
         ),
     ] = DEFAULT_VIEWPORT_HEIGHT,
+    startup_timeout_ms: Annotated[
+        int,
+        typer.Option(
+            "--startup-timeout-ms",
+            help="Maximum time to wait for a managed server URL.",
+        ),
+    ] = DEFAULT_SERVER_STARTUP_TIMEOUT_MS,
     checks: Annotated[
         list[str] | None,
         typer.Option(
@@ -171,16 +239,37 @@ def browser_validate_command(
         ),
     ] = None,
 ) -> None:
-    """Validate an already-running local page without model or API access."""
-    result = run_browser_validation(
-        url,
-        screenshot=screenshot,
-        checks=checks,
-        full_page=full_page,
-        width=width,
-        height=height,
-        project_root=project.expanduser().resolve(),
-    )
+    """Validate a local page directly or with an approved managed dev server."""
+    if url is not None and managed_url is not None:
+        typer.echo("Error: Provide the URL as an argument or --url, not both.", err=True)
+        raise typer.Exit(code=1)
+    selected_url = managed_url or url
+    if selected_url is None:
+        typer.echo("Error: A loopback URL is required.", err=True)
+        raise typer.Exit(code=1)
+    project_root = project.expanduser().resolve()
+    if serve is None:
+        result = run_browser_validation(
+            selected_url,
+            screenshot=screenshot,
+            checks=checks,
+            full_page=full_page,
+            width=width,
+            height=height,
+            project_root=project_root,
+        )
+    else:
+        result = run_managed_browser_validation(
+            serve,
+            selected_url,
+            screenshot=screenshot,
+            checks=checks,
+            full_page=full_page,
+            width=width,
+            height=height,
+            startup_timeout_ms=startup_timeout_ms,
+            project_root=project_root,
+        )
     output = dict(result)
     output.setdefault("status", "passed" if output.get("ok") is True else "failed")
     typer.echo(

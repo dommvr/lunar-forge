@@ -67,7 +67,7 @@ def run_local_command(
         )
 
     try:
-        arguments = _split_command(command)
+        arguments = split_command(command)
     except ValueError as exc:
         return _error_result(command, f"Could not parse command: {exc}", started)
     if not arguments:
@@ -165,6 +165,11 @@ def _split_command(command: str) -> list[str]:
     # shlex is POSIX-oriented. In non-POSIX mode it preserves surrounding
     # quotes, so remove only a single matching pair from each parsed argument.
     return [_strip_matching_quotes(item) for item in shlex.split(command, posix=False)]
+
+
+def split_command(command: str) -> list[str]:
+    """Parse a command using the same platform rules as local execution."""
+    return _split_command(command)
 
 
 def _resolve_executable(executable: str, cwd: Path) -> str | None:

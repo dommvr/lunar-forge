@@ -20,6 +20,8 @@ class ProjectInfo(TypedDict):
     routing: str | None
     test_command: str | None
     build_command: str | None
+    dev_command: str | None
+    local_url: str | None
     is_empty: bool
 
 
@@ -85,6 +87,18 @@ def detect_project(project_root: str | Path) -> ProjectInfo:
     if "build" in scripts and package_manager:
         build_command = _package_command(package_manager, "build")
 
+    dev_command: str | None = None
+    if "dev" in scripts and package_manager:
+        dev_command = _package_command(package_manager, "dev")
+
+    local_url: str | None = None
+    if dev_command is not None:
+        local_url = (
+            "http://localhost:5173"
+            if has_vite
+            else "http://localhost:3000"
+        )
+
     return {
         "languages": languages,
         "frameworks": frameworks,
@@ -92,6 +106,8 @@ def detect_project(project_root: str | Path) -> ProjectInfo:
         "routing": routing,
         "test_command": test_command,
         "build_command": build_command,
+        "dev_command": dev_command,
+        "local_url": local_url,
         "is_empty": _is_empty(root),
     }
 

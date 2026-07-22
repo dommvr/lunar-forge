@@ -215,13 +215,17 @@ def requires_approval(
 
 
 def _describe_request(tool_name: str, arguments: Mapping[str, Any]) -> str:
-    if tool_name == "run_command":
+    if tool_name in {"run_command", "run_managed_browser_validation"}:
         command = arguments.get("command")
         if isinstance(command, str):
             preview = _redact_command_preview(" ".join(command.split()))
             if len(preview) > 200:
                 preview = f"{preview[:197]}..."
+            if tool_name == "run_managed_browser_validation":
+                return f"Start managed dev server: {preview}."
             return f"Run command: {preview}."
+        if tool_name == "run_managed_browser_validation":
+            return "Start managed dev server."
         return "Run command."
     if tool_name == "run_validation":
         return "Run detected validation commands."
