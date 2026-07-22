@@ -6,7 +6,12 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from lunar_forge.mcp.client import MCPClient, MCPToolDefinition
+from lunar_forge.mcp.client import (
+    MAX_DISCOVERED_TOOLS,
+    MCPClient,
+    MCPClientError,
+    MCPToolDefinition,
+)
 from lunar_forge.mcp.permissions import mcp_tool_permission
 from lunar_forge.tools.registry import Tool, ToolRegistry
 
@@ -19,7 +24,7 @@ MAX_NAMESPACED_TOOL_NAME_CHARACTERS = 128
 
 
 def namespace_mcp_tool(server_name: str, tool_name: str) -> str:
-    """Create a stable MCP namespace accepted by the model tool registry."""
+    """Create a stable internal MCP identity for routing and diagnostics."""
     if not _SERVER_NAMESPACE_PATTERN.fullmatch(server_name):
         raise ValueError("Invalid MCP server namespace.")
     if not _TOOL_NAME_PATTERN.fullmatch(tool_name):
@@ -37,15 +42,28 @@ def register_mcp_tools(
     read_only_only: bool = False,
 ) -> tuple[str, ...]:
     """Register enabled-server tools, optionally limiting them to plan-safe reads."""
-    registered: list[str] = []
+    pending: list[Tool] = []
+    pending_names: set[str] = set()
+    existing_names = set(registry.names())
+    discovered_count = 0
     for server in client.config.enabled_servers:
-        for definition in client.discover_tools(server.name):
+        definitions = client.discover_tools(server.name)
+        discovered_count += len(definitions)
+        if discovered_count > MAX_DISCOVERED_TOOLS:
+            raise MCPClientError(
+                "Enabled MCP servers expose too many tools in total."
+            )
+        for definition in definitions:
             if read_only_only and not definition.read_only:
                 continue
             tool = _registry_tool(client, server.name, definition)
-            registry.register(tool)
-            registered.append(tool.name)
-    return tuple(registered)
+            if tool.name in existing_names or tool.name in pending_names:
+                raise ValueError(f"MCP tool name is already registered: {tool.name}")
+            pending.append(tool)
+            pending_names.add(tool.name)
+    for tool in pending:
+        registry.register(tool)
+    return tuple(tool.name for tool in pending)
 
 
 def _registry_tool(

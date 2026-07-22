@@ -140,6 +140,28 @@ servers:
         load_mcp_config(project)
 
 
+def test_unknown_server_keys_are_rejected_clearly(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_project_config(
+        project,
+        """
+servers:
+  github:
+    command: github-mcp-server
+    transport: stdio
+    enabled: true
+""".lstrip(),
+    )
+
+    with pytest.raises(
+        MCPConfigError,
+        match="MCP server 'github' contains unknown keys",
+    ):
+        load_mcp_config(project)
+
+
 @pytest.mark.parametrize(
     "args_yaml",
     (

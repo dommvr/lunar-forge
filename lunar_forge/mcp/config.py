@@ -77,12 +77,7 @@ def load_mcp_config(project_root: str | Path) -> MCPConfig:
     Configuration is declarative only. Loading it never starts a process and
     environment entries retain variable names rather than resolved secret values.
     """
-    root = Path(project_root).resolve()
-    if not root.is_dir():
-        raise MCPConfigError(f"Project root is not a directory: {root}")
-
-    user_path = Path.home() / ".lunar-forge" / "mcp.yaml"
-    project_path = safe_path(root, ".agent/mcp.yaml")
+    user_path, project_path = mcp_config_paths(project_root)
     user_servers = _read_server_definitions(user_path)
     project_servers = _read_server_definitions(project_path)
     merged = _merge_server_definitions(user_servers, project_servers)
@@ -95,6 +90,17 @@ def load_mcp_config(project_root: str | Path) -> MCPConfig:
             name: _parse_server(name, definition)
             for name, definition in sorted(merged.items())
         }
+    )
+
+
+def mcp_config_paths(project_root: str | Path) -> tuple[Path, Path]:
+    """Return the user and project MCP config paths in merge order."""
+    root = Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        raise MCPConfigError(f"Project root is not a directory: {root}")
+    return (
+        Path.home() / ".lunar-forge" / "mcp.yaml",
+        safe_path(root, ".agent/mcp.yaml"),
     )
 
 

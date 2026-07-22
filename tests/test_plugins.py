@@ -343,10 +343,10 @@ def test_registered_plugin_tool_is_namespaced_and_registry_compatible(tmp_path):
 
     registered = register_plugin_tools(registry, (loaded,), resolver)
     schema = registry.schemas()[0]["function"]
-    result = registry.execute("example.echo", {"message": "hello"})
+    result = registry.execute("example_echo", {"message": "hello"})
 
     assert registered == ("example.echo",)
-    assert schema["name"] == "example.echo"
+    assert schema["name"] == "example_echo"
     assert schema["parameters"]["required"] == ["message"]
     assert "filesystem=read" in schema["description"]
     assert registry.get("example.echo").permission is PermissionLevel.EXECUTE
@@ -417,7 +417,7 @@ def test_denied_local_plugin_is_not_imported(tmp_path):
         resolve_local_plugin_entrypoint,
     )
 
-    result = registry.execute("example.echo", {"message": "blocked"})
+    result = registry.execute("example_echo", {"message": "blocked"})
 
     assert result["permission_denied"] is True
     assert not marker.exists()
@@ -499,7 +499,7 @@ def test_agent_registers_double_opted_in_plugin_and_preserves_builtins(tmp_path)
                 tool_calls=(
                     ToolCall(
                         id="plugin-call",
-                        name="example.echo",
+                        name="example_echo",
                         arguments={"message": "integrated"},
                     ),
                 ),
@@ -519,7 +519,8 @@ def test_agent_registers_double_opted_in_plugin_and_preserves_builtins(tmp_path)
         schema["function"]["name"] for schema in model.tool_schemas[0]
     }
     assert "read_file" in first_schema_names
-    assert "example.echo" in first_schema_names
+    assert "example_echo" in first_schema_names
+    assert all("." not in name for name in first_schema_names)
     assert output.startswith("Plugin complete.")
 
 
@@ -537,7 +538,7 @@ def test_agent_ignores_per_plugin_enablement_when_global_switch_is_off(tmp_path)
     ).run("Explain the project", tmp_path, mode="plan")
 
     schema_names = {schema["function"]["name"] for schema in model.tool_schemas[0]}
-    assert "example.echo" not in schema_names
+    assert "example_echo" not in schema_names
     assert output.startswith("No plugin used.")
 
 
@@ -551,7 +552,7 @@ def test_no_command_mode_blocks_plugin_code_before_resolution(tmp_path):
         plugin_resolver=lambda plugin, definition: resolved.append(definition.name),
     )
 
-    result = registry.execute("example.echo", {"message": "blocked"})
+    result = registry.execute("example_echo", {"message": "blocked"})
 
     assert result["permission_denied"] is True
     assert resolved == []
@@ -579,6 +580,7 @@ def test_yes_mode_still_prompts_before_plugin_execution(tmp_path):
     assert result["permission_denied"] is True
     assert len(requests) == 1
     assert requests[0].permission is PermissionLevel.EXECUTE
+    assert requests[0].tool_name == "example.echo"
 
 
 def test_plugin_exception_is_contained_without_exposing_message(tmp_path):

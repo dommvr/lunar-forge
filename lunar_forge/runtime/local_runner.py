@@ -193,6 +193,11 @@ def _resolve_executable(executable: str, cwd: Path) -> str | None:
     return None
 
 
+def resolve_executable(executable: str, cwd: str | Path) -> str | None:
+    """Public executable resolver shared by local subprocess integrations."""
+    return _resolve_executable(executable, Path(cwd).expanduser().resolve())
+
+
 def _windows_pathext() -> tuple[str, ...]:
     raw_value = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
     extensions: list[str] = []
@@ -230,6 +235,11 @@ def _path_summary() -> str:
             "candidates configured."
         )
     return summary
+
+
+def executable_path_summary() -> str:
+    """Return a sanitized PATH/PATHEXT summary without exposing their values."""
+    return _path_summary()
 
 
 def _is_windows() -> bool:

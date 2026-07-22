@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
@@ -35,6 +36,7 @@ ToolHandler = Callable[..., dict[str, Any]]
 MAX_REGISTRY_RESULT_CHARACTERS = 200_000
 MAX_REGISTRY_RESULT_PREVIEW_CHARACTERS = 20_000
 MAX_REGISTERED_TOOLS = 256
+PROVIDER_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 REDACTED_TOOL_VALUE = "[REDACTED]"
 _SENSITIVE_RESULT_KEYS = frozenset(
     {
@@ -73,6 +75,8 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
+        self._model_names_by_internal: dict[str, str] = {}
+        self._internal_names_by_model: dict[str, str] = {}
         self._permission_manager = permission_manager or PermissionManager()
         for tool in tools:
             self.register(tool)
@@ -80,17 +84,38 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"Tool is already registered: {tool.name}")
+        model_name = provider_safe_tool_name(tool.name)
+        colliding_name = self._internal_names_by_model.get(model_name)
+        if colliding_name is not None:
+            raise ValueError(
+                "Provider-safe tool name collision: "
+                f"{colliding_name!r} and {tool.name!r} both map to "
+                f"{model_name!r}."
+            )
         if len(self._tools) >= MAX_REGISTERED_TOOLS:
             raise ValueError(
                 f"Tool registry supports at most {MAX_REGISTERED_TOOLS} tools."
             )
         self._tools[tool.name] = tool
+        self._model_names_by_internal[tool.name] = model_name
+        self._internal_names_by_model[model_name] = tool.name
 
     def get(self, name: str) -> Tool:
         return self._tools[name]
 
     def names(self) -> tuple[str, ...]:
+        """Return stable internal names for diagnostics and permission policy."""
         return tuple(sorted(self._tools))
+
+    def model_name_for(self, internal_name: str) -> str:
+        """Return the provider-safe alias for a registered internal tool name."""
+        return self._model_names_by_internal[internal_name]
+
+    def internal_name_for(self, name: str) -> str | None:
+        """Resolve an internal name or provider-safe alias to internal identity."""
+        if name in self._tools:
+            return name
+        return self._internal_names_by_model.get(name)
 
     def set_permission_manager(self, permission_manager: PermissionManager) -> None:
         """Apply a mode-specific permission policy to future executions."""
@@ -107,7 +132,7 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
-                    "name": tool.name,
+                    "name": self._model_names_by_internal[tool.name],
                     "description": tool.description,
                     "parameters": tool.parameters,
                 },
@@ -126,9 +151,10 @@ class ToolRegistry:
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Execute a tool and always return a JSON-serializable result."""
-        tool = self._tools.get(name)
-        if tool is None:
+        internal_name = self.internal_name_for(name)
+        if internal_name is None:
             return {"ok": False, "error": f"Unknown tool: {name}"}
+        tool = self._tools[internal_name]
         if not isinstance(arguments, Mapping):
             return {"ok": False, "error": "Tool arguments must be an object."}
 
@@ -150,13 +176,13 @@ class ToolRegistry:
         except Exception as exc:
             return {
                 "ok": False,
-                "error": f"Tool {name} failed with {type(exc).__name__}.",
+                "error": f"Tool {tool.name} failed with {type(exc).__name__}.",
             }
 
         if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
             return {
                 "ok": False,
-                "error": f"Tool {name} returned an invalid result.",
+                "error": f"Tool {tool.name} returned an invalid result.",
             }
         try:
             safe_result = _redact_sensitive_result_values(result)
@@ -169,7 +195,9 @@ class ToolRegistry:
         except (TypeError, ValueError, RecursionError):
             return {
                 "ok": False,
-                "error": f"Tool {name} returned a non-serializable result.",
+                "error": (
+                    f"Tool {tool.name} returned a non-serializable result."
+                ),
             }
         if len(serialized) > MAX_REGISTRY_RESULT_CHARACTERS:
             bounded_result: dict[str, Any] = {
@@ -181,6 +209,18 @@ class ToolRegistry:
                 bounded_result["error"] = "Tool error result exceeded the size limit."
             return bounded_result
         return safe_result
+
+
+def provider_safe_tool_name(internal_name: str) -> str:
+    """Normalize one internal identity for provider function-name constraints."""
+    if not isinstance(internal_name, str) or not internal_name.strip():
+        raise ValueError("Tool name must be a non-empty string.")
+    model_name = re.sub(r"[^a-zA-Z0-9_-]", "_", internal_name)
+    if not PROVIDER_TOOL_NAME_PATTERN.fullmatch(model_name):
+        raise ValueError(
+            f"Tool name cannot be converted to a provider-safe name: {internal_name!r}"
+        )
+    return model_name
 
 
 def _redact_sensitive_result_values(value: Any) -> Any:

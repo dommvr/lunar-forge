@@ -95,7 +95,8 @@ class RestrictedToolRegistry:
                 read_only=read_only,
                 allow_execute=allow_execute,
             )
-            if _schema_tool_name(schema) in allowed_names
+            if self._registry.internal_name_for(_schema_tool_name(schema) or "")
+            in allowed_names
         ]
 
     def execute(
@@ -103,7 +104,8 @@ class RestrictedToolRegistry:
         name: str,
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
-        if not self.role.allows(name):
+        internal_name = self.internal_name_for(name)
+        if internal_name is None or not self.role.allows(internal_name):
             return {
                 "ok": False,
                 "error": (
@@ -114,6 +116,14 @@ class RestrictedToolRegistry:
                 "blocked_by_subagent": True,
             }
         return self._registry.execute(name, arguments)
+
+    def model_name_for(self, internal_name: str) -> str:
+        """Return the provider-safe alias from the underlying registry."""
+        return self._registry.model_name_for(internal_name)
+
+    def internal_name_for(self, name: str) -> str | None:
+        """Resolve a model-facing alias without weakening the role allowlist."""
+        return self._registry.internal_name_for(name)
 
     def set_permission_manager(self, permission_manager: PermissionManager) -> None:
         """Delegate policy updates without creating a second permission path."""

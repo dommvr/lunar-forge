@@ -98,6 +98,7 @@ class CodeAgent:
             )
         _log_session(session, "user_prompt", prompt=request)
 
+        mcp_client: MCPClient | None = None
         try:
             if self.max_steps < 1:
                 raise ValueError("max_steps must be at least 1.")
@@ -112,6 +113,7 @@ class CodeAgent:
                 MCPClient(
                     load_mcp_config(root),
                     transport_factory=self.mcp_transport_factory,
+                    project_root=root,
                 )
                 if self.config.mcp.enabled
                 else None
@@ -249,12 +251,17 @@ class CodeAgent:
                         call_ids,
                         strict=True,
                     ):
+                        internal_tool_name = (
+                            tools.internal_name_for(tool_call.name) or tool_call.name
+                        )
                         _log_session(
                             session,
                             "tool_call",
                             step=step,
                             id=call_id,
-                            name=tool_call.name,
+                            name=internal_tool_name,
+                            model_tool_name=tool_call.name,
+                            internal_tool_name=internal_tool_name,
                             arguments=tool_call.arguments,
                         )
                         result = tools.execute(tool_call.name, tool_call.arguments)
@@ -263,7 +270,9 @@ class CodeAgent:
                             "tool_result",
                             step=step,
                             id=call_id,
-                            name=tool_call.name,
+                            name=internal_tool_name,
+                            model_tool_name=tool_call.name,
+                            internal_tool_name=internal_tool_name,
                             result=result,
                         )
                         if result.get("permission_denied") is True:
@@ -272,7 +281,9 @@ class CodeAgent:
                                 "permission_denial",
                                 step=step,
                                 id=call_id,
-                                name=tool_call.name,
+                                name=internal_tool_name,
+                                model_tool_name=tool_call.name,
+                                internal_tool_name=internal_tool_name,
                                 reason=result.get("error", "Permission denied."),
                             )
                         elif result.get("ok") is False:
@@ -281,7 +292,9 @@ class CodeAgent:
                                 "error",
                                 source="tool",
                                 step=step,
-                                name=tool_call.name,
+                                name=internal_tool_name,
+                                model_tool_name=tool_call.name,
+                                internal_tool_name=internal_tool_name,
                                 message=result.get("error", "Tool execution failed."),
                             )
                         messages.append(
@@ -309,6 +322,9 @@ class CodeAgent:
                 message=str(exc),
             )
             raise
+        finally:
+            if mcp_client is not None:
+                mcp_client.close()
 
     def _run_subagent_workflow(
         self,
@@ -468,13 +484,18 @@ def _run_subagent_model_loop(
                 call_ids,
                 strict=True,
             ):
+                internal_tool_name = (
+                    tools.internal_name_for(tool_call.name) or tool_call.name
+                )
                 _log_session(
                     session,
                     "tool_call",
                     step=step,
                     subagent=role.name,
                     id=call_id,
-                    name=tool_call.name,
+                    name=internal_tool_name,
+                    model_tool_name=tool_call.name,
+                    internal_tool_name=internal_tool_name,
                     arguments=tool_call.arguments,
                 )
                 result = tools.execute(tool_call.name, tool_call.arguments)
@@ -484,7 +505,9 @@ def _run_subagent_model_loop(
                     step=step,
                     subagent=role.name,
                     id=call_id,
-                    name=tool_call.name,
+                    name=internal_tool_name,
+                    model_tool_name=tool_call.name,
+                    internal_tool_name=internal_tool_name,
                     result=result,
                 )
                 if result.get("permission_denied") is True:
@@ -494,7 +517,9 @@ def _run_subagent_model_loop(
                         step=step,
                         subagent=role.name,
                         id=call_id,
-                        name=tool_call.name,
+                        name=internal_tool_name,
+                        model_tool_name=tool_call.name,
+                        internal_tool_name=internal_tool_name,
                         reason=result.get("error", "Permission denied."),
                     )
                 elif result.get("ok") is False:
@@ -504,10 +529,12 @@ def _run_subagent_model_loop(
                         source="tool",
                         step=step,
                         subagent=role.name,
-                        name=tool_call.name,
+                        name=internal_tool_name,
+                        model_tool_name=tool_call.name,
+                        internal_tool_name=internal_tool_name,
                         message=result.get("error", "Tool execution failed."),
                     )
-                changed_path = _changed_path(tool_call.name, result)
+                changed_path = _changed_path(internal_tool_name, result)
                 if changed_path and changed_path not in changed_files:
                     changed_files.append(changed_path)
                 messages.append(

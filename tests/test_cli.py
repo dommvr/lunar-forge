@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 import lunar_forge.cli as cli_module
 from lunar_forge.cli import app
 from lunar_forge.config import AppConfig
+from lunar_forge.config import MCPRuntimeConfig
 from lunar_forge.runtime.checkpoints import create_file_checkpoint
 
 
@@ -318,4 +319,66 @@ def test_browser_validate_command_accepts_full_page_and_viewport(
         "width": 1440,
         "height": 1200,
         "project_root": tmp_path.resolve(),
+    }
+
+
+def test_mcp_list_command_is_model_free_and_returns_diagnostics(
+    monkeypatch,
+    tmp_path,
+):
+    def unexpected_model(*args, **kwargs):
+        raise AssertionError("MCP diagnostics must not use model APIs")
+
+    captured = {}
+    monkeypatch.setattr(cli_module, "run_agent", unexpected_model)
+    monkeypatch.setattr(
+        cli_module,
+        "load_config",
+        lambda project_root: AppConfig(mcp=MCPRuntimeConfig(enabled=True)),
+    )
+
+    def fake_diagnostic(project_root, *, globally_enabled):
+        captured.update(
+            project_root=project_root,
+            globally_enabled=globally_enabled,
+        )
+        return {
+            "ok": True,
+            "status": "passed",
+            "mcp_enabled": True,
+            "config_files": [
+                {
+                    "scope": "project",
+                    "path": str(tmp_path / ".agent/mcp.yaml"),
+                    "loaded": True,
+                }
+            ],
+            "enabled_servers": ["playwright"],
+            "disabled_servers": [],
+            "discovered_tools": [
+                {
+                    "server": "playwright",
+                    "name": "mcp.playwright.browser_navigate",
+                    "read_only": False,
+                }
+            ],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cli_module, "build_mcp_diagnostic", fake_diagnostic)
+
+    result = CliRunner().invoke(
+        app,
+        ["mcp", "list", "--project", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    output = json.loads(result.stdout)
+    assert output["enabled_servers"] == ["playwright"]
+    assert output["discovered_tools"][0]["name"] == (
+        "mcp.playwright.browser_navigate"
+    )
+    assert captured == {
+        "project_root": tmp_path.resolve(),
+        "globally_enabled": True,
     }

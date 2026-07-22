@@ -123,30 +123,62 @@ LunarForge reports a clear upgrade-or-use-chat error.
 MCP support is experimental and disabled by default. It uses two explicit
 opt-ins: set `mcp.enabled: true` in `.agent/config.yaml` (or user config), then
 enable each server separately in `.agent/mcp.yaml` or
-`~/.lunar-forge/mcp.yaml`:
+`~/.lunar-forge/mcp.yaml`. Enabled local servers are launched as stdio
+subprocesses with `shell=False`; their executable is resolved with the same
+PATH/PATHEXT handling used by local commands.
+
+On Windows, a Playwright MCP configuration can use:
+
+`.agent/config.yaml`:
+
+```yaml
+mcp:
+  enabled: true
+```
+
+`.agent/mcp.yaml`:
 
 ```yaml
 servers:
-  github:
-    command: github-mcp-server
-    args: [--stdio]
-    env:
-      GITHUB_TOKEN: ${GITHUB_TOKEN}
+  playwright:
+    command: npx.cmd
+    args:
+      - -y
+      - "@playwright/mcp@latest"
+      - "--isolated"
     enabled: true
 ```
 
 Raw credentials are rejected; `env` values name environment variables using
 `${NAME}` references. Discovered tools are namespaced, such as
-`mcp.github.create_issue`, and every MCP call passes through the normal approval
-system. Plan mode exposes only tools carrying the standard MCP
+`mcp.playwright.browser_navigate`, and every MCP call passes through the normal
+approval system. Plan mode exposes only tools carrying the standard MCP
 `annotations.readOnlyHint: true`, and those read-only external calls still
 require approval.
 
-This phase integrates an injectable MCP transport with the agent registry but
-does not bundle a production stdio or network transport. Embedders and tests can
-supply a transport factory; enabling a configured server in the standalone CLI
-without one reports that no transport is configured rather than launching an
-external process implicitly.
+Names shown by MCP diagnostics remain the dotted internal identities. Tool
+schemas sent to model providers use safe aliases instead—for example,
+`mcp.playwright.browser_navigate` becomes
+`mcp_playwright_browser_navigate`. Returned model calls are resolved back to
+the internal identity before permission checks and MCP routing.
+
+Inspect configuration and perform bounded startup/tool discovery without a
+model or API key:
+
+```powershell
+lunar-forge mcp list --project C:\path\to\project
+```
+
+The diagnostic prints loaded config files, globally and individually enabled
+state, disabled servers, namespaced discovered tools, and bounded startup or
+discovery errors. Running it starts servers only when both opt-ins are enabled.
+An `npx -y` server may download its configured package, so review MCP config
+before running discovery. Server stderr is drained but never placed in model
+context or diagnostic output, and configured environment values are resolved
+only for the child process. Servers inherit a small operational environment
+(such as PATH, temporary-directory, and platform runtime variables) plus the
+variables explicitly mapped in `env`; unrelated model/API credentials are not
+forwarded automatically.
 
 ### Experimental local plugins
 
@@ -193,6 +225,11 @@ access are always permission-gated. All plugin tools are omitted from plan mode
 because in-process code cannot enforce a manifest's read-only claim. Plugin
 arguments, results, and exceptions are contained and bounded before entering
 model context.
+
+Plugin diagnostics and permission requests use the manifest's dotted internal
+name, such as `example.echo`. Model providers see its safe alias,
+`example_echo`; model calls using that alias are resolved back to
+`example.echo` before approval and execution.
 
 Plugin capability declarations are a trust contract, not an operating-system
 sandbox. Enable only code you have reviewed. The loader intentionally supports
@@ -455,8 +492,9 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
 - The new-project workflow intentionally supports six focused starters.
 - Subagents are role-specific model calls in a fixed sequence, not independent
   processes or autonomous collaborators.
-- MCP has no bundled production transport yet; configured servers are not
-  launched implicitly.
+- MCP currently supports local stdio servers only. Streamable HTTP, server
+  sampling/elicitation requests, dynamic tool-list refresh, and OS-level server
+  sandboxing are not implemented.
 - Browser validation requires the optional Playwright extra and a separately
   started local server.
 - Plugins run reviewed local Python in-process after approval. Capability

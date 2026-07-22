@@ -12,6 +12,7 @@ from typer.core import TyperGroup
 
 from lunar_forge.agent import run_agent
 from lunar_forge.config import load_config
+from lunar_forge.mcp.client import build_mcp_diagnostic
 from lunar_forge.runtime.checkpoints import (
     list_checkpoint_directories,
     rollback_file,
@@ -46,6 +47,7 @@ class DefaultCommandGroup(TyperGroup):
             "sessions",
             "resume",
             "browser-validate",
+            "mcp",
             "--help",
             "-h",
         }
@@ -59,6 +61,11 @@ app = typer.Typer(
     cls=DefaultCommandGroup,
     help="A small, local coding-agent CLI.",
 )
+mcp_app = typer.Typer(
+    add_completion=False,
+    help="Inspect explicitly configured local MCP servers.",
+)
+app.add_typer(mcp_app, name="mcp")
 
 
 @app.command()
@@ -179,6 +186,38 @@ def browser_validate_command(
         )
     )
     if output.get("ok") is not True:
+        raise typer.Exit(code=1)
+
+
+@mcp_app.command("list")
+def mcp_list_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """Start enabled MCP servers and report bounded tool discovery details."""
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        result = build_mcp_diagnostic(
+            project_root,
+            globally_enabled=config.mcp.enabled,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if result.get("ok") is not True:
         raise typer.Exit(code=1)
 
 

@@ -6,7 +6,12 @@ import pytest
 import lunar_forge.mcp.config as mcp_config_module
 from lunar_forge.agent import CodeAgent
 from lunar_forge.config import AppConfig, MCPRuntimeConfig
-from lunar_forge.mcp.client import MAX_OUTPUT_CHARACTERS, MCPClient
+from lunar_forge.mcp.client import (
+    MAX_DISCOVERED_TOOLS,
+    MAX_OUTPUT_CHARACTERS,
+    MCPClient,
+    MCPClientError,
+)
 from lunar_forge.mcp.config import MCPConfig, MCPServerConfig
 from lunar_forge.mcp.registry import namespace_mcp_tool, register_mcp_tools
 from lunar_forge.model_clients import ModelResponse, ToolCall
@@ -104,7 +109,10 @@ def test_mocked_schema_registers_as_namespaced_registry_tool():
     assert tool.name == "mcp.github.create_issue"
     assert tool.parameters["required"] == ["title"]
     assert tool.permission is PermissionLevel.EXECUTE
-    assert registry.schemas()[0]["function"]["name"] == "mcp.github.create_issue"
+    assert registry.names() == ("mcp.github.create_issue",)
+    assert registry.schemas()[0]["function"]["name"] == (
+        "mcp_github_create_issue"
+    )
 
 
 def test_integrated_registry_preserves_builtins_and_adds_mcp_tools(tmp_path):
@@ -152,8 +160,8 @@ def test_namespaced_calls_route_to_the_matching_server_client(tmp_path):
         mcp_client=MCPClient(config, lambda server: transports[server.name]),
     )
 
-    github_result = registry.execute("mcp.github.search", {"query": "one"})
-    notes_result = registry.execute("mcp.notes.search", {"query": "two"})
+    github_result = registry.execute("mcp_github_search", {"query": "one"})
+    notes_result = registry.execute("mcp_notes_search", {"query": "two"})
 
     assert github_result["result"] == {"source": "github"}
     assert notes_result["result"] == {"source": "notes"}
@@ -182,7 +190,7 @@ def test_plan_registry_includes_only_explicitly_read_only_mcp_tools(tmp_path):
     assert read_tool.plan_safe is True
 
     result = registry.execute(
-        "mcp.github.search_issues",
+        "mcp_github_search_issues",
         {"query": "is:open"},
     )
 
@@ -209,6 +217,8 @@ servers:
         encoding="utf-8",
     )
     transport = FakeTransport(_github_tools())
+    transport.closed = False
+    transport.close = lambda: setattr(transport, "closed", True)
     model = SequenceModel(
         (
             ModelResponse(
@@ -216,7 +226,7 @@ servers:
                 tool_calls=(
                     ToolCall(
                         id="mcp-call",
-                        name="mcp.github.create_issue",
+                        name="mcp_github_create_issue",
                         arguments={"title": "Integrated"},
                     ),
                 ),
@@ -237,9 +247,26 @@ servers:
         schema["function"]["name"] for schema in model.tool_schemas[0]
     }
     assert "read_file" in first_schema_names
-    assert "mcp.github.create_issue" in first_schema_names
+    assert "mcp_github_create_issue" in first_schema_names
+    assert all("." not in name for name in first_schema_names)
     assert transport.calls == [("create_issue", {"title": "Integrated"})]
+    assert transport.closed is True
     assert output.startswith("Issue created.")
+
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [
+        json.loads(line)
+        for line in session_file.read_text(encoding="utf-8").splitlines()
+    ]
+    tool_call_event = next(
+        event for event in events if event["event"] == "tool_call"
+    )
+    assert tool_call_event["data"]["model_tool_name"] == (
+        "mcp_github_create_issue"
+    )
+    assert tool_call_event["data"]["internal_tool_name"] == (
+        "mcp.github.create_issue"
+    )
 
 
 def test_agent_does_not_discover_mcp_when_global_switch_is_disabled(tmp_path):
@@ -265,7 +292,7 @@ servers:
     ).run("Explain the project", tmp_path, mode="plan")
 
     schema_names = {schema["function"]["name"] for schema in model.tool_schemas[0]}
-    assert not any(name.startswith("mcp.") for name in schema_names)
+    assert not any(name.startswith("mcp_") for name in schema_names)
     assert output.startswith("No MCP used.")
 
 
@@ -303,7 +330,7 @@ def test_approved_mcp_call_reaches_mock_transport():
     register_mcp_tools(registry, client)
 
     result = registry.execute(
-        "mcp.github.create_issue",
+        "mcp_github_create_issue",
         {"title": "Approved"},
     )
 
@@ -471,8 +498,44 @@ def test_invalid_namespace_parts_are_rejected(server_name, tool_name):
         namespace_mcp_tool(server_name, tool_name)
 
 
-def test_no_transport_does_not_launch_external_server():
-    client = MCPClient(_config(enabled=True))
+def test_client_closes_created_mock_transport():
+    transport = FakeTransport(_github_tools())
+    transport.closed = False
+    transport.close = lambda: setattr(transport, "closed", True)
+    client = MCPClient(_config(enabled=True), lambda server: transport)
 
-    with pytest.raises(RuntimeError, match="not launched"):
-        client.discover_tools("github")
+    client.discover_tools("github")
+    client.close()
+
+    assert transport.closed is True
+
+
+def test_registry_bounds_total_tools_across_enabled_servers():
+    tools_per_server = (MAX_DISCOVERED_TOOLS // 2) + 1
+    transports = {
+        server_name: FakeTransport(
+            [
+                {
+                    "name": f"tool_{index}",
+                    "inputSchema": {"type": "object"},
+                }
+                for index in range(tools_per_server)
+            ]
+        )
+        for server_name in ("one", "two")
+    }
+    config = MCPConfig(
+        servers={
+            name: MCPServerConfig(name=name, command="mock", enabled=True)
+            for name in transports
+        }
+    )
+    registry = ToolRegistry()
+
+    with pytest.raises(MCPClientError, match="too many tools"):
+        register_mcp_tools(
+            registry,
+            MCPClient(config, lambda server: transports[server.name]),
+        )
+
+    assert registry.names() == ()
