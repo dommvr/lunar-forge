@@ -18,9 +18,11 @@ REVIEWER_ROLE = SubagentRole(
         "findings with file references, and do not modify project state. Prioritize "
         "correctness and maintainability over stylistic preferences. Validation "
         "status belongs to tester and tool results. In parallel mode the tester may "
-        "still be running, so never infer that browser validation did not run from "
-        "this role's read-only tool restrictions. You may say that the reviewer did "
-        "not personally run it and defer to the authoritative validation summary."
+        "still be running. Do not make global browser-validation status claims or "
+        "claims about whether screenshots, console errors, failed requests, page "
+        "titles, or final URLs were captured or inspected. Do not report this role's "
+        "browser tool limitations. Focus on code-review findings and defer browser "
+        "status silently to the authoritative validation summary."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

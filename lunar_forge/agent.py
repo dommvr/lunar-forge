@@ -56,6 +56,26 @@ MAX_TOOL_RESULT_CHARACTERS = 20_000
 MAX_FINAL_OUTPUT_CHARACTERS = 50_000
 MAX_SUBAGENT_ERROR_CHARACTERS = 500
 MAX_BROWSER_VALIDATION_RECORDS = 20
+FINAL_SUMMARY_SECTION_NAMES = frozenset(
+    {
+        "changed files",
+        "validation",
+        "browser validation",
+        "commands run",
+        "checkpoints",
+        "subagents run",
+        "parallel subagent groups",
+        "session log",
+    }
+)
+APPLICATION_OWNED_SUMMARY_SECTIONS = frozenset(
+    {
+        "browser validation",
+        "subagents run",
+        "parallel subagent groups",
+        "session log",
+    }
+)
 
 
 class AgentError(RuntimeError):
@@ -1424,10 +1444,26 @@ def _finalize_validation_summary(
         return final_text
 
     if reviewer_advisory:
-        final_text = _reviewer_advisory_text(final_text)
-        final_text = f"Reviewer findings (advisory):\n{final_text}"
+        browser_passed = any(
+            record.ran and record.ok for record in evidence.browser_validations
+        )
+        final_text = _reviewer_advisory_text(
+            final_text,
+            browser_passed=browser_passed,
+        )
+        summary_text, advisory_text = _partition_reviewer_output(final_text)
+        final_blocks: list[str] = []
+        if advisory_text:
+            final_blocks.append(
+                f"Reviewer findings (advisory):\n{advisory_text}"
+            )
+        if summary_text:
+            final_blocks.append(summary_text)
+        final_text = "\n\n".join(final_blocks)
 
-    lines = [final_text, "", "Browser validation:"]
+    lines = ["Browser validation:"]
+    if final_text:
+        lines[:0] = [final_text, ""]
     if not evidence.browser_validations:
         if mode == "plan":
             reason = "plan mode; browser and managed-server execution is disabled"
@@ -1475,8 +1511,12 @@ def _finalize_validation_summary(
     return "\n".join(lines)
 
 
-def _reviewer_advisory_text(text: str) -> str:
-    """Keep reviewer findings while making role-local browser limits explicit."""
+def _reviewer_advisory_text(
+    text: str,
+    *,
+    browser_passed: bool,
+) -> str:
+    """Remove role-local browser status claims from the displayed review."""
     conflict = re.compile(
         r"(?i)(?:browser(?:/ui)? validation.*(?:did not run|unavailable)|"
         r"active reviewer role.*(?:no permission|cannot|can't).*browser|"
@@ -1485,6 +1525,8 @@ def _reviewer_advisory_text(text: str) -> str:
     lines: list[str] = []
     inserted_note = False
     for line in text.splitlines():
+        if browser_passed and _is_reviewer_browser_status_claim(line, conflict):
+            continue
         if conflict.search(line):
             if not inserted_note:
                 lines.append(
@@ -1494,7 +1536,121 @@ def _reviewer_advisory_text(text: str) -> str:
                 inserted_note = True
             continue
         lines.append(line)
+    if browser_passed:
+        lines = _remove_empty_reviewer_headings(lines)
     return "\n".join(lines).strip()
+
+
+def _is_reviewer_browser_status_claim(
+    line: str,
+    conflict: re.Pattern[str],
+) -> bool:
+    statement = line.strip().lstrip("-* ").strip()
+    if not statement:
+        return False
+    if conflict.search(statement):
+        return True
+
+    subject = (
+        r"(?:browser(?:/ui)? validation|browser (?:check|inspection|test)|"
+        r"full[- ]page screenshot|screenshot|console errors?|failed requests?|"
+        r"page title|final url)"
+    )
+    if re.search(rf"(?i)^(?:a |an |the )?no {subject}\b", statement):
+        return True
+    if re.search(
+        rf"(?i)^(?:a |an |the )?{subject}\b.*(?:"
+        r"did not|was not|were not|is not|are not|has not|have not|"
+        r"wasn't|weren't|isn't|aren't|could not|couldn't|unavailable|"
+        r"unknown|missing|not captured|not inspected|not checked|"
+        r"not reported|passed|failed|absent)",
+        statement,
+    ):
+        return True
+    return bool(
+        re.search(
+            rf"(?i)(?:did not|could not|couldn't|was unable to|no permission to)"
+            rf".*\b{subject}\b",
+            statement,
+        )
+    )
+
+
+def _remove_empty_reviewer_headings(lines: Sequence[str]) -> list[str]:
+    headings = {
+        "validation:",
+        "browser validation:",
+        "findings:",
+        "review findings:",
+        "reviewer findings:",
+        "reviewer findings (advisory):",
+    }
+    cleaned: list[str] = []
+    for index, line in enumerate(lines):
+        normalized = line.strip().lstrip("#").strip().lower()
+        if normalized not in headings:
+            cleaned.append(line)
+            continue
+        following = next(
+            (candidate.strip() for candidate in lines[index + 1 :] if candidate.strip()),
+            "",
+        )
+        if following and not following.endswith(":"):
+            cleaned.append(line)
+    return cleaned
+
+
+def _partition_reviewer_output(text: str) -> tuple[str, str]:
+    """Separate normal final-summary sections from reviewer findings."""
+    summary_lines: list[str] = []
+    advisory_lines: list[str] = []
+    destination = advisory_lines
+    suppress_section = False
+
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading in FINAL_SUMMARY_SECTION_NAMES:
+            destination = summary_lines
+            suppress_section = heading in APPLICATION_OWNED_SUMMARY_SECTIONS
+        elif heading is not None:
+            destination = advisory_lines
+            suppress_section = False
+
+        if not suppress_section:
+            destination.append(line)
+
+    return (
+        _clean_reviewer_block(summary_lines),
+        _clean_reviewer_block(advisory_lines),
+    )
+
+
+def _reviewer_section_heading(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    markdown_heading = stripped.startswith("#")
+    candidate = stripped.lstrip("#").strip().strip("*_` ")
+    candidate_lower = candidate.lower()
+    for section_name in FINAL_SUMMARY_SECTION_NAMES:
+        if candidate_lower == section_name or candidate_lower.startswith(
+            f"{section_name}:"
+        ):
+            return section_name
+    normalized = candidate.removesuffix(":").strip().lower()
+    if markdown_heading or candidate.endswith(":"):
+        return normalized
+    return None
+
+
+def _clean_reviewer_block(lines: Sequence[str]) -> str:
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end]).strip()
 
 
 def _truncate_final_output(text: str) -> str:

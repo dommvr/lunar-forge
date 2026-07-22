@@ -578,8 +578,15 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
     assert started == ["planner", "coder", "tester", "reviewer"]
 
 
-@pytest.mark.parametrize("parallel", (False, True))
-def test_browser_success_is_authoritative_over_reviewer_text(tmp_path, parallel):
+@pytest.mark.parametrize(
+    ("parallel", "include_reviewer_finding"),
+    ((False, True), (True, True), (False, False)),
+)
+def test_browser_success_is_authoritative_over_reviewer_text(
+    tmp_path,
+    parallel,
+    include_reviewer_finding,
+):
     (tmp_path / "package.json").write_text(
         json.dumps(
             {
@@ -670,9 +677,21 @@ def test_browser_success_is_authoritative_over_reviewer_text(tmp_path, parallel)
                     )
                 return ModelResponse(text="Browser validation completed.")
             if role == "reviewer":
+                findings = (
+                    "Findings:\n"
+                    "- app.jsx still has an unrelated maintainability issue.\n\n"
+                    if include_reviewer_finding
+                    else ""
+                )
                 return ModelResponse(
                     text=(
-                        "Validation:\n- Browser validation did not run; the active "
+                        f"{findings}"
+                        "Changed files:\n"
+                        "- None.\n\n"
+                        "Validation:\n"
+                        "- No full-page screenshot was captured.\n"
+                        "- Console errors were not inspected.\n"
+                        "- Browser validation did not run; the active "
                         "reviewer role has no permission to start the dev server or "
                         "run managed browser validation."
                     )
@@ -701,9 +720,19 @@ def test_browser_success_is_authoritative_over_reviewer_text(tmp_path, parallel)
     assert approvals[0].tool_name == "run_managed_browser_validation"
     assert "Browser validation did not run" not in output
     assert "active reviewer role has no permission" not in output
-    assert "Reviewer findings (advisory):" in output
-    assert "this role did not personally run browser validation" in output
+    assert "No full-page screenshot was captured" not in output
+    assert "Console errors were not inspected" not in output
+    if include_reviewer_finding:
+        assert "Reviewer findings (advisory):" in output
+        assert "app.jsx still has an unrelated maintainability issue" in output
+    else:
+        assert "Reviewer findings (advisory):" not in output
+        assert "\nFindings:\n" not in output
+    assert "Changed files:\n- None." in output
+    assert "Reviewer findings (advisory):\nChanged files:" not in output
+    assert "Reviewer role note" not in output
     assert "Browser validation:" in output
+    assert output.count("Browser validation:") == 1
     assert "run_managed_browser_validation: passed" in output
     assert "authoritative tool result" in output
     assert "Final URL: http://localhost:5173" in output
@@ -712,11 +741,18 @@ def test_browser_success_is_authoritative_over_reviewer_text(tmp_path, parallel)
     assert "Console errors: 1" in output
     assert "Failed requests: 0" in output
     assert "Full-page screenshot: yes" in output
-    assert output.index("Reviewer findings (advisory):") < output.index(
-        "Browser validation:"
-    )
+    if include_reviewer_finding:
+        assert output.index("Reviewer findings (advisory):") < output.index(
+            "Browser validation:"
+        )
     if parallel:
         assert "Parallel subagent groups:\n- post-edit: tester, reviewer" in output
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    raw_session = session_file.read_text(encoding="utf-8")
+    assert "No full-page screenshot was captured" in raw_session
+    # Session redaction may replace the word "Console", but the raw role
+    # statement remains logged rather than being rewritten by final-display cleanup.
+    assert "errors were not inspected" in raw_session
 
 
 def test_browser_intent_plan_mode_does_not_start_server(tmp_path):
@@ -890,7 +926,8 @@ def test_reviewer_prompt_defers_to_tester_browser_results():
     prompt = REVIEWER_ROLE.system_prompt_fragment
 
     assert "Validation status belongs to tester and tool results" in prompt
-    assert "never infer that browser validation did not run" in prompt
+    assert "Do not make global browser-validation status claims" in prompt
+    assert "Do not report this role's browser tool limitations" in prompt
 
 
 def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path):

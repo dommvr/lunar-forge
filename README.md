@@ -540,7 +540,10 @@ project validation. Final browser status comes from the structured Tester/tool
 result, not Reviewer prose. The authoritative section reports status, final URL,
 page title, screenshot path, console-error and failed-request counts, and whether
 full-page mode was used; Reviewer findings remain advisory in both sequential
-and parallel subagent modes.
+and parallel subagent modes. When browser validation passes, reviewer claims
+about missing screenshots or uninspected browser output are omitted from the
+displayed summary, while unrelated code-review findings remain visible. Raw role
+outputs remain available in the project-confined session log.
 
 For deterministic validation without a model or API key, run:
 
@@ -684,7 +687,8 @@ start processes.
 
   Confirm the final Browser validation section says `passed` and includes the
   URL, title, screenshot path, both error counts, and `Full-page screenshot: yes`.
-  It must not also claim that browser validation did not run.
+  It must not also claim that browser validation did not run, no screenshot was
+  captured, or console errors were not inspected.
 
 - [ ] Enable parallel subagents with either configuration or the CLI flag (both
   are not required), run a disposable change, and confirm the final report lists
