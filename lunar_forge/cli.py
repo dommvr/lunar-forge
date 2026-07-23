@@ -18,6 +18,12 @@ from lunar_forge.runtime.checkpoints import (
     list_checkpoint_directories,
     rollback_file,
 )
+from lunar_forge.runtime.git import (
+    create_git_commit,
+    format_git_commit_result,
+    format_git_status,
+    git_status,
+)
 from lunar_forge.runtime.sessions import (
     format_session_summary,
     list_session_files,
@@ -53,6 +59,7 @@ class DefaultCommandGroup(TyperGroup):
             "resume",
             "browser-setup",
             "browser-validate",
+            "git",
             "mcp",
             "plugins",
             "--help",
@@ -78,6 +85,11 @@ plugins_app = typer.Typer(
     help="Inspect explicitly configured local plugins without loading code.",
 )
 app.add_typer(plugins_app, name="plugins")
+git_app = typer.Typer(
+    add_completion=False,
+    help="Inspect status or create an explicitly approved Git commit.",
+)
+app.add_typer(git_app, name="git")
 
 
 @app.command()
@@ -116,6 +128,20 @@ def run(
             help="Enable safe concurrent read-only specialist phases.",
         ),
     ] = False,
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            help="Offer an approved Git commit after successful work.",
+        ),
+    ] = False,
+    commit_message: Annotated[
+        str | None,
+        typer.Option(
+            "--commit-message",
+            help="Commit message used with --commit; otherwise derived from the task.",
+        ),
+    ] = None,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
@@ -128,6 +154,8 @@ def run(
     )
 
     try:
+        if commit_message is not None and not commit:
+            raise ValueError("--commit-message requires --commit.")
         config = load_config(project_root, cli_overrides=cli_overrides)
         _validate_network_flag(allow_network, config.runtime.mode)
         response = run_agent(
@@ -135,12 +163,73 @@ def run(
             project_root,
             config=config,
             mode=config.permissions.mode,
+            offer_commit=commit,
+            commit_message=commit_message,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
     typer.echo(response)
+
+
+@git_app.command("status")
+def git_status_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """Show bounded repository-wide ``git status --short`` output."""
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        result = git_status(
+            project_root,
+            mode=_git_execution_mode(
+                config.permissions.mode,
+                config.runtime.mode,
+            ),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_git_status(result))
+    if result.get("ok") is not True:
+        raise typer.Exit(code=1)
+
+
+@git_app.command("commit")
+def git_commit_command(
+    message: Annotated[
+        str,
+        typer.Option("--message", "-m", help="Concise Git commit message."),
+    ],
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+) -> None:
+    """Preview and create one explicitly approved path-limited commit."""
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        result = create_git_commit(
+            project_root,
+            message,
+            mode=_git_execution_mode(
+                config.permissions.mode,
+                config.runtime.mode,
+            ),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_git_commit_result(result))
+    if result.get("ok") is not True:
+        raise typer.Exit(code=1)
 
 
 @app.command("browser-setup")
@@ -628,6 +717,12 @@ def _runtime_overrides(
 def _validate_network_flag(allow_network: bool, runtime_mode: str) -> None:
     if allow_network and runtime_mode != "docker":
         raise ValueError("--allow-network requires Docker runtime mode.")
+
+
+def _git_execution_mode(permission_mode: str, runtime_mode: str) -> str:
+    if runtime_mode.strip().lower() == "no-command":
+        return "no-command"
+    return permission_mode.strip().lower() or "default"
 
 
 def main() -> None:

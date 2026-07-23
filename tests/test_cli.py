@@ -206,6 +206,95 @@ def test_subagents_flag_is_available_and_sets_cli_override():
     }
 
 
+def test_commit_flags_are_available_and_forwarded(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(cli_module, "load_config", lambda *args, **kwargs: AppConfig())
+
+    def fake_run_agent(prompt, project_root, **kwargs):
+        captured.update(prompt=prompt, project_root=project_root, **kwargs)
+        return "Done."
+
+    monkeypatch.setattr(cli_module, "run_agent", fake_run_agent)
+
+    help_result = CliRunner().invoke(app, ["run", "--help"])
+    result = CliRunner().invoke(
+        app,
+        [
+            "--commit",
+            "--commit-message",
+            "Document feature",
+            "Update docs",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert help_result.exit_code == 0
+    assert "--commit" in help_result.stdout
+    assert "--commit-message" in help_result.stdout
+    assert result.exit_code == 0
+    assert captured["offer_commit"] is True
+    assert captured["commit_message"] == "Document feature"
+
+
+def test_git_status_and_commit_commands_format_results(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "load_config", lambda *args, **kwargs: AppConfig())
+    monkeypatch.setattr(
+        cli_module,
+        "git_status",
+        lambda project_root, **kwargs: {
+            "ok": True,
+            "repository_root": str(tmp_path),
+            "status_short": [" M README.md"],
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_git_commit",
+        lambda project_root, message, **kwargs: {
+            "ok": True,
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M README.md"],
+            "diff_summary": "README.md | 1 +",
+            "proposed_files": ["README.md"],
+            "unrelated_files": [],
+            "excluded_files": [],
+            "session_scoped": False,
+            "message": "Update docs",
+            "approved": True,
+            "approval_requested": True,
+            "result_code": "commit_created",
+            "commit_hash": "abc123",
+        },
+    )
+    runner = CliRunner()
+
+    status_result = runner.invoke(
+        app,
+        ["git", "status", "--project", str(tmp_path)],
+    )
+    commit_result = runner.invoke(
+        app,
+        [
+            "git",
+            "commit",
+            "--project",
+            str(tmp_path),
+            "--message",
+            "Update docs",
+        ],
+    )
+
+    assert status_result.exit_code == 0
+    assert "git status --short" in status_result.stdout.lower()
+    assert "README.md" in status_result.stdout
+    assert commit_result.exit_code == 0
+    assert "Files proposed for commit" in commit_result.stdout
+    assert "Proposed commit message: Update docs" in commit_result.stdout
+    assert "- Commit created: abc123" in commit_result.stdout
+
+
 def test_browser_setup_is_model_free_lists_commands_and_uses_approvals(
     monkeypatch,
     tmp_path,

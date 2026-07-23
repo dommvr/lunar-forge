@@ -215,6 +215,11 @@ def requires_approval(
 
 
 def _describe_request(tool_name: str, arguments: Mapping[str, Any]) -> str:
+    if tool_name == "git_commit":
+        preview = arguments.get("preview")
+        if isinstance(preview, str) and preview.strip():
+            return preview.strip()
+        return "Create the proposed Git commit."
     if tool_name in {"run_command", "run_managed_browser_validation"}:
         command = arguments.get("command")
         if isinstance(command, str):

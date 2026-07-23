@@ -46,6 +46,7 @@ command described by the test before answering `y`. Paths beneath
 - [ ] Checkpoints and rollback
 - [ ] Parallel subagents
 - [ ] No-command mode
+- [ ] Guarded Git status and commit
 - [ ] Repository validation after documentation changes
 
 ## 1. Install and CLI availability
@@ -143,7 +144,7 @@ New-Item -ItemType Directory -Force -Path $PlanProject | Out-Null
 **Command**
 
 ```powershell
-lunar-forge --project $PlanProject --plan "Inspect note.txt and plan how to replace alpha with beta. List the file and validation steps, but do not edit anything."
+lunar-forge --project $PlanProject --plan --commit "Inspect note.txt and plan how to replace alpha with beta. List the file and validation steps, but do not edit anything."
 Get-Content -LiteralPath (Join-Path $PlanProject "note.txt")
 Test-Path -LiteralPath (Join-Path $PlanProject ".agent")
 ```
@@ -152,7 +153,8 @@ Test-Path -LiteralPath (Join-Path $PlanProject ".agent")
 
 LunarForge describes the goal, likely changed file, and validation approach.
 `note.txt` still contains `alpha`, the final `Test-Path` prints `False`, and no
-write or command approval prompt appears.
+write or command approval prompt appears. The Git section says plan mode blocks
+the commit, and no Git approval prompt appears.
 
 **Cleanup**
 
@@ -949,6 +951,8 @@ permissions:
 lunar-forge browser-setup --project $NoCommandProject
 $BrowserSetupExitCode = $LASTEXITCODE
 Write-Host "browser-setup exit code: $BrowserSetupExitCode"
+lunar-forge git status --project $NoCommandProject
+lunar-forge git commit --project $NoCommandProject --message "Blocked commit"
 lunar-forge --project $NoCommandProject "Read note.txt and explain whether command execution or validation tools are available. Do not edit files."
 Get-Content -LiteralPath (Join-Path $NoCommandProject "note.txt")
 ```
@@ -957,6 +961,8 @@ Get-Content -LiteralPath (Join-Path $NoCommandProject "note.txt")
 
 `browser-setup` exits with code 1 and clearly reports that no-command mode
 blocks execution; neither install command runs and no approval prompt appears.
+Both Git commands also fail before invoking Git or asking approval and report
+that no-command mode blocks Git execution.
 The agent can still read and quote `note.txt`, reports command-backed validation
 as unavailable, and leaves the file unchanged.
 
@@ -964,6 +970,91 @@ as unavailable, and leaves the file unchanged.
 
 ```powershell
 Remove-Item -Recurse -Force -LiteralPath $NoCommandProject
+```
+
+## 21. Guarded Git status and commit
+
+**Purpose**
+
+Confirm deterministic status, mandatory commit approval, current-session file
+preference, unrelated dirty-file separation, generated/runtime exclusion,
+stable final Git summaries, session logging, and commit-hash reporting.
+
+**Setup**
+
+This test requires Git and a configured model. It creates an isolated repository
+with local-only identity settings.
+
+```powershell
+$GitProject = Join-Path $ManualRoot "git-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $GitProject ".agent") | Out-Null
+Push-Location $GitProject
+git init
+git config user.name "LunarForge Manual Test"
+git config user.email "lunar-forge@example.invalid"
+"original" | Set-Content -LiteralPath note.txt -Encoding utf8
+git add note.txt
+git commit -m "Create baseline"
+"unrelated" | Set-Content -LiteralPath unrelated.txt -Encoding utf8
+@'
+permissions:
+  mode: yes
+'@ | Set-Content -LiteralPath .agent\config.yaml -Encoding utf8
+Pop-Location
+```
+
+**Command**
+
+```powershell
+lunar-forge git status --project $GitProject
+lunar-forge --project $GitProject --commit --commit-message "Update note" "Use read_file_with_line_numbers, then replace_lines to replace line 1 of note.txt with updated. Do not run commands."
+Push-Location $GitProject
+git log -1 --format="%H %s"
+git status --short
+Pop-Location
+lunar-forge git commit --project $GitProject --message "Add unrelated fixture"
+```
+
+Approve the file edit, then approve the agent-offered Git commit. For the final
+deterministic command, review its proposal and approve only after confirming it
+contains `unrelated.txt` and still excludes `.agent/`.
+
+Repeat the agent command with a fresh edit and deny only the Git approval to
+verify the files remain uncommitted. Also run `--commit` on a read-only task that
+makes no file changes; it should not display a Git approval prompt.
+
+**Expected result**
+
+Initial status shows `unrelated.txt` and `.agent` runtime files. The agent commit
+preview shows bounded status and diff output, labels only `note.txt` as changed
+by LunarForge and proposed for commit, lists `unrelated.txt` as not included,
+lists `.agent` browser artifacts, sessions, and checkpoints under excluded
+files, and shows `Proposed commit message: Update note`. Approval is required
+despite `permissions.mode: yes`. An approved run ends with:
+
+```text
+Git:
+- Commit created: <hash>
+```
+
+The result and `git log` show the `Update note` commit hash. `unrelated.txt`
+remains dirty afterward. A denied run ends with `Commit not created: approval
+denied` and leaves the proposed files uncommitted. A run with no LunarForge file
+changes ends with `Commit not created: no changes` without asking approval. The
+explicit deterministic commit then proposes and commits `unrelated.txt`, still
+excludes `.agent`, requires another approval, and returns its hash.
+
+The session JSONL contains `git_status_summary`, `git_commit_proposal`,
+`git_commit_approval`, `git_commit_result`, and, for an approved commit,
+`git_commit_created` events. A separate run with a failed `run_validation`
+result and only the `--commit` flag ends with `Commit not created: validation
+failed`. Merely mentioning a commit in the prompt does not override this guard;
+the prompt must explicitly say something like `commit even if validation fails`.
+
+**Cleanup**
+
+```powershell
+Remove-Item -Recurse -Force -LiteralPath $GitProject
 ```
 
 ## Repository validation after documentation changes

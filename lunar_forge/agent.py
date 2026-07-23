@@ -38,6 +38,11 @@ from lunar_forge.prompts import (
     build_user_prompt,
     detect_browser_intent,
 )
+from lunar_forge.runtime.git import (
+    create_git_commit,
+    derive_commit_message,
+    format_git_commit_result,
+)
 from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
 from lunar_forge.subagents import (
     RestrictedToolRegistry,
@@ -89,6 +94,8 @@ class SubagentPhaseResult:
     browser_validations: tuple[BrowserValidationRecord, ...] = ()
     browser_validations_truncated: bool = False
     validation_commands_run: bool = False
+    validation_observed: bool = False
+    validation_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,8 @@ class ValidationEvidence:
     browser_validations: list[BrowserValidationRecord] = field(default_factory=list)
     browser_validations_truncated: bool = False
     validation_commands_run: bool = False
+    validation_observed: bool = False
+    validation_failed: bool = False
 
     def merge(self, result: SubagentPhaseResult) -> None:
         remaining = MAX_BROWSER_VALIDATION_RECORDS - len(self.browser_validations)
@@ -123,6 +132,16 @@ class ValidationEvidence:
         self.validation_commands_run = (
             self.validation_commands_run or result.validation_commands_run
         )
+        if result.validation_observed:
+            self.validation_observed = True
+            self.validation_failed = result.validation_failed
+
+
+@dataclass(frozen=True)
+class AgentWorkflowResult:
+    text: str
+    changed_files: tuple[str, ...]
+    validation_evidence: ValidationEvidence
 
 
 @dataclass(frozen=True)
@@ -165,6 +184,8 @@ class CodeAgent:
         resume_messages: Sequence[Mapping[str, Any]] = (),
         resumed_from: str | None = None,
         use_subagents: bool | None = None,
+        offer_commit: bool = False,
+        commit_message: str | None = None,
     ) -> str:
         """Run the permission-gated model/tool loop until final text."""
         root = Path(project_root).expanduser().resolve()
@@ -278,7 +299,7 @@ class CodeAgent:
                 else use_subagents
             )
             if subagents_enabled:
-                subagent_output = self._run_subagent_workflow(
+                subagent_result = self._run_subagent_workflow(
                     request=request,
                     model_client=model_client,
                     registry=tools,
@@ -288,8 +309,19 @@ class CodeAgent:
                     mode=normalized_mode,
                     browser_intent=browser_intent,
                 )
+                final_output = self._finalize_git_commit_offer(
+                    subagent_result.text,
+                    request=request,
+                    root=root,
+                    mode=normalized_mode,
+                    session=session,
+                    changed_files=subagent_result.changed_files,
+                    validation_evidence=subagent_result.validation_evidence,
+                    offer_commit=offer_commit,
+                    commit_message=commit_message,
+                )
                 return _append_session_note(
-                    subagent_output,
+                    final_output,
                     session,
                     normalized_mode,
                 )
@@ -326,6 +358,7 @@ class CodeAgent:
                 allow_execute=normalized_mode not in {"plan", "no-command"},
             )
             validation_evidence = ValidationEvidence()
+            changed_files: list[str] = []
 
             for step in range(self.max_steps):
                 response = model_client.complete(messages, tool_schemas)
@@ -365,6 +398,9 @@ class CodeAgent:
                             tool_call.arguments,
                             result,
                         )
+                        changed_path = _changed_path(internal_tool_name, result)
+                        if changed_path and changed_path not in changed_files:
+                            changed_files.append(changed_path)
                         _log_session(
                             session,
                             "tool_result",
@@ -414,6 +450,17 @@ class CodeAgent:
                         validation_evidence,
                         mode=normalized_mode,
                     )
+                    final_text = self._finalize_git_commit_offer(
+                        final_text,
+                        request=request,
+                        root=root,
+                        mode=normalized_mode,
+                        session=session,
+                        changed_files=changed_files,
+                        validation_evidence=validation_evidence,
+                        offer_commit=offer_commit,
+                        commit_message=commit_message,
+                    )
                     return _append_session_note(final_text, session, normalized_mode)
                 raise AgentError("Model returned neither text nor tool calls.")
 
@@ -431,6 +478,65 @@ class CodeAgent:
             if mcp_client is not None:
                 mcp_client.close()
 
+    def _finalize_git_commit_offer(
+        self,
+        text: str,
+        *,
+        request: str,
+        root: Path,
+        mode: str,
+        session: SessionLogger | None,
+        changed_files: Sequence[str],
+        validation_evidence: ValidationEvidence,
+        offer_commit: bool,
+        commit_message: str | None,
+    ) -> str:
+        if not offer_commit:
+            return text
+        if mode == "plan":
+            _log_git_commit_skipped(
+                session,
+                result_code="plan_mode",
+                reason="Plan mode blocks Git commits.",
+            )
+            return f"{text}\n\nGit:\n- Commit not created: plan mode"
+        if (
+            validation_evidence.validation_failed
+            and not _request_allows_commit_after_failed_validation(request)
+        ):
+            reason = (
+                "Validation failed and the task prompt did not explicitly request a "
+                "commit despite failed validation."
+            )
+            _log_git_commit_skipped(
+                session,
+                result_code="validation_failed",
+                reason=reason,
+            )
+            return f"{text}\n\nGit:\n- Commit not created: validation failed"
+        if not changed_files:
+            _log_git_commit_skipped(
+                session,
+                result_code="no_changes",
+                reason="LunarForge did not change any files in this session.",
+            )
+            return f"{text}\n\nGit:\n- Commit not created: no changes"
+
+        git_mode = (
+            "no-command"
+            if self.config.runtime.mode.strip().lower() == "no-command"
+            else mode
+        )
+        result = create_git_commit(
+            root,
+            commit_message or derive_commit_message(request),
+            session_files=tuple(changed_files),
+            mode=git_mode,
+            approval_callback=self.approval_callback,
+        )
+        _log_git_commit_result(session, result)
+        return f"{text}\n\nGit:\n{format_git_commit_result(result)}"
+
     def _run_subagent_workflow(
         self,
         *,
@@ -442,7 +548,7 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
         browser_intent: BrowserIntent,
-    ) -> str:
+    ) -> AgentWorkflowResult:
         if self.config.subagents.parallel:
             return self._run_parallel_subagent_workflow(
                 request=request,
@@ -524,7 +630,11 @@ class CodeAgent:
             mode=mode,
             reviewer_advisory=final_role == "reviewer",
         )
-        return _append_subagent_report(final_text, roles_run)
+        return AgentWorkflowResult(
+            text=_append_subagent_report(final_text, roles_run),
+            changed_files=tuple(changed_files),
+            validation_evidence=validation_evidence,
+        )
 
     def _run_parallel_subagent_workflow(
         self,
@@ -537,7 +647,7 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
         browser_intent: BrowserIntent,
-    ) -> str:
+    ) -> AgentWorkflowResult:
         """Run only explicitly safe phase groups with bounded concurrency."""
         orchestrator = SubagentOrchestrator()
         include_security = requires_security_analysis(request)
@@ -623,11 +733,15 @@ class CodeAgent:
                 validation_evidence,
                 mode=mode,
             )
-            return _append_subagent_report(
-                final_text,
-                roles_run,
-                parallel_groups=parallel_groups,
-                failures=failures,
+            return AgentWorkflowResult(
+                text=_append_subagent_report(
+                    final_text,
+                    roles_run,
+                    parallel_groups=parallel_groups,
+                    failures=failures,
+                ),
+                changed_files=tuple(changed_files),
+                validation_evidence=validation_evidence,
             )
 
         implement_phase = phase_by_role["coder"]
@@ -658,11 +772,15 @@ class CodeAgent:
                 validation_evidence,
                 mode=mode,
             )
-            return _append_subagent_report(
-                final_text,
-                roles_run,
-                parallel_groups=parallel_groups,
-                failures=failures,
+            return AgentWorkflowResult(
+                text=_append_subagent_report(
+                    final_text,
+                    roles_run,
+                    parallel_groups=parallel_groups,
+                    failures=failures,
+                ),
+                changed_files=tuple(changed_files),
+                validation_evidence=validation_evidence,
             )
 
         if not include_security and requires_security_review(changed_files):
@@ -735,11 +853,15 @@ class CodeAgent:
             mode=mode,
             reviewer_advisory="reviewer" in outputs,
         )
-        return _append_subagent_report(
-            final_text,
-            roles_run,
-            parallel_groups=parallel_groups,
-            failures=failures,
+        return AgentWorkflowResult(
+            text=_append_subagent_report(
+                final_text,
+                roles_run,
+                parallel_groups=parallel_groups,
+                failures=failures,
+            ),
+            changed_files=tuple(changed_files),
+            validation_evidence=validation_evidence,
         )
 
     def _run_parallel_phase_group(
@@ -1076,6 +1198,8 @@ def _run_subagent_model_loop(
                 validation_commands_run=(
                     validation_evidence.validation_commands_run
                 ),
+                validation_failed=validation_evidence.validation_failed,
+                validation_observed=validation_evidence.validation_observed,
             )
         raise AgentError(
             f"Subagent {role.name!r} returned neither text nor tool calls."
@@ -1100,6 +1224,8 @@ def run_agent(
     use_subagents: bool | None = None,
     mcp_transport_factory: TransportFactory | None = None,
     plugin_resolver: EntrypointResolver | None = None,
+    offer_commit: bool = False,
+    commit_message: str | None = None,
 ) -> str:
     """Convenience entry point used by the CLI."""
     root = Path(project_root).expanduser().resolve()
@@ -1119,6 +1245,8 @@ def run_agent(
         resume_messages=resume_messages,
         resumed_from=resumed_from,
         use_subagents=use_subagents,
+        offer_commit=offer_commit,
+        commit_message=commit_message,
     )
 
 
@@ -1144,6 +1272,73 @@ def _log_session(
     except Exception:
         # Session telemetry must never interrupt the coding-agent workflow.
         return
+
+
+def _log_git_commit_result(
+    session: SessionLogger | None,
+    result: Mapping[str, Any],
+) -> None:
+    if "status_short" in result:
+        _log_session(
+            session,
+            "git_status_summary",
+            status_short=result.get("status_short", []),
+            diff_summary=result.get("diff_summary", ""),
+        )
+    proposed_files = result.get("proposed_files", [])
+    if isinstance(proposed_files, Sequence) and not isinstance(
+        proposed_files,
+        (str, bytes),
+    ) and proposed_files:
+        _log_session(
+            session,
+            "git_commit_proposal",
+            proposed_files=proposed_files,
+            unrelated_files=result.get("unrelated_files", []),
+            excluded_files=result.get("excluded_files", []),
+            diff_summary=result.get("diff_summary", ""),
+            message=result.get("message"),
+        )
+    if result.get("approval_requested") is True:
+        _log_session(
+            session,
+            "git_commit_approval",
+            approved=result.get("approved") is True,
+            reason=result.get("approval_reason") or result.get("error"),
+        )
+    commit_hash = result.get("commit_hash")
+    if isinstance(commit_hash, str) and commit_hash:
+        _log_session(
+            session,
+            "git_commit_created",
+            commit_hash=commit_hash,
+            committed_files=result.get("committed_files", []),
+        )
+    _log_session(
+        session,
+        "git_commit_result",
+        result_code=result.get("result_code", "unknown"),
+        commit_created=result.get("ok") is True,
+        commit_hash=commit_hash,
+        reason=result.get("error"),
+    )
+
+
+def _log_git_commit_skipped(
+    session: SessionLogger | None,
+    *,
+    result_code: str,
+    reason: str,
+) -> None:
+    _log_session(session, "git_commit_skipped", reason=reason)
+    _log_session(
+        session,
+        "git_commit_result",
+        result_code=result_code,
+        commit_created=False,
+        commit_hash=None,
+        reason=reason,
+    )
 
 
 def _append_session_note(
@@ -1267,6 +1462,30 @@ def _changed_path(tool_name: str, result: Mapping[str, Any]) -> str | None:
     return path if isinstance(path, str) and path else None
 
 
+def _request_allows_commit_after_failed_validation(request: str) -> bool:
+    """Require an explicit failed-validation override in the task prompt."""
+    normalized = " ".join(request.lower().split())
+    if re.search(r"\b(?:do not|don't|dont|never)\s+commit\b", normalized):
+        return False
+    validation_failure = (
+        r"(?:(?:validation|tests?|checks?).{0,32}"
+        r"(?:fail(?:s|ed|ing|ure)?|errors?|unsuccessful|does not pass|doesn't pass)|"
+        r"(?:fail(?:s|ed|ing|ure)?|errors?|unsuccessful|does not pass|doesn't pass)"
+        r".{0,32}"
+        r"(?:validation|tests?|checks?))"
+    )
+    override = r"(?:even if|even when|even with|despite|regardless of|anyway if)"
+    patterns = (
+        rf"\bcommit(?:ted|ting)?\b.{{0,80}}\b{override}\b.{{0,80}}{validation_failure}",
+        rf"\b{override}\b.{{0,80}}{validation_failure}.{{0,80}}\bcommit(?:ted|ting)?\b",
+        rf"\bcommit(?:ted|ting)?\b.{{0,80}}\bwithout\b.{{0,40}}"
+        rf"\b(?:passing|successful)\b.{{0,40}}\b(?:validation|tests?|checks?)\b",
+        r"\bcommit(?:ted|ting)?\b.{0,80}\bregardless of\b.{0,40}"
+        r"\b(?:validation|tests?|checks?)\b.{0,20}\b(?:result|outcome|status)\b",
+    )
+    return any(re.search(pattern, normalized) is not None for pattern in patterns)
+
+
 def _resume_history_messages(
     messages: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1345,6 +1564,9 @@ def _record_validation_evidence(
             evidence.validation_commands_run = (
                 evidence.validation_commands_run or bool(results)
             )
+        if result.get("permission_denied") is not True:
+            evidence.validation_observed = True
+            evidence.validation_failed = result.get("ok") is False
         return
     if tool_name not in {
         "run_browser_validation",
@@ -1398,6 +1620,9 @@ def _record_validation_evidence(
             error=error if isinstance(error, str) and error else None,
         )
     )
+    if not_run_reason is None:
+        evidence.validation_observed = True
+        evidence.validation_failed = result.get("ok") is False
 
 
 def _browser_not_run_reason(

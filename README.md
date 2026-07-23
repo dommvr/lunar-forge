@@ -479,6 +479,65 @@ content, interactive controls, optional console-error collection, managed Vite
 validation, and Playwright MCP configuration examples. Generated dependency and
 build directories are not checked in.
 
+## Guarded Git commits
+
+Git support is opt-in and operates only inside an existing repository. Inspect
+bounded repository status without a model:
+
+```powershell
+lunar-forge git status --project C:\path\to\project
+```
+
+Create a deterministic commit proposal with an explicit message:
+
+```powershell
+lunar-forge git commit --project C:\path\to\project --message "Add pricing page"
+```
+
+The command prints `git status --short`, a bounded diff summary, eligible
+proposed files, unrelated dirty files marked as not included, excluded files,
+and the proposed commit message before asking approval. Agent-driven proposals
+specifically label the files changed by LunarForge. The commit action always
+requires approval, including under
+`permissions.mode: yes`. Only proposed paths are staged and committed; unrelated
+staged changes are left out. The result includes the commit hash when Git makes
+it available.
+
+Ask the coding-agent workflow to offer the same guarded finalization only after
+successful work:
+
+```powershell
+lunar-forge --project C:\path\to\project --commit "Add a pricing page"
+lunar-forge --project C:\path\to\project --commit --commit-message "Add pricing page" "Add a pricing page"
+```
+
+`--commit` never commits automatically. The agent prefers files changed by the
+current LunarForge session and shows other dirty paths separately. If structured
+validation fails, it does not offer a commit unless the task prompt explicitly
+says to commit despite failed validation; a general request to commit is not an
+override. If LunarForge changed no eligible files, it does not show an approval
+prompt. Plan mode never commits, and no-command mode blocks all Git subprocess
+execution.
+
+Agent final output always reports the opt-in result in a stable section:
+
+```text
+Git:
+- Commit created: abc123...
+```
+
+When no commit is made, the same section states the reason, such as `approval
+denied`, `validation failed`, `no changes`, or `not a repo`. A denied proposal
+leaves every file uncommitted. Session JSONL records the bounded proposal,
+approval decision, and final commit result without adding `.agent/` runtime
+files to the commit.
+
+Runtime, generated, and obvious secret paths are never proposed, including
+`.agent/`, `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `dist/`,
+`build/`, `coverage/`, `.env*`, private-key filenames, and `.key`/`.pem` files.
+Git uses the same platform-aware executable resolution as local commands and
+always runs with `shell=False`.
+
 ## Validation
 
 The permission-gated `run_validation` tool chooses likely commands from project

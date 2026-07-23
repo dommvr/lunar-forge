@@ -1,0 +1,585 @@
+import json
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import lunar_forge.agent as agent_module
+import lunar_forge.runtime.git as git_module
+from lunar_forge.agent import CodeAgent
+from lunar_forge.config import AppConfig
+from lunar_forge.model_clients import ModelResponse, ToolCall
+from lunar_forge.permissions import PermissionLevel
+from lunar_forge.runtime.git import (
+    create_git_commit,
+    format_git_commit_result,
+    git_status,
+    prepare_git_commit,
+)
+from lunar_forge.tools.registry import Tool, ToolRegistry
+
+
+class SequenceModel:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def complete(self, messages, tools=None):
+        return self.responses.pop(0)
+
+
+def _result(args, *, ok=True, stdout="", stderr=""):
+    return git_module._GitCommandResult(
+        ok=ok,
+        args=tuple(args),
+        exit_code=0 if ok else 1,
+        stdout=stdout,
+        stderr=stderr,
+        truncated=False,
+        error=None if ok else stderr or "Git failed.",
+    )
+
+
+def _mock_git(monkeypatch, root, status_output, *, diff_output="1 file changed"):
+    calls = []
+
+    def fake_run_git(cwd, arguments, timeout_ms):
+        args = tuple(arguments)
+        calls.append((Path(cwd), args, timeout_ms))
+        if args == ("rev-parse", "--show-toplevel"):
+            return _result(args, stdout=f"{root}\n")
+        if args == ("status", "--short", "--untracked-files=all", "-z"):
+            return _result(args, stdout=status_output)
+        if args[:4] == ("diff", "--stat", "--no-ext-diff", "HEAD"):
+            return _result(args, stdout=f"{diff_output}\n")
+        if args[:2] == ("add", "--"):
+            return _result(args)
+        if args[:2] == ("commit", "--only"):
+            return _result(args, stdout="commit created\n")
+        if args == ("rev-parse", "HEAD"):
+            return _result(args, stdout="abc123def456\n")
+        raise AssertionError(f"Unexpected Git arguments: {args}")
+
+    monkeypatch.setattr(git_module, "_run_git", fake_run_git)
+    return calls
+
+
+def test_status_outside_repository_fails_clearly(monkeypatch, tmp_path):
+    def fake_run_git(cwd, arguments, timeout_ms):
+        return _result(arguments, ok=False, stderr="not a git repository")
+
+    monkeypatch.setattr(git_module, "_run_git", fake_run_git)
+
+    result = git_status(tmp_path)
+
+    assert result["ok"] is False
+    assert result["status_short"] == []
+    assert result["error"] == "Project is not inside a Git repository."
+
+
+def test_status_in_repository_returns_short_status(monkeypatch, tmp_path):
+    _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M README.md\0?? src/new.py\0",
+    )
+
+    result = git_status(tmp_path)
+
+    assert result["ok"] is True
+    assert result["clean"] is False
+    assert result["status_short"] == [" M README.md", "?? src/new.py"]
+    assert result["entries"] == [
+        {"status": " M", "path": "README.md"},
+        {"status": "??", "path": "src/new.py"},
+    ]
+
+
+def test_commit_requires_approval_even_in_yes_mode(monkeypatch, tmp_path):
+    calls = _mock_git(monkeypatch, tmp_path, " M README.md\0")
+    approvals = []
+
+    result = create_git_commit(
+        tmp_path,
+        "Update README",
+        session_files=("README.md",),
+        mode="yes",
+        approval_callback=lambda request: approvals.append(request) or False,
+    )
+
+    assert result["ok"] is False
+    assert result["permission_denied"] is True
+    assert result["approved"] is False
+    assert len(approvals) == 1
+    assert approvals[0].tool_name == "git_commit"
+    assert approvals[0].permission is PermissionLevel.EXECUTE
+    assert "Git status --short" in approvals[0].description
+    assert "Files changed by LunarForge" in approvals[0].description
+    assert "Proposed commit message: Update README" in approvals[0].description
+    assert "README.md" in approvals[0].description
+    assert not any(args[:1] in {("add",), ("commit",)} for _, args, _ in calls)
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    (("plan", "Plan mode blocks Git commits"), ("no-command", "blocks Git")),
+)
+def test_plan_and_no_command_block_commit_without_git_execution(
+    monkeypatch,
+    tmp_path,
+    mode,
+    message,
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Blocked modes must not execute Git")
+
+    monkeypatch.setattr(git_module, "_run_git", unexpected)
+
+    result = create_git_commit(tmp_path, "Blocked commit", mode=mode)
+
+    assert result["ok"] is False
+    assert result["approved"] is False
+    assert message in result["error"]
+
+
+def test_no_command_blocks_status_without_git_execution(monkeypatch, tmp_path):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("No-command mode must not execute Git")
+
+    monkeypatch.setattr(git_module, "_run_git", unexpected)
+
+    result = git_status(tmp_path, mode="no-command")
+
+    assert result["ok"] is False
+    assert "No-command mode" in result["error"]
+
+
+def test_generated_runtime_and_secret_files_are_excluded(monkeypatch, tmp_path):
+    status_output = "\0".join(
+        (
+            " M keep.py",
+            "?? .agent/session.jsonl",
+            "?? .agent/checkpoints/2026/note.txt",
+            "?? .agent/artifacts/browser/full-page.png",
+            "?? node_modules/pkg/index.js",
+            "?? .venv/pyvenv.cfg",
+            "?? venv/pyvenv.cfg",
+            "?? pkg/__pycache__/app.pyc",
+            "?? dist/app.js",
+            "?? build/output.txt",
+            "?? coverage/index.html",
+            "?? .env",
+            "?? certs/private.pem",
+            "",
+        )
+    )
+    _mock_git(monkeypatch, tmp_path, status_output)
+
+    result = prepare_git_commit(tmp_path)
+
+    assert result["ok"] is True
+    assert result["proposed_files"] == ["keep.py"]
+    assert set(result["excluded_files"]) == {
+        ".agent/session.jsonl",
+        ".agent/checkpoints/2026/note.txt",
+        ".agent/artifacts/browser/full-page.png",
+        "node_modules/pkg/index.js",
+        ".venv/pyvenv.cfg",
+        "venv/pyvenv.cfg",
+        "pkg/__pycache__/app.pyc",
+        "dist/app.js",
+        "build/output.txt",
+        "coverage/index.html",
+        ".env",
+        "certs/private.pem",
+    }
+
+
+def test_unrelated_dirty_files_are_not_committed_by_default(
+    monkeypatch,
+    tmp_path,
+):
+    calls = _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M current.py\0 M unrelated.py\0?? .agent/session.jsonl\0",
+    )
+
+    result = create_git_commit(
+        tmp_path,
+        "Update current file",
+        session_files=("current.py",),
+        approval_callback=lambda request: True,
+    )
+
+    assert result["ok"] is True
+    assert result["commit_hash"] == "abc123def456"
+    assert result["committed_files"] == ["current.py"]
+    assert result["unrelated_files"] == ["unrelated.py"]
+    assert result["excluded_files"] == [".agent/session.jsonl"]
+    add_args = next(args for _, args, _ in calls if args[0] == "add")
+    commit_args = next(args for _, args, _ in calls if args[0] == "commit")
+    assert add_args == ("add", "--", "current.py")
+    assert commit_args[-2:] == ("--", "current.py")
+    assert "unrelated.py" not in commit_args
+
+
+def test_denied_commit_formats_full_proposal_and_clear_result(monkeypatch, tmp_path):
+    _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M current.py\0 M unrelated.py\0?? .agent/artifacts/browser/page.png\0",
+        diff_output="current.py | 2 +-",
+    )
+
+    result = create_git_commit(
+        tmp_path,
+        "Update current file",
+        session_files=("current.py",),
+        approval_callback=lambda request: False,
+    )
+    formatted = format_git_commit_result(result)
+
+    assert "Files changed by LunarForge (proposed for commit):\n- current.py" in formatted
+    assert "Unrelated dirty files (not included):\n- unrelated.py" in formatted
+    assert ".agent/artifacts/browser/page.png" in formatted
+    assert "Bounded diff summary:\ncurrent.py | 2 +-" in formatted
+    assert "Proposed commit message: Update current file" in formatted
+    assert formatted.endswith("- Commit not created: approval denied")
+
+
+def test_clean_commit_request_reports_no_changes_without_a_proposal(
+    monkeypatch,
+    tmp_path,
+):
+    _mock_git(monkeypatch, tmp_path, "")
+
+    result = create_git_commit(
+        tmp_path,
+        "Nothing to commit",
+        approval_callback=lambda request: pytest.fail("Approval was not expected"),
+    )
+    formatted = format_git_commit_result(result)
+
+    assert result["result_code"] == "no_changes"
+    assert formatted == "- Commit not created: no changes"
+    assert "Git status --short" not in formatted
+
+
+def test_outside_repository_commit_has_stable_final_reason(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        git_module,
+        "_run_git",
+        lambda cwd, arguments, timeout_ms: _result(
+            arguments,
+            ok=False,
+            stderr="not a git repository",
+        ),
+    )
+
+    result = create_git_commit(tmp_path, "Unavailable commit")
+
+    assert result["result_code"] == "not_repository"
+    assert format_git_commit_result(result) == "- Commit not created: not a repo"
+
+
+def test_git_subprocess_uses_resolver_and_shell_false(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(
+        git_module,
+        "resolve_executable",
+        lambda executable, cwd: "C:/Git/bin/git.exe",
+    )
+
+    def fake_run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = git_module._run_git(tmp_path, ("status", "--short"), 1_000)
+
+    assert result.ok is True
+    assert captured["arguments"] == ["C:/Git/bin/git.exe", "status", "--short"]
+    assert captured["cwd"] == tmp_path
+    assert captured["shell"] is False
+    assert captured["check"] is False
+
+
+def test_failed_validation_prevents_auto_offered_commit(monkeypatch, tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(id="validate", name="run_validation", arguments={}),
+                ),
+            ),
+            ModelResponse(text="Validation failed."),
+        )
+    )
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=lambda: {
+                    "ok": False,
+                    "results": [{"ok": False, "exit_code": 1}],
+                    "error": "Tests failed.",
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    def unexpected_commit(*args, **kwargs):
+        raise AssertionError("A failed validation must suppress the commit offer")
+
+    monkeypatch.setattr(agent_module, "create_git_commit", unexpected_commit)
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run(
+        "Update the project",
+        tmp_path,
+        registry=registry,
+        offer_commit=True,
+    )
+
+    assert "Git:\n- Commit not created: validation failed" in output
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    skipped = [event for event in events if event["event"] == "git_commit_skipped"]
+    assert len(skipped) == 1
+    results = [event for event in events if event["event"] == "git_commit_result"]
+    assert results[0]["data"]["result_code"] == "validation_failed"
+
+
+def test_commit_mention_alone_does_not_override_failed_validation(
+    monkeypatch,
+    tmp_path,
+):
+    evidence = agent_module.ValidationEvidence(validation_failed=True)
+    agent = CodeAgent(AppConfig())
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: pytest.fail("Commit proposal was not expected"),
+    )
+
+    output = agent._finalize_git_commit_offer(
+        "Validation failed.",
+        request="Update the project and commit it.",
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=("app.py",),
+        validation_evidence=evidence,
+        offer_commit=True,
+        commit_message=None,
+    )
+
+    assert output.endswith("Git:\n- Commit not created: validation failed")
+
+
+def test_explicit_failed_validation_override_allows_commit_proposal(
+    monkeypatch,
+    tmp_path,
+):
+    evidence = agent_module.ValidationEvidence(validation_failed=True)
+    captured = {}
+
+    def fake_commit(project_root, message, **kwargs):
+        captured.update(project_root=project_root, message=message, **kwargs)
+        return {
+            "ok": False,
+            "result_code": "approval_denied",
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M app.py"],
+            "diff_summary": "app.py | 1 +",
+            "proposed_files": ["app.py"],
+            "unrelated_files": [],
+            "excluded_files": [],
+            "session_scoped": True,
+            "message": "Commit despite failure",
+            "approved": False,
+            "approval_requested": True,
+            "permission_denied": True,
+            "error": "Approval denied by user.",
+        }
+
+    monkeypatch.setattr(agent_module, "create_git_commit", fake_commit)
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        "Validation failed.",
+        request="Commit even if validation fails.",
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=("app.py",),
+        validation_evidence=evidence,
+        offer_commit=True,
+        commit_message="Commit despite failure",
+    )
+
+    assert captured["session_files"] == ("app.py",)
+    assert "Proposed commit message: Commit despite failure" in output
+    assert output.endswith("- Commit not created: approval denied")
+
+
+def test_agent_with_no_changed_files_does_not_prepare_commit(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: pytest.fail("Commit proposal was not expected"),
+    )
+    output = CodeAgent(
+        AppConfig(),
+        model_client=SequenceModel((ModelResponse(text="No changes were needed."),)),
+    ).run("Inspect the project", tmp_path, offer_commit=True)
+
+    assert "Git:\n- Commit not created: no changes" in output
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    assert not any(event["event"] == "git_commit_proposal" for event in events)
+    result = next(event for event in events if event["event"] == "git_commit_result")
+    assert result["data"]["result_code"] == "no_changes"
+
+
+def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="write",
+                        name="write_file",
+                        arguments={"path": "app.py", "content": "updated"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Changed files:\n- app.py"),
+        )
+    )
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="write_file",
+                description="Write a file.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {
+                    "ok": True,
+                    "path": arguments["path"],
+                },
+                permission=PermissionLevel.WRITE,
+            ),
+        )
+    )
+    captured = {}
+
+    def fake_commit(project_root, message, **kwargs):
+        captured.update(project_root=project_root, message=message, **kwargs)
+        return {
+            "ok": True,
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M app.py", "?? .agent/session.jsonl"],
+            "diff_summary": "app.py | 1 +",
+            "proposed_files": ["app.py"],
+            "unrelated_files": [],
+            "excluded_files": [".agent/session.jsonl"],
+            "session_scoped": True,
+            "message": "Update app",
+            "approved": True,
+            "approval_requested": True,
+            "approval_reason": "Approved by user.",
+            "result_code": "commit_created",
+            "commit_hash": "abc123",
+            "committed_files": ["app.py"],
+        }
+
+    monkeypatch.setattr(agent_module, "create_git_commit", fake_commit)
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run(
+        "Update app",
+        tmp_path,
+        registry=registry,
+        offer_commit=True,
+    )
+
+    assert captured["session_files"] == ("app.py",)
+    assert "Git:\n" in output
+    assert "Files changed by LunarForge (proposed for commit):\n- app.py" in output
+    assert "Proposed commit message: Update app" in output
+    assert "- Commit created: abc123" in output
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [json.loads(line) for line in session_file.read_text().splitlines()]
+    names = [event["event"] for event in events]
+    assert "git_status_summary" in names
+    assert "git_commit_proposal" in names
+    assert "git_commit_approval" in names
+    assert "git_commit_created" in names
+    assert "git_commit_result" in names
+    proposal = next(event for event in events if event["event"] == "git_commit_proposal")
+    assert proposal["data"]["message"] == "Update app"
+    result = next(event for event in events if event["event"] == "git_commit_result")
+    assert result["data"]["commit_hash"] == "abc123"
+
+
+def test_git_finalization_preserves_browser_and_subagent_summaries(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "result_code": "approval_denied",
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M app.py"],
+            "diff_summary": "app.py | 1 +",
+            "proposed_files": ["app.py"],
+            "unrelated_files": [],
+            "excluded_files": [],
+            "session_scoped": True,
+            "message": "Update app",
+            "approved": False,
+            "approval_requested": True,
+            "permission_denied": True,
+            "error": "Approval denied by user.",
+        },
+    )
+    existing_summary = (
+        "Review complete.\n\n"
+        "Browser validation:\n- run_browser_validation: passed\n\n"
+        "Subagents run:\n- tester\n- reviewer"
+    )
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        existing_summary,
+        request="Update app",
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=("app.py",),
+        validation_evidence=agent_module.ValidationEvidence(),
+        offer_commit=True,
+        commit_message="Update app",
+    )
+
+    assert "Browser validation:\n- run_browser_validation: passed" in output
+    assert "Subagents run:\n- tester\n- reviewer" in output
+    assert output.endswith("- Commit not created: approval denied")
