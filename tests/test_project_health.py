@@ -1,5 +1,6 @@
 import json
 from importlib import import_module
+from types import SimpleNamespace
 
 from lunar_forge.tools.project_health import project_health
 
@@ -154,3 +155,45 @@ def test_project_health_reports_safely_available_tracked_runtime_paths(
 
     assert result["suspicious_tracked_paths"] == [".env", "dist/bundle.js"]
     assert result["tracked_path_check"] == "checked"
+
+
+def test_project_health_git_inspection_is_read_only_and_shell_false(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    monkeypatch.setattr(
+        project_health_module,
+        "resolve_executable",
+        lambda executable, cwd: "C:/Git/bin/git.exe",
+    )
+
+    def fake_run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b".env\0dist/bundle.js\0",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(project_health_module.subprocess, "run", fake_run)
+
+    result = project_health_module._tracked_suspicious_paths(tmp_path)
+
+    assert result == {
+        "status": "checked",
+        "paths": [".env", "dist/bundle.js"],
+        "truncated": False,
+    }
+    assert captured["arguments"] == [
+        "C:/Git/bin/git.exe",
+        "ls-files",
+        "--cached",
+        "-z",
+        "--",
+        ".",
+    ]
+    assert captured["cwd"] == tmp_path
+    assert captured["shell"] is False
+    assert captured["check"] is False

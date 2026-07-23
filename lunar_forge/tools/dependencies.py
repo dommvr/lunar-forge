@@ -33,9 +33,19 @@ _LOCKFILES = (
     "poetry.lock",
 )
 _URL_CREDENTIALS = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+_SECRET_VALUE = r"""(?:"[^"]*"|'[^']*'|[^\s]+)"""
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*"
-    r"\s*=\s*)([^\s]+)"
+    r"\s*=\s*)"
+    + _SECRET_VALUE
+)
+_SECRET_OPTION = re.compile(
+    r"(?i)(--?[A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_-]*"
+    r"(?:\s*=\s*|\s+))"
+    + _SECRET_VALUE
+)
+_BEARER_CREDENTIAL = re.compile(
+    r"(?i)\b(Bearer\s+)[A-Z0-9._~+/-]{8,}"
 )
 _API_KEY = re.compile(
     r"(?i)\b(?:sk-(?:ant-)?|gh[pousr]_|github_pat_)[a-z0-9_-]{8,}\b"
@@ -714,6 +724,8 @@ def _specifier(value: Any) -> str:
 def _sanitize(value: str) -> str:
     sanitized = _URL_CREDENTIALS.sub(r"\1[REDACTED]@", value)
     sanitized = _SECRET_ASSIGNMENT.sub(r"\1[REDACTED]", sanitized)
+    sanitized = _SECRET_OPTION.sub(r"\1[REDACTED]", sanitized)
+    sanitized = _BEARER_CREDENTIAL.sub(r"\1[REDACTED]", sanitized)
     return _API_KEY.sub("[REDACTED]", sanitized)
 
 

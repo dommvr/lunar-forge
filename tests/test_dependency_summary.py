@@ -205,12 +205,24 @@ def test_dependency_summary_handles_mixed_markers_and_bounds_results(tmp_path):
 
 def test_dependency_summary_redacts_credentials_in_returned_metadata(tmp_path):
     secret = "credential-value-that-must-not-escape"
+    quoted_secret = "quoted credential value"
+    option_secret = "option-secret-value"
+    bearer_secret = "bearer.secret.value"
     (tmp_path / "requirements.txt").write_text(
         f"private-lib @ https://{secret}@example.com/archive.whl\n",
         encoding="utf-8",
     )
     (tmp_path / "package.json").write_text(
-        json.dumps({"scripts": {"check": f"API_TOKEN={secret} tool check"}}),
+        json.dumps(
+            {
+                "scripts": {
+                    "assignment": f'API_TOKEN="{quoted_secret}" tool check',
+                    "check": f"API_TOKEN={secret} tool check",
+                    "option": f"tool --api-key {option_secret} check",
+                    "bearer": f"tool --header 'Bearer {bearer_secret}'",
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -218,5 +230,6 @@ def test_dependency_summary_redacts_credentials_in_returned_metadata(tmp_path):
     serialized = json.dumps(result)
 
     assert result["ok"] is True
-    assert secret not in serialized
+    for value in (secret, quoted_secret, option_secret, bearer_secret):
+        assert value not in serialized
     assert "[REDACTED]" in serialized

@@ -133,7 +133,7 @@ def git_status(
     mode: str = "default",
     timeout_ms: int = DEFAULT_GIT_TIMEOUT_MS,
 ) -> dict[str, Any]:
-    """Return bounded repository-wide short status for a selected project."""
+    """Return bounded short status confined to the selected project."""
     normalized_mode = mode.strip().lower()
     if normalized_mode == "no-command":
         return {
@@ -165,10 +165,18 @@ def git_status(
             "status_short": [],
         }
     repository_root = Path(repository_root_result[1]).resolve()
+    project_pathspec = _project_status_pathspec(root, repository_root)
 
     command = _run_git(
         repository_root,
-        ("status", "--short", "--untracked-files=all", "-z"),
+        (
+            "status",
+            "--short",
+            "--untracked-files=all",
+            "-z",
+            "--",
+            project_pathspec,
+        ),
         timeout_ms,
     )
     if not command.ok:
@@ -186,7 +194,7 @@ def git_status(
             "status_short": [],
         }
     try:
-        entries = _parse_short_status(command.stdout)
+        parsed_entries = _parse_short_status(command.stdout)
     except ValueError as exc:
         return {
             "ok": False,
@@ -194,6 +202,15 @@ def git_status(
             "repository_root": str(repository_root),
             "status_short": [],
         }
+    entries = tuple(
+        entry
+        for entry in parsed_entries
+        if _path_is_within_project(
+            repository_root,
+            root,
+            entry.path,
+        )
+    )
     modified_files = [
         entry.path for entry in entries if entry.status != "??"
     ]
@@ -960,6 +977,14 @@ def _repository_root(root: Path, timeout_ms: int) -> tuple[bool, str]:
     except ValueError:
         return False, "Git repository root does not contain the selected project."
     return True, str(repository_root)
+
+
+def _project_status_pathspec(
+    project_root: Path,
+    repository_root: Path,
+) -> str:
+    relative = project_root.relative_to(repository_root).as_posix()
+    return relative or "."
 
 
 def _run_git(

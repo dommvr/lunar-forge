@@ -62,7 +62,14 @@ def _mock_git(
         calls.append((Path(cwd), args, timeout_ms))
         if args == ("rev-parse", "--show-toplevel"):
             return _result(args, stdout=f"{root}\n")
-        if args == ("status", "--short", "--untracked-files=all", "-z"):
+        if args == (
+            "status",
+            "--short",
+            "--untracked-files=all",
+            "-z",
+            "--",
+            ".",
+        ):
             return _result(args, stdout=status_output)
         if args[:4] == ("diff", "--stat", "--no-ext-diff", "HEAD"):
             return _result(args, stdout=f"{diff_output}\n")
@@ -137,8 +144,53 @@ def test_clean_repo_status_is_compact(monkeypatch, tmp_path):
     }
     assert [args for _, args, _ in calls] == [
         ("rev-parse", "--show-toplevel"),
-        ("status", "--short", "--untracked-files=all", "-z"),
+        (
+            "status",
+            "--short",
+            "--untracked-files=all",
+            "-z",
+            "--",
+            ".",
+        ),
     ]
+
+
+def test_status_is_confined_to_a_nested_project_root(monkeypatch, tmp_path):
+    project = tmp_path / "packages" / "app"
+    project.mkdir(parents=True)
+    calls = []
+
+    def fake_run_git(cwd, arguments, timeout_ms):
+        args = tuple(arguments)
+        calls.append((Path(cwd), args, timeout_ms))
+        if args == ("rev-parse", "--show-toplevel"):
+            return _result(args, stdout=f"{tmp_path}\n")
+        if args == (
+            "status",
+            "--short",
+            "--untracked-files=all",
+            "-z",
+            "--",
+            "packages/app",
+        ):
+            return _result(
+                args,
+                stdout=(
+                    " M packages/app/app.py\0"
+                    " M packages/sibling/private.pem\0"
+                ),
+            )
+        raise AssertionError(f"Unexpected Git arguments: {args}")
+
+    monkeypatch.setattr(git_module, "_run_git", fake_run_git)
+
+    result = git_status(project)
+
+    assert result["ok"] is True
+    assert result["status_short"] == [" M packages/app/app.py"]
+    assert result["modified_files"] == ["packages/app/app.py"]
+    assert "private.pem" not in json.dumps(result)
+    assert calls[-1][0] == tmp_path
 
 
 def test_dirty_repo_status_classifies_staged_untracked_and_excluded(

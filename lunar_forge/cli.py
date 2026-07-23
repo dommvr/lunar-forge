@@ -180,7 +180,7 @@ def git_status_command(
         typer.Option("--project", "-p", help="Target project directory."),
     ] = Path("."),
 ) -> None:
-    """Show bounded repository-wide ``git status --short`` output."""
+    """Show bounded project-scoped ``git status --short`` output."""
     project_root = project.expanduser().resolve()
     try:
         config = load_config(project_root)

@@ -30,6 +30,7 @@ command described by the test before answering `y`. Paths beneath
 - [ ] Config loading and precedence
 - [ ] Plan mode
 - [ ] Basic project inspection
+- [ ] Built-in project intelligence
 - [ ] Line tools
 - [ ] Static HTML starter
 - [ ] Python Tkinter starter
@@ -210,9 +211,11 @@ Remove-Item -Recurse -Force -LiteralPath $InspectProject
 
 **Purpose**
 
-Confirm that `project_health` and `dependency_summary` return compact metadata
-without running project code, reading lockfile bodies, or enabling commands in
-no-command mode.
+Confirm that the plan-mode registry exposes all five provider-safe,
+read-permission project intelligence tools. Exercise filesystem health and
+dependency parsing without running project code, reading secret files, or
+parsing lockfile bodies. Git-backed behavior is exercised in sections 20 and
+21.
 
 **Setup**
 
@@ -231,6 +234,14 @@ New-Item -ItemType Directory -Force -Path (Join-Path $IntelProject "dist") | Out
 }
 '@ | Set-Content -LiteralPath (Join-Path $IntelProject "package.json") -Encoding utf8
 "lockfile body is intentionally not parsed" | Set-Content -LiteralPath (Join-Path $IntelProject "package-lock.json") -Encoding utf8
+"manual-secret-canary" | Set-Content -LiteralPath (Join-Path $IntelProject ".env") -Encoding utf8
+@'
+from pathlib import Path
+from setuptools import setup
+
+Path("setup-executed.txt").write_text("setup.py ran")
+setup(install_requires=["requests>=2"])
+'@ | Set-Content -LiteralPath (Join-Path $IntelProject "setup.py") -Encoding utf8
 ```
 
 **Command**
@@ -242,21 +253,38 @@ import json
 import os
 from lunar_forge.tools.registry import create_tool_registry
 
-registry = create_tool_registry(os.environ["INTEL_PROJECT"], mode="no-command")
+registry = create_tool_registry(os.environ["INTEL_PROJECT"], mode="plan")
+intelligence = {
+    "project_health",
+    "dependency_summary",
+    "git_status",
+    "git_diff",
+    "list_changed_files",
+}
+schema_names = {
+    item["function"]["name"]
+    for item in registry.schemas(read_only=True, allow_execute=False)
+}
+print("available:", sorted(intelligence & set(registry.names())))
+print("provider-safe:", sorted(intelligence & schema_names))
 print(json.dumps(registry.execute("project_health", {}), indent=2))
 print(json.dumps(registry.execute("dependency_summary", {}), indent=2))
 '@ | python -
+Test-Path -LiteralPath (Join-Path $IntelProject "setup-executed.txt")
 ```
 
 **Expected result**
 
-Both results have `ok: true`. Health reports the README, `AGENTS.md`, tests,
-package markers, `.gitignore`, `dist`, and npm validation hints; its
-`tracked_path_check` is `skipped_no_command`. Dependency metadata reports npm,
-React/Vite, the three scripts, bounded dependency lists, and likely `npm test`,
-`npm run build`, and `npm run dev` commands. The invalid lockfile body causes no
-parse error because lockfile contents are not read. No approval prompt appears
-and no project command runs.
+Both `available` and `provider-safe` list all five exact tool names. Both
+filesystem results have `ok: true` and serialize as JSON. Health reports the
+README, `AGENTS.md`, tests, package markers, `.gitignore`, `dist`, and validation
+hints without returning `manual-secret-canary`. Dependency metadata reports
+npm, React/Vite, the scripts, bounded dependency lists, the static `requests`
+requirement, and likely npm commands. The invalid lockfile body causes no parse
+error because lockfile contents are not read. `Test-Path` prints `False`,
+proving `setup.py` was not executed. No approval prompt appears and no project
+command runs. This disposable directory is not a Git repository, so invoking a
+Git-backed tool here would return a clear non-repository error without mutation.
 
 **Cleanup**
 
@@ -1015,6 +1043,26 @@ lunar-forge git status --project $NoCommandProject
 lunar-forge git commit --project $NoCommandProject --message "Blocked commit"
 lunar-forge --project $NoCommandProject "Read note.txt and explain whether command execution or validation tools are available. Do not edit files."
 Get-Content -LiteralPath (Join-Path $NoCommandProject "note.txt")
+$env:NO_COMMAND_PROJECT = $NoCommandProject
+@'
+import json
+import os
+from lunar_forge.tools.registry import create_tool_registry
+
+registry = create_tool_registry(
+    os.environ["NO_COMMAND_PROJECT"],
+    mode="no-command",
+    session_changed_files=["note.txt"],
+)
+for name, arguments in (
+    ("git_status", {}),
+    ("git_diff", {}),
+    ("list_changed_files", {"source": "both"}),
+    ("list_changed_files", {"source": "session"}),
+    ("project_health", {}),
+):
+    print(name, json.dumps(registry.execute(name, arguments), sort_keys=True))
+'@ | python -
 ```
 
 **Expected result**
@@ -1024,11 +1072,15 @@ blocks execution; neither install command runs and no approval prompt appears.
 Both Git commands also fail before invoking Git or asking approval and report
 that no-command mode blocks Git execution.
 The agent can still read and quote `note.txt`, reports command-backed validation
-as unavailable, and leaves the file unchanged.
+as unavailable, and leaves the file unchanged. The direct registry calls show
+the same block for `git_status`, `git_diff`, and `source="both"`;
+`source="session"` succeeds without Git and returns `note.txt`.
+`project_health` succeeds with `tracked_path_check: skipped_no_command`.
 
 **Cleanup**
 
 ```powershell
+Remove-Item Env:\NO_COMMAND_PROJECT -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force -LiteralPath $NoCommandProject
 ```
 
@@ -1090,6 +1142,7 @@ from lunar_forge.tools.registry import create_tool_registry
 
 registry = create_tool_registry(
     os.environ["GIT_TOOL_PROJECT"],
+    mode="plan",
     session_changed_files=["note.txt"],
 )
 print(json.dumps(registry.execute("git_status", {}), indent=2))
@@ -1102,6 +1155,10 @@ print(json.dumps(
 ))
 print(json.dumps(
     registry.execute("list_changed_files", {"source": "both"}),
+    indent=2,
+))
+print(json.dumps(
+    registry.execute("git_diff", {"path": ".env", "max_lines": 40}),
     indent=2,
 ))
 '@ | python -
@@ -1124,10 +1181,12 @@ makes no file changes; it should not display a Git approval prompt.
 **Expected result**
 
 Initial status shows modified `note.txt`, `unrelated.txt`, and `.agent` runtime
-files. The three registry calls report compact status, a bounded diff containing
-only `note.txt`, and combined session/Git metadata. `note.txt` is both
-session-changed and Git-modified; `.agent`, `node_modules`, `dist`, `.next`, and
-`.env` are excluded and never appear as diff contents or commit candidates. No
+files. The plan-mode registry calls report compact project-scoped status, a
+bounded diff containing only `note.txt`, and combined session/Git metadata.
+`note.txt` is both session-changed and Git-modified; `.agent`, `node_modules`,
+`dist`, `.next`, and `.env` are excluded and never appear as diff contents or
+commit candidates. The explicit `.env` diff fails with an excluded-path error
+and does not return its placeholder body. Every result serializes as JSON. No
 Git mutation or approval occurs for these read-only calls.
 
 The agent commit preview shows bounded status and diff output, labels only

@@ -1,11 +1,14 @@
 import re
+from pathlib import Path
 
 import pytest
 
+from lunar_forge.permissions import PermissionLevel
 from lunar_forge.tools.registry import (
     PROVIDER_TOOL_NAME_PATTERN,
     Tool,
     ToolRegistry,
+    create_tool_registry,
     provider_safe_tool_name,
 )
 
@@ -84,3 +87,42 @@ def test_provider_name_normalization_rejects_empty_names():
     )
     with pytest.raises(ValueError, match="non-empty"):
         provider_safe_tool_name(" ")
+
+
+def test_project_intelligence_tools_are_read_only_and_provider_safe(
+    tmp_path,
+):
+    registry = create_tool_registry(tmp_path, mode="plan")
+    intelligence_tools = {
+        "project_health",
+        "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
+    }
+
+    assert intelligence_tools.issubset(registry.names())
+    for name in intelligence_tools:
+        tool = registry.get(name)
+        model_name = registry.model_name_for(name)
+        assert tool.permission is PermissionLevel.READ
+        assert model_name == name
+        assert PROVIDER_TOOL_NAME_PATTERN.fullmatch(model_name)
+
+
+def test_provider_sdk_imports_are_isolated_to_model_clients():
+    package_root = Path(__file__).parents[1] / "lunar_forge"
+    provider_import = re.compile(
+        r"^\s*(?:from|import)\s+(?:litellm|openai|anthropic)\b",
+        re.MULTILINE,
+    )
+    leaked_imports = []
+
+    for path in package_root.rglob("*.py"):
+        relative = path.relative_to(package_root)
+        if relative.parts[0] == "model_clients":
+            continue
+        if provider_import.search(path.read_text(encoding="utf-8")):
+            leaked_imports.append(relative.as_posix())
+
+    assert leaked_imports == []

@@ -1182,7 +1182,19 @@ def test_reviewer_prompt_defers_to_tester_browser_results():
     assert "Do not report this role's browser tool limitations" in prompt
 
 
-def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path):
+def test_parallel_read_only_phases_overlap_and_merge_deterministically(
+    monkeypatch,
+    tmp_path,
+):
+    restricted_views = []
+    original_restrict = SubagentRole.restrict
+
+    def record_restricted_view(role, registry):
+        view = original_restrict(role, registry)
+        restricted_views.append((role.name, view))
+        return view
+
+    monkeypatch.setattr(SubagentRole, "restrict", record_restricted_view)
     model = ParallelRoleModel()
     config = AppConfig(
         subagents=SubagentConfig(enabled=True, parallel=True),
@@ -1201,6 +1213,10 @@ def test_parallel_read_only_phases_overlap_and_merge_deterministically(tmp_path)
     assert model.tools_by_role["tester"] == {"read_file", "run_validation"}
     assert model.tools_by_role["reviewer"] == {"read_file"}
     assert model.writer_overlap is False
+    views_by_role = dict(restricted_views)
+    assert views_by_role["tester"] is not views_by_role["reviewer"]
+    assert views_by_role["tester"].role is TESTER_ROLE
+    assert views_by_role["reviewer"].role is REVIEWER_ROLE
 
     session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
     events = [json.loads(line) for line in session_file.read_text().splitlines()]

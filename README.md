@@ -332,22 +332,30 @@ read-only roles receive only the numbered reader.
 
 ### Read-only project intelligence
 
-Two compact built-in tools reduce broad file dumps and command guessing:
+Five compact built-in tools reduce broad file dumps and command guessing:
 
-- `project_health()` reports README and root/nested `AGENTS.md` presence, test
-  markers, package markers, validation hints, `.gitignore`, CI configuration,
-  generated/runtime folders, and suspicious tracked/runtime paths when bounded
-  Git inspection is safely available.
-- `dependency_summary()` statically parses bounded metadata from `package.json`,
-  `pyproject.toml`, `requirements.txt`, `setup.cfg`, and literal values in
-  `setup.py`. It reports package-manager hints, scripts, bounded direct and
-  development dependencies, Python dependencies and console entry points,
-  framework hints, and likely validation/development/build commands.
+| Tool | Inputs | Bounded result |
+| --- | --- | --- |
+| `project_health()` | None | README and `AGENTS.md` presence, nested instruction count, tests/config, package markers, validation hints, `.gitignore`, CI, generated/runtime folders, and names of suspicious tracked paths when safely available. |
+| `dependency_summary()` | None | Package-manager hints, scripts, bounded Node/Python dependency lists, framework hints, and likely validation, development, and build commands. |
+| `git_status()` | None | Project-scoped short status plus modified, staged, untracked, and excluded path groups. |
+| `git_diff(path=None, staged=false, max_lines=None)` | Optional project-relative file, staged selector, and line cap | Bounded tracked diff and stat; runtime, generated, and secret-looking file contents are blocked. |
+| `list_changed_files(source="both")` | `session`, `git`, or `both` | Session/Git path state with staged, untracked, excluded, and commit-candidate flags. |
 
-Neither tool installs dependencies or runs project code. Lockfile bodies are
-never parsed, manifest results are bounded, and credential-shaped returned text
-is redacted. In no-command mode, `project_health` skips its optional read-only
-Git check while retaining filesystem health signals.
+Every tool is registered with read permission and returns a JSON-serializable
+dictionary. Manifests and Git output have explicit size/count caps; lockfile
+bodies are never parsed. `dependency_summary` parses `setup.py` with the AST and
+literal evaluation only—it never imports or executes it—and redacts common URL,
+assignment, option, bearer-token, and API-key credential shapes.
+
+All five tools are available in plan mode because they cannot mutate project or
+Git state. In no-command mode, filesystem-only dependency health remains
+available, `project_health` skips its optional Git check, and
+`list_changed_files(source="session")` remains available. `git_status`,
+`git_diff`, and Git-backed `list_changed_files` requests fail clearly before
+starting Git. Suspicious or excluded path names may be reported so they can be
+removed from commit candidates, but their file bodies are not read by health
+checks and are never returned by `git_diff`.
 
 The agent prompt uses `project_health` plus `dependency_summary` for broad
 review, audit, explanation, onboarding, and feature-planning work, and uses
@@ -355,7 +363,11 @@ dependency metadata before guessing validation commands. Small targeted edits
 continue to inspect only the relevant files. Planner and Reviewer can use both
 tools, Tester can use dependency metadata, and Security can use project health;
 all remain read-only through the central permission registry and are available
-in plan mode.
+in plan mode. Provider-facing names are normalized and collision-checked by the
+central registry; these five names already satisfy the provider-safe pattern
+unchanged. The tools return provider-neutral dictionaries and contain no
+LiteLLM, OpenAI, or Anthropic translation code—provider adapters remain under
+`lunar_forge/model_clients/`.
 
 ### Optional subagent mode
 
@@ -383,12 +395,14 @@ Reviewer together. Tester can use only its existing permission-gated validation
 tools; no parallel role receives file mutation tools.
 
 Each role receives an explicit tool allowlist and cannot obtain tools outside
-it. Every concurrent role receives a separate restricted registry view and
-conversation list. All allowed mutations and commands still pass through the
-central registry, normal permission prompts, and session logging. Session
-lifecycle events include role, phase, parallel group, and start/completion/error
-state. Successful sibling results remain visible when one parallel role fails,
-and final merge/report order follows the declared phase order rather than thread
+it. Every concurrent role receives a newly created restricted registry view and
+conversation list. Those views delegate permitted calls to the shared central
+registry so path safety, session change tracking, permission checks, and output
+redaction remain single-sourced. All allowed mutations and commands still pass
+through normal permission prompts and session logging. Session lifecycle events
+include role, phase, parallel group, and start/completion/error state.
+Successful sibling results remain visible when one parallel role fails, and
+final merge/report order follows the declared phase order rather than thread
 completion order. Production parallel roles receive separate model-client
 instances so mutable provider response state is not shared. Explicit custom
 clients injected through the Python API cannot be cloned generically and must
@@ -515,23 +529,12 @@ bounded repository status without a model:
 lunar-forge git status --project C:\path\to\project
 ```
 
-The model-facing read-only registry also exposes:
-
-- `git_status()` for compact modified, staged, untracked, and excluded path
-  state;
-- `git_diff(path=None, staged=false, max_lines=None)` for bounded staged or
-  unstaged details; and
-- `list_changed_files(source="both")`, where `source` may be `session`, `git`,
-  or `both`, to combine files changed through the current registry with Git
-  state and mark commit candidates.
-
-These tools use the guarded runtime with `shell=False` and never stage, commit,
-or otherwise mutate Git. Diff commands are path-limited and omit contents from
-runtime, generated, and secret-looking paths. Reviewer and Security can use all
+The three Git intelligence tools documented above use the guarded runtime with
+argument arrays and `shell=False`; they never stage, commit, or otherwise
+mutate Git. Status and diff pathspecs are confined to the selected project even
+when it is nested inside a larger repository. Reviewer and Security can use all
 three tools; Tester can use status and changed-file metadata, and Planner can
-use status when existing dirty state affects a plan. Git-backed calls fail
-clearly outside a repository and in no-command mode, while a session-only
-changed-file query remains available because it starts no subprocess.
+use status when existing dirty state affects a plan.
 
 Tool use is task-scaled: Reviewer starts from changed-file metadata and requests
 a bounded diff only when useful; Tester uses dependency metadata when command
@@ -800,6 +803,12 @@ rollback, parallel subagents, and guarded Git finalization.
 - Session redaction covers configured environment values, sensitive keys,
   bearer tokens, and common API-key patterns; arbitrary secret-looking prose
   that matches none of those signals cannot be identified reliably.
+- Project intelligence is intentionally shallow: it inspects root manifests and
+  common markers rather than recursively resolving workspaces, dependency
+  graphs, dynamic Python configuration, or CI semantics. Credential redaction
+  is heuristic, and suspicious path names are reported as metadata even though
+  their contents remain unread. Git-backed intelligence requires an installed
+  Git executable and an existing repository.
 - Guarded Git commits are path-limited but do not lock the working tree between
   proposal and execution. External edits made during that window can change the
   content committed for an approved path, and a Git failure after `git add` may
