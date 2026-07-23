@@ -578,6 +578,117 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
     assert started == ["planner", "coder", "tester", "reviewer"]
 
 
+def test_tester_command_results_replace_reviewer_not_run_summary(tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(text="Plan: update app.py, then validate."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="write_app",
+                        name="write_file",
+                        arguments={"path": "app.py", "content": "updated"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Implemented app.py."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="validate",
+                        name="run_validation",
+                        arguments={},
+                    ),
+                    ToolCall(
+                        id="command",
+                        name="run_command",
+                        arguments={"command": "python -m pytest -q"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Validation and command checks passed."),
+            ModelResponse(
+                text=(
+                    "Changed files:\n"
+                    "- app.py\n\n"
+                    "Validation:\n"
+                    "- Not run (review-only phase).\n\n"
+                    "Commands run:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+
+    def run_validation():
+        command = "python -B -m compileall lunar_forge"
+        return {
+            "ok": True,
+            "commands": [command],
+            "results": [{"ok": True, "command": command, "exit_code": 0}],
+        }
+
+    def run_command(command):
+        return {
+            "ok": True,
+            "command": command,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 1,
+            "truncated": False,
+        }
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="write_file",
+                description="Write a file.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {
+                    "ok": True,
+                    "path": arguments["path"],
+                },
+                permission=PermissionLevel.WRITE,
+            ),
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=run_validation,
+                permission=PermissionLevel.EXECUTE,
+            ),
+            Tool(
+                name="run_command",
+                description="Run a command.",
+                parameters={"type": "object"},
+                handler=run_command,
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update the app", tmp_path, registry=registry)
+
+    assert (
+        "Validation:\n"
+        "- python -B -m compileall lunar_forge: passed "
+        "(authoritative tool result; exit code 0)"
+    ) in output
+    assert (
+        "- python -m pytest -q: passed "
+        "(authoritative tool result; via run_command; exit code 0)"
+    ) in output
+    assert "Not run (review-only phase)" not in output
+    assert "Commands run:\n- None" not in output
+
+
 @pytest.mark.parametrize(
     ("parallel", "include_reviewer_finding"),
     ((False, True), (True, True), (False, False)),

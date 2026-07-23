@@ -28,8 +28,9 @@ TESTER_ROLE = SubagentRole(
         "the routing context instead of ordinary run_validation. Report whether "
         "browser validation ran, its final URL, page title, screenshot path, full-page "
         "mode, console error count, and failed request count. Tool results are the "
-        "authoritative validation record. Stop after identifying one reasonable fix "
-        "path. Never create or edit files."
+        "authoritative validation record. Report the exact commands and outcomes "
+        "returned by run_validation and run_command. Stop after identifying one "
+        "reasonable fix path. Never create or edit files."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

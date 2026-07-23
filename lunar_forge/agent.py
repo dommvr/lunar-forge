@@ -61,6 +61,8 @@ MAX_TOOL_RESULT_CHARACTERS = 20_000
 MAX_FINAL_OUTPUT_CHARACTERS = 50_000
 MAX_SUBAGENT_ERROR_CHARACTERS = 500
 MAX_BROWSER_VALIDATION_RECORDS = 20
+MAX_COMMAND_EXECUTION_RECORDS = 50
+MAX_RECORDED_COMMAND_CHARACTERS = 500
 FINAL_SUMMARY_SECTION_NAMES = frozenset(
     {
         "changed files",
@@ -93,6 +95,8 @@ class SubagentPhaseResult:
     changed_files: tuple[str, ...] = ()
     browser_validations: tuple[BrowserValidationRecord, ...] = ()
     browser_validations_truncated: bool = False
+    command_executions: tuple[CommandExecutionRecord, ...] = ()
+    command_executions_truncated: bool = False
     validation_commands_run: bool = False
     validation_observed: bool = False
     validation_failed: bool = False
@@ -113,10 +117,20 @@ class BrowserValidationRecord:
     error: str | None
 
 
+@dataclass(frozen=True)
+class CommandExecutionRecord:
+    command: str
+    source: str
+    ok: bool
+    exit_code: int | None
+
+
 @dataclass
 class ValidationEvidence:
     browser_validations: list[BrowserValidationRecord] = field(default_factory=list)
     browser_validations_truncated: bool = False
+    command_executions: list[CommandExecutionRecord] = field(default_factory=list)
+    command_executions_truncated: bool = False
     validation_commands_run: bool = False
     validation_observed: bool = False
     validation_failed: bool = False
@@ -128,6 +142,17 @@ class ValidationEvidence:
             self.browser_validations_truncated
             or result.browser_validations_truncated
             or len(result.browser_validations) > remaining
+        )
+        command_remaining = MAX_COMMAND_EXECUTION_RECORDS - len(
+            self.command_executions
+        )
+        self.command_executions.extend(
+            result.command_executions[:command_remaining]
+        )
+        self.command_executions_truncated = (
+            self.command_executions_truncated
+            or result.command_executions_truncated
+            or len(result.command_executions) > command_remaining
         )
         self.validation_commands_run = (
             self.validation_commands_run or result.validation_commands_run
@@ -1195,6 +1220,12 @@ def _run_subagent_model_loop(
                 browser_validations_truncated=(
                     validation_evidence.browser_validations_truncated
                 ),
+                command_executions=tuple(
+                    validation_evidence.command_executions
+                ),
+                command_executions_truncated=(
+                    validation_evidence.command_executions_truncated
+                ),
                 validation_commands_run=(
                     validation_evidence.validation_commands_run
                 ),
@@ -1560,13 +1591,53 @@ def _record_validation_evidence(
 ) -> None:
     if tool_name == "run_validation":
         results = result.get("results")
+        commands = result.get("commands")
+        command_items = (
+            commands
+            if isinstance(commands, Sequence)
+            and not isinstance(commands, (str, bytes))
+            else ()
+        )
         if isinstance(results, Sequence) and not isinstance(results, (str, bytes)):
-            evidence.validation_commands_run = (
-                evidence.validation_commands_run or bool(results)
-            )
+            for index, item in enumerate(results):
+                if not isinstance(item, Mapping) or not _command_actually_ran(item):
+                    continue
+                command = item.get("command")
+                if not isinstance(command, str) or not command.strip():
+                    command = (
+                        command_items[index]
+                        if index < len(command_items)
+                        and isinstance(command_items[index], str)
+                        else None
+                    )
+                if isinstance(command, str) and command.strip():
+                    _append_command_execution(
+                        evidence,
+                        command=command,
+                        source="run_validation",
+                        result=item,
+                    )
+        evidence.validation_commands_run = evidence.validation_commands_run or any(
+            record.source == "run_validation"
+            for record in evidence.command_executions
+        )
         if result.get("permission_denied") is not True:
             evidence.validation_observed = True
             evidence.validation_failed = result.get("ok") is False
+        return
+    if tool_name == "run_command":
+        if not _command_actually_ran(result):
+            return
+        command = result.get("command")
+        if not isinstance(command, str) or not command.strip():
+            command = arguments.get("command")
+        if isinstance(command, str) and command.strip():
+            _append_command_execution(
+                evidence,
+                command=command,
+                source="run_command",
+                result=result,
+            )
         return
     if tool_name not in {
         "run_browser_validation",
@@ -1625,6 +1696,49 @@ def _record_validation_evidence(
         evidence.validation_failed = result.get("ok") is False
 
 
+def _append_command_execution(
+    evidence: ValidationEvidence,
+    *,
+    command: str,
+    source: str,
+    result: Mapping[str, Any],
+) -> None:
+    if len(evidence.command_executions) >= MAX_COMMAND_EXECUTION_RECORDS:
+        evidence.command_executions_truncated = True
+        return
+    normalized = " ".join(command.split())
+    if len(normalized) > MAX_RECORDED_COMMAND_CHARACTERS:
+        normalized = (
+            f"{normalized[: MAX_RECORDED_COMMAND_CHARACTERS - 14]}"
+            "...[truncated]"
+        )
+    raw_exit_code = result.get("exit_code")
+    exit_code = (
+        raw_exit_code
+        if isinstance(raw_exit_code, int) and not isinstance(raw_exit_code, bool)
+        else None
+    )
+    evidence.command_executions.append(
+        CommandExecutionRecord(
+            command=normalized,
+            source=source,
+            ok=result.get("ok") is True,
+            exit_code=exit_code,
+        )
+    )
+
+
+def _command_actually_ran(result: Mapping[str, Any]) -> bool:
+    if result.get("permission_denied") is True:
+        return False
+    exit_code = result.get("exit_code")
+    has_exit_code = isinstance(exit_code, int) and not isinstance(
+        exit_code,
+        bool,
+    )
+    return has_exit_code or result.get("timed_out") is True
+
+
 def _browser_not_run_reason(
     tool_name: str,
     result: Mapping[str, Any],
@@ -1665,6 +1779,7 @@ def _finalize_validation_summary(
             "No detected validation commands were run.",
             final_text,
         )
+    final_text = _apply_authoritative_command_summary(final_text, evidence)
     if not browser_intent.detected and not evidence.browser_validations:
         return final_text
 
@@ -1734,6 +1849,72 @@ def _finalize_validation_summary(
     if evidence.browser_validations_truncated:
         lines.append("- Additional browser validation records were truncated.")
     return "\n".join(lines)
+
+
+def _apply_authoritative_command_summary(
+    text: str,
+    evidence: ValidationEvidence,
+) -> str:
+    if not evidence.command_executions:
+        return text
+
+    validation_records = [
+        record
+        for record in evidence.command_executions
+        if record.source == "run_validation"
+    ]
+    replaced_sections = {"commands run"}
+    if validation_records:
+        replaced_sections.add("validation")
+    retained_text = _remove_summary_sections(text, replaced_sections)
+
+    blocks = [retained_text] if retained_text else []
+    if validation_records:
+        validation_lines = ["Validation:"]
+        validation_lines.extend(
+            _format_command_execution(record, include_source=False)
+            for record in validation_records
+        )
+        blocks.append("\n".join(validation_lines))
+
+    command_lines = ["Commands run:"]
+    command_lines.extend(
+        _format_command_execution(record, include_source=True)
+        for record in evidence.command_executions
+    )
+    if evidence.command_executions_truncated:
+        command_lines.append("- Additional command execution records were truncated.")
+    blocks.append("\n".join(command_lines))
+    return "\n\n".join(blocks)
+
+
+def _format_command_execution(
+    record: CommandExecutionRecord,
+    *,
+    include_source: bool,
+) -> str:
+    status = "passed" if record.ok else "failed"
+    details = ["authoritative tool result"]
+    if include_source:
+        details.append(f"via {record.source}")
+    if record.exit_code is not None:
+        details.append(f"exit code {record.exit_code}")
+    return f"- {record.command}: {status} ({'; '.join(details)})"
+
+
+def _remove_summary_sections(text: str, section_names: set[str]) -> str:
+    retained_lines: list[str] = []
+    suppress_section = False
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading in section_names:
+            suppress_section = True
+            continue
+        if heading is not None:
+            suppress_section = False
+        if not suppress_section:
+            retained_lines.append(line)
+    return _clean_reviewer_block(retained_lines)
 
 
 def _reviewer_advisory_text(

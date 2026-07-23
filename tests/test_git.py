@@ -8,7 +8,7 @@ import pytest
 import lunar_forge.agent as agent_module
 import lunar_forge.runtime.git as git_module
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig
+from lunar_forge.config import AppConfig, SubagentConfig
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.permissions import PermissionLevel
 from lunar_forge.runtime.git import (
@@ -618,6 +618,124 @@ def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
     assert proposal["data"]["message"] == "Update app"
     result = next(event for event in events if event["event"] == "git_commit_result")
     assert result["data"]["commit_hash"] == "abc123"
+
+
+def test_agent_commit_flow_preserves_executed_validation_summary(
+    monkeypatch,
+    tmp_path,
+):
+    validation_command = "python -B -m compileall lunar_forge"
+    model = SequenceModel(
+        (
+            ModelResponse(text="Plan: update app.py, validate, then offer a commit."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="write",
+                        name="write_file",
+                        arguments={"path": "app.py", "content": "updated"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Implemented app.py."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(id="validate", name="run_validation", arguments={}),
+                ),
+            ),
+            ModelResponse(text="Validation passed."),
+            ModelResponse(
+                text=(
+                    "Changed files:\n"
+                    "- app.py\n\n"
+                    "Validation:\n"
+                    "- Not run (review-only phase).\n\n"
+                    "Commands run:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="write_file",
+                description="Write a file.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {
+                    "ok": True,
+                    "path": arguments["path"],
+                },
+                permission=PermissionLevel.WRITE,
+            ),
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=lambda: {
+                    "ok": True,
+                    "commands": [validation_command],
+                    "results": [
+                        {
+                            "ok": True,
+                            "command": validation_command,
+                            "exit_code": 0,
+                        }
+                    ],
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    def fake_commit(project_root, message, **kwargs):
+        return {
+            "ok": True,
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M app.py"],
+            "diff_summary": "app.py | 1 +",
+            "proposed_files": ["app.py"],
+            "unrelated_files": [],
+            "excluded_files": [],
+            "session_scoped": True,
+            "message": message,
+            "approved": True,
+            "approval_requested": True,
+            "approval_reason": "Approved by user.",
+            "result_code": "commit_created",
+            "commit_hash": "abc123",
+            "committed_files": ["app.py"],
+        }
+
+    monkeypatch.setattr(agent_module, "create_git_commit", fake_commit)
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run(
+        "Update app",
+        tmp_path,
+        registry=registry,
+        offer_commit=True,
+        commit_message="Update app",
+    )
+
+    assert (
+        f"Validation:\n- {validation_command}: passed "
+        "(authoritative tool result; exit code 0)"
+    ) in output
+    assert (
+        f"Commands run:\n- {validation_command}: passed "
+        "(authoritative tool result; via run_validation; exit code 0)"
+    ) in output
+    assert "Not run (review-only phase)" not in output
+    assert "Commands run:\n- None" not in output
+    assert "Proposed commit message: Update app" in output
+    assert "- Commit created: abc123" in output
 
 
 def test_agent_logs_denied_commit_proposal_and_terminal_result(monkeypatch, tmp_path):
