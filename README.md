@@ -534,9 +534,11 @@ files to the commit.
 
 Runtime, generated, and obvious secret paths are never proposed, including
 `.agent/`, `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `dist/`,
-`build/`, `coverage/`, `.env*`, private-key filenames, and `.key`/`.pem` files.
-Git uses the same platform-aware executable resolution as local commands and
-always runs with `shell=False`.
+`build/`, framework and test caches such as `.next/` and `.pytest_cache/`,
+coverage output, `.env*`, package-manager credential files, common
+credentials/secrets filenames, and private-key or key-store files. Git uses the
+same platform-aware executable resolution as local commands and always runs
+with `shell=False`.
 
 ## Validation
 
@@ -706,7 +708,8 @@ See the comprehensive, Windows-friendly
 [manual testing guide](docs/manual-testing.md). It covers installation,
 configuration, plan and no-command modes, file inspection and line edits, all
 six project starters, validation, browser setup and managed validation,
-Playwright MCP, plugin diagnostics, sessions, rollback, and parallel subagents.
+Playwright MCP, every checked-in example project, plugin diagnostics, sessions,
+rollback, parallel subagents, and guarded Git finalization.
 
 ## Known limitations
 
@@ -729,7 +732,9 @@ Playwright MCP, plugin diagnostics, sessions, rollback, and parallel subagents.
   Explicitly injected custom model clients must tolerate concurrent requests.
 - MCP currently supports local stdio servers only. Streamable HTTP, server
   sampling/elicitation requests, dynamic tool-list refresh, and OS-level server
-  sandboxing are not implemented.
+  sandboxing are not implemented. The Playwright MCP example deliberately uses
+  `npx -y` with a floating package tag, so an uncached first run needs network
+  access and writes to npm's user cache.
 - Browser validation requires the optional Playwright extra. Managed process
   termination is best-effort; operating-system child processes spawned by a dev
   command may require manual cleanup if they ignore or outlive the parent.
@@ -739,5 +744,9 @@ Playwright MCP, plugin diagnostics, sessions, rollback, and parallel subagents.
 - Session redaction covers configured environment values, sensitive keys,
   bearer tokens, and common API-key patterns; arbitrary secret-looking prose
   that matches none of those signals cannot be identified reliably.
+- Guarded Git commits are path-limited but do not lock the working tree between
+  proposal and execution. External edits made during that window can change the
+  content committed for an approved path, and a Git failure after `git add` may
+  leave those selected paths staged for manual review.
 - Plugins run reviewed local Python in-process after approval. Capability
   declarations and output containment do not provide OS-level isolation.

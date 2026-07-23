@@ -85,6 +85,32 @@ mcp:
     assert config.enabled_servers == (server,)
 
 
+def test_checked_in_playwright_example_matches_supported_schema(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    example_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "mcp"
+        / "playwright"
+        / "mcp.yaml"
+    )
+    _write_project_config(project, example_path.read_text(encoding="utf-8"))
+
+    config = load_mcp_config(project)
+    server = config.servers["playwright"]
+
+    assert server.command == "npx.cmd"
+    assert server.args == ("-y", "@playwright/mcp@latest", "--isolated")
+    assert dict(server.env) == {}
+    assert server.enabled is True
+    assert config.enabled_servers == (server,)
+
+
 def test_project_config_overrides_user_server_fields(monkeypatch, tmp_path):
     home = tmp_path / "home"
     _isolate_user_config(monkeypatch, home)

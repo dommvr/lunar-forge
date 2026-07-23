@@ -3,6 +3,9 @@
 This is a deliberately small React frontend. Generated dependency and build
 directories are ignored and are not part of the example.
 
+Run these commands from the LunarForge repository root. The project needs
+Node.js and npm, but no secrets, global npm packages, or remote runtime APIs.
+
 ## Install
 
 ```powershell
@@ -33,5 +36,8 @@ npm run preview
 ## Cleanup
 
 ```powershell
-Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue
+$Generated = @("node_modules", "dist", "package-lock.json")
+$Generated | ForEach-Object {
+    Remove-Item -Recurse -Force -LiteralPath $_ -ErrorAction SilentlyContinue
+}
 ```

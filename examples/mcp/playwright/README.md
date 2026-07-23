@@ -3,6 +3,15 @@
 These files show the two explicit opt-ins needed to expose Playwright MCP tools
 to LunarForge on Windows. The configuration contains no credentials.
 
+`config.yaml` uses the normal application schema and turns on MCP globally for
+the selected project. `mcp.yaml` uses the supported MCP-server schema: a
+top-level `servers` mapping whose server entries accept only `command`, `args`,
+`env`, and `enabled`. `command` is a string, `args` is a list of strings,
+`enabled` is a boolean, and optional environment values must be references such
+as `${HOST_TOKEN}` rather than raw credentials. A nested `mcp: {servers: ...}`
+shape is also accepted, but the checked-in file intentionally uses the simpler
+top-level form.
+
 From the repository root, copy the examples into the browser demo:
 
 ```powershell
@@ -12,8 +21,11 @@ Copy-Item examples\mcp\playwright\mcp.yaml examples\projects\browser-demo\.agent
 lunar-forge mcp list --project examples\projects\browser-demo
 ```
 
-The diagnostic may use `npx -y` to download `@playwright/mcp` when it is not
-already cached. It should report namespaced tools such as
+The configured command uses `npx -y`, so the diagnostic may download
+`@playwright/mcp` into npm's user cache when it is not already available. This
+is an explicit consequence of enabling and running this example; it does not
+install a global npm package or require a secret. The diagnostic should report
+namespaced tools such as
 `mcp.playwright.browser_navigate` and their provider-safe aliases.
 
 Start the browser demo in one terminal:

@@ -3,6 +3,9 @@
 This example uses only `argparse` and `unittest` from the Python standard
 library. It has no third-party dependencies.
 
+Run these commands from the LunarForge repository root. No virtual environment,
+network access, or secret is required.
+
 ## Run
 
 ```powershell
@@ -24,5 +27,8 @@ python -m unittest -q
 
 ## Cleanup
 
-Python may create `__pycache__`; it is ignored by the repository and can be
-removed at any time.
+Python may create `__pycache__`; remove it with:
+
+```powershell
+Remove-Item -Recurse -Force __pycache__ -ErrorAction SilentlyContinue
+```

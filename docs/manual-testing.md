@@ -37,6 +37,7 @@ command described by the test before answering `y`. Paths beneath
 - [ ] Flask starter
 - [ ] FastAPI starter
 - [ ] Vite React starter
+- [ ] Checked-in example projects
 - [ ] Validation workflow
 - [ ] `browser-setup`
 - [ ] Managed browser validation
@@ -638,7 +639,7 @@ screenshot; the default URL remains error-free.
 **Cleanup**
 
 ```powershell
-$BrowserGenerated = @("node_modules", "dist", ".agent")
+$BrowserGenerated = @("node_modules", "dist", ".agent", "package-lock.json")
 foreach ($name in $BrowserGenerated) {
     $path = Join-Path $BrowserProject $name
     if (Test-Path -LiteralPath $path) {
@@ -696,7 +697,7 @@ or discovery errors are bounded and do not print server stderr.
 
 ```powershell
 if ($McpServer -and -not $McpServer.HasExited) { Stop-Process -Id $McpServer.Id }
-$McpGenerated = @("node_modules", "dist", ".agent")
+$McpGenerated = @("node_modules", "dist", ".agent", "package-lock.json")
 foreach ($name in $McpGenerated) {
     $path = Join-Path $McpProject $name
     if (Test-Path -LiteralPath $path) {
@@ -996,6 +997,20 @@ git config user.email "lunar-forge@example.invalid"
 git add note.txt
 git commit -m "Create baseline"
 "unrelated" | Set-Content -LiteralPath unrelated.txt -Encoding utf8
+$GitExcludedDirectories = @(
+    ".agent\artifacts\browser",
+    "node_modules\fixture",
+    "dist",
+    ".next\cache"
+)
+$GitExcludedDirectories | ForEach-Object {
+    New-Item -ItemType Directory -Force -Path $_ | Out-Null
+}
+"screenshot" | Set-Content -LiteralPath .agent\artifacts\browser\full-page.png -Encoding utf8
+"generated dependency" | Set-Content -LiteralPath node_modules\fixture\index.js -Encoding utf8
+"build output" | Set-Content -LiteralPath dist\bundle.js -Encoding utf8
+"framework cache" | Set-Content -LiteralPath .next\cache\entry.bin -Encoding utf8
+"placeholder, not a real secret" | Set-Content -LiteralPath .env -Encoding utf8
 @'
 permissions:
   mode: yes
@@ -1029,7 +1044,8 @@ Initial status shows `unrelated.txt` and `.agent` runtime files. The agent commi
 preview shows bounded status and diff output, labels only `note.txt` as changed
 by LunarForge and proposed for commit, lists `unrelated.txt` as not included,
 lists `.agent` browser artifacts, sessions, and checkpoints under excluded
-files, and shows `Proposed commit message: Update note`. Approval is required
+files. It also excludes `node_modules`, `dist`, `.next`, and `.env`, and shows
+`Proposed commit message: Update note`. Approval is required
 despite `permissions.mode: yes`. An approved run ends with:
 
 ```text
@@ -1055,6 +1071,86 @@ the prompt must explicitly say something like `commit even if validation fails`.
 
 ```powershell
 Remove-Item -Recurse -Force -LiteralPath $GitProject
+```
+
+## 22. Checked-in example project smoke tests
+
+**Purpose**
+
+Confirm that every checked-in example has runnable, source-only commands and
+that the browser demo and Vite project build without global npm packages,
+application secrets, or generated content committed to the repository.
+
+**Setup**
+
+Run from the LunarForge repository root. Python 3.11+, Node.js, and npm are
+required. Dependency installation is explicit and may need network access. A
+single disposable virtual environment is kept outside the example projects.
+
+```powershell
+$ExamplesVenv = Join-Path $ManualRoot "examples-venv"
+python -m venv $ExamplesVenv
+$ExamplesPython = Join-Path $ExamplesVenv "Scripts\python.exe"
+& $ExamplesPython -m pip install -r examples\projects\flask-api\requirements.txt -r examples\projects\fastapi-api\requirements.txt
+```
+
+**Command**
+
+```powershell
+Test-Path -LiteralPath examples\projects\static-site\index.html
+Test-Path -LiteralPath examples\projects\static-site\styles.css
+Select-String -SimpleMatch "Small pages are excellent test fixtures." examples\projects\static-site\index.html
+
+Push-Location examples\projects\python-cli
+& $ExamplesPython -B app.py --name Ada --excited
+& $ExamplesPython -B -m unittest -q
+Pop-Location
+
+Push-Location examples\projects\flask-api
+& $ExamplesPython -B -m unittest -q
+Pop-Location
+
+Push-Location examples\projects\fastapi-api
+& $ExamplesPython -B -m unittest -q
+Pop-Location
+
+Push-Location examples\projects\vite-react
+npm install
+npm run build
+Pop-Location
+
+Push-Location examples\projects\browser-demo
+npm install
+npm run build
+Pop-Location
+```
+
+**Expected result**
+
+Both static-site paths exist and the expected heading is found. The Python CLI
+prints `Hello, Ada!`; its two tests pass; and the Flask and FastAPI suites pass.
+Both npm installations remain local to their example directories, and both
+Vite builds exit with code 0 and write only local `dist` output. No command asks
+for an API key, global npm installation, cloud service, or external runtime API.
+
+**Cleanup**
+
+```powershell
+Remove-Item -Recurse -Force -LiteralPath $ExamplesVenv -ErrorAction SilentlyContinue
+$ExampleGenerated = @(
+    "examples\projects\browser-demo\node_modules",
+    "examples\projects\browser-demo\dist",
+    "examples\projects\browser-demo\package-lock.json",
+    "examples\projects\vite-react\node_modules",
+    "examples\projects\vite-react\dist",
+    "examples\projects\vite-react\package-lock.json",
+    "examples\projects\python-cli\__pycache__",
+    "examples\projects\flask-api\__pycache__",
+    "examples\projects\fastapi-api\__pycache__"
+)
+$ExampleGenerated | ForEach-Object {
+    Remove-Item -Recurse -Force -LiteralPath $_ -ErrorAction SilentlyContinue
+}
 ```
 
 ## Repository validation after documentation changes

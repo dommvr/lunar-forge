@@ -4,6 +4,12 @@ This React/Vite page is the canonical LunarForge browser-validation target. It
 has stable headings, content below the first viewport, a counter button, a form
 field, and no console errors during normal use.
 
+The demo uses no secrets, remote assets, external APIs, global npm packages, or
+model calls for its install/build/server and deterministic `browser-validate`
+workflow. Node.js, npm, and a LunarForge environment with optional browser
+support are the only prerequisites. `npm install` writes dependencies locally;
+network access is needed only when those packages are not already cached.
+
 ## Install
 
 From the repository root:
@@ -61,6 +67,11 @@ to return to the error-free default.
 
 ## Playwright MCP inspection
 
+This optional section uses the configured LunarForge model and therefore needs
+that model's normal environment-variable credential. The browser demo itself
+does not read or store the credential. `npx -y` may download the explicitly
+enabled MCP package into npm's user cache when it is not already available.
+
 Copy the checked-in Windows MCP examples into this project's local config:
 
 ```powershell
@@ -83,5 +94,8 @@ server command from `npx.cmd` to `npx`; see the MCP example README.
 ## Cleanup
 
 ```powershell
-Remove-Item -Recurse -Force node_modules,dist,.agent -ErrorAction SilentlyContinue
+$Generated = @("node_modules", "dist", ".agent", "package-lock.json")
+$Generated | ForEach-Object {
+    Remove-Item -Recurse -Force -LiteralPath $_ -ErrorAction SilentlyContinue
+}
 ```

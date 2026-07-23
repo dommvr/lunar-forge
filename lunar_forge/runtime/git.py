@@ -26,6 +26,17 @@ _TRUNCATION_MARKER = "\n...[git output truncated]"
 _EXCLUDED_DIRECTORY_NAMES = frozenset(
     {
         ".agent",
+        ".mypy_cache",
+        ".next",
+        ".nox",
+        ".nuxt",
+        ".output",
+        ".parcel-cache",
+        ".pnpm-store",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".turbo",
         "node_modules",
         ".venv",
         "venv",
@@ -33,15 +44,30 @@ _EXCLUDED_DIRECTORY_NAMES = frozenset(
         "dist",
         "build",
         "coverage",
+        "htmlcov",
+        "site-packages",
     }
 )
 _SECRET_FILENAMES = frozenset(
     {
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "credentials.yaml",
+        "credentials.yml",
         "id_rsa",
         "id_dsa",
         "id_ecdsa",
         "id_ed25519",
+        "secrets.json",
+        "secrets.toml",
+        "secrets.yaml",
+        "secrets.yml",
     }
+)
+_SECRET_SUFFIXES = frozenset(
+    {".jks", ".kdbx", ".key", ".p12", ".pem", ".pfx"}
 )
 
 
@@ -670,7 +696,7 @@ def _is_excluded_path(path: str) -> bool:
         return True
     if filename in _SECRET_FILENAMES:
         return True
-    return normalized.suffix.casefold() in {".key", ".pem"}
+    return normalized.suffix.casefold() in _SECRET_SUFFIXES
 
 
 def _diff_summary(

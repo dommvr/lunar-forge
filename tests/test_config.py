@@ -135,6 +135,29 @@ def test_mcp_integration_requires_explicit_config_enablement(monkeypatch, tmp_pa
     assert load_config(project).mcp.enabled is True
 
 
+def test_checked_in_playwright_application_config_enables_mcp(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    config_directory = project / ".agent"
+    config_directory.mkdir(parents=True)
+    example_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "mcp"
+        / "playwright"
+        / "config.yaml"
+    )
+    (config_directory / "config.yaml").write_text(
+        example_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    assert load_config(project).mcp.enabled is True
+
+
 def test_plugin_integration_defaults_to_disabled(monkeypatch, tmp_path):
     _isolate_user_config(monkeypatch, tmp_path / "home")
     project = tmp_path / "project"

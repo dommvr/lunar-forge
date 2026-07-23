@@ -3,6 +3,9 @@
 This example is plain HTML and CSS. It has no package manager, dependency
 installation, or build step.
 
+Run these commands from the LunarForge repository root. The page uses no
+secrets, remote assets, or external services.
+
 ## Open directly
 
 From the repository root on Windows:

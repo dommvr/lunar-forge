@@ -3,25 +3,28 @@
 This example exposes two typed JSON endpoints and keeps its test import-level
 so no extra HTTP client dependency is needed. Nothing installs automatically.
 
+Run these commands from the LunarForge repository root. Python 3.11 or newer is
+required; the app needs no secrets or external service.
+
 ## Create an environment and install
 
 ```powershell
 cd examples/projects/fastapi-api
 python -m venv .venv
-& .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+$ExamplePython = ".\.venv\Scripts\python.exe"
+& $ExamplePython -m pip install -r requirements.txt
 ```
 
 ## Test
 
 ```powershell
-python -m unittest -q
+& $ExamplePython -m unittest -q
 ```
 
 ## Run
 
 ```powershell
-uvicorn app:app --reload
+& $ExamplePython -m uvicorn app:app --reload
 ```
 
 Open <http://127.0.0.1:8000/docs>. Stop the server with `Ctrl+C`.
@@ -29,6 +32,5 @@ Open <http://127.0.0.1:8000/docs>. Stop the server with `Ctrl+C`.
 ## Cleanup
 
 ```powershell
-deactivate
 Remove-Item -Recurse -Force .venv
 ```

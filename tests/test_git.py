@@ -40,7 +40,14 @@ def _result(args, *, ok=True, stdout="", stderr=""):
     )
 
 
-def _mock_git(monkeypatch, root, status_output, *, diff_output="1 file changed"):
+def _mock_git(
+    monkeypatch,
+    root,
+    status_output,
+    *,
+    diff_output="1 file changed",
+    fail_on=None,
+):
     calls = []
 
     def fake_run_git(cwd, arguments, timeout_ms):
@@ -53,8 +60,12 @@ def _mock_git(monkeypatch, root, status_output, *, diff_output="1 file changed")
         if args[:4] == ("diff", "--stat", "--no-ext-diff", "HEAD"):
             return _result(args, stdout=f"{diff_output}\n")
         if args[:2] == ("add", "--"):
+            if fail_on == "add":
+                return _result(args, ok=False, stderr="git add failed")
             return _result(args)
         if args[:2] == ("commit", "--only"):
+            if fail_on == "commit":
+                return _result(args, ok=False, stderr="git commit failed")
             return _result(args, stdout="commit created\n")
         if args == ("rev-parse", "HEAD"):
             return _result(args, stdout="abc123def456\n")
@@ -165,11 +176,19 @@ def test_generated_runtime_and_secret_files_are_excluded(monkeypatch, tmp_path):
             "?? .venv/pyvenv.cfg",
             "?? venv/pyvenv.cfg",
             "?? pkg/__pycache__/app.pyc",
+            "?? frontend/.next/cache/webpack.bin",
+            "?? frontend/.nuxt/server/index.mjs",
+            "?? .pytest_cache/v/cache/nodeids",
+            "?? htmlcov/index.html",
             "?? dist/app.js",
             "?? build/output.txt",
             "?? coverage/index.html",
             "?? .env",
+            "?? .npmrc",
+            "?? deploy/credentials.json",
+            "?? deploy/secrets.toml",
             "?? certs/private.pem",
+            "?? certs/signing.p12",
             "",
         )
     )
@@ -187,11 +206,19 @@ def test_generated_runtime_and_secret_files_are_excluded(monkeypatch, tmp_path):
         ".venv/pyvenv.cfg",
         "venv/pyvenv.cfg",
         "pkg/__pycache__/app.pyc",
+        "frontend/.next/cache/webpack.bin",
+        "frontend/.nuxt/server/index.mjs",
+        ".pytest_cache/v/cache/nodeids",
+        "htmlcov/index.html",
         "dist/app.js",
         "build/output.txt",
         "coverage/index.html",
         ".env",
+        ".npmrc",
+        "deploy/credentials.json",
+        "deploy/secrets.toml",
         "certs/private.pem",
+        "certs/signing.p12",
     }
 
 
@@ -246,6 +273,47 @@ def test_denied_commit_formats_full_proposal_and_clear_result(monkeypatch, tmp_p
     assert "Bounded diff summary:\ncurrent.py | 2 +-" in formatted
     assert "Proposed commit message: Update current file" in formatted
     assert formatted.endswith("- Commit not created: approval denied")
+
+
+@pytest.mark.parametrize(
+    ("fail_on", "result_code", "unexpected_command"),
+    (
+        ("add", "git_add_failed", "commit"),
+        ("commit", "git_commit_failed", "rev-parse-head"),
+    ),
+)
+def test_git_mutation_failures_stop_without_reporting_a_commit(
+    monkeypatch,
+    tmp_path,
+    fail_on,
+    result_code,
+    unexpected_command,
+):
+    calls = _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M current.py\0",
+        fail_on=fail_on,
+    )
+
+    result = create_git_commit(
+        tmp_path,
+        "Update current file",
+        session_files=("current.py",),
+        approval_callback=lambda request: True,
+    )
+    arguments = [args for _, args, _ in calls]
+
+    assert result["ok"] is False
+    assert result["result_code"] == result_code
+    assert "commit_hash" not in result
+    if unexpected_command == "commit":
+        assert not any(args[0] == "commit" for args in arguments)
+    else:
+        assert ("rev-parse", "HEAD") not in arguments
+    assert format_git_commit_result(result).endswith(
+        f"- Commit not created: git {fail_on} failed"
+    )
 
 
 def test_clean_commit_request_reports_no_changes_without_a_proposal(
@@ -305,6 +373,21 @@ def test_git_subprocess_uses_resolver_and_shell_false(monkeypatch, tmp_path):
     assert captured["cwd"] == tmp_path
     assert captured["shell"] is False
     assert captured["check"] is False
+
+
+def test_agent_never_prepares_a_commit_without_opt_in(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: pytest.fail("Git must remain opt-in"),
+    )
+
+    output = CodeAgent(
+        AppConfig(),
+        model_client=SequenceModel((ModelResponse(text="Task complete."),)),
+    ).run("Inspect the project", tmp_path)
+
+    assert "Git:" not in output
 
 
 def test_failed_validation_prevents_auto_offered_commit(monkeypatch, tmp_path):
@@ -535,6 +618,55 @@ def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
     assert proposal["data"]["message"] == "Update app"
     result = next(event for event in events if event["event"] == "git_commit_result")
     assert result["data"]["commit_hash"] == "abc123"
+
+
+def test_agent_logs_denied_commit_proposal_and_terminal_result(monkeypatch, tmp_path):
+    session = agent_module.create_session_logger(tmp_path)
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "result_code": "approval_denied",
+            "repository_root": str(tmp_path),
+            "project_root": str(tmp_path),
+            "status_short": [" M app.py", "?? .agent/sessions/session.jsonl"],
+            "diff_summary": "app.py | 1 +",
+            "proposed_files": ["app.py"],
+            "unrelated_files": [],
+            "excluded_files": [".agent/sessions/session.jsonl"],
+            "session_scoped": True,
+            "message": "Update app",
+            "approved": False,
+            "approval_requested": True,
+            "approval_reason": "Approval denied by user.",
+            "permission_denied": True,
+            "error": "Approval denied by user.",
+        },
+    )
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        "Task complete.",
+        request="Update app",
+        root=tmp_path,
+        mode="default",
+        session=session,
+        changed_files=("app.py",),
+        validation_evidence=agent_module.ValidationEvidence(),
+        offer_commit=True,
+        commit_message="Update app",
+    )
+
+    events = [json.loads(line) for line in session.path.read_text().splitlines()]
+    approval = next(
+        event for event in events if event["event"] == "git_commit_approval"
+    )
+    result = next(event for event in events if event["event"] == "git_commit_result")
+    assert "- Commit not created: approval denied" in output
+    assert approval["data"]["approved"] is False
+    assert result["data"]["result_code"] == "approval_denied"
+    assert result["data"]["commit_created"] is False
+    assert not any(event["event"] == "git_commit_created" for event in events)
 
 
 def test_git_finalization_preserves_browser_and_subagent_summaries(
