@@ -514,6 +514,24 @@ bounded repository status without a model:
 lunar-forge git status --project C:\path\to\project
 ```
 
+The model-facing read-only registry also exposes:
+
+- `git_status()` for compact modified, staged, untracked, and excluded path
+  state;
+- `git_diff(path=None, staged=false, max_lines=None)` for bounded staged or
+  unstaged details; and
+- `list_changed_files(source="both")`, where `source` may be `session`, `git`,
+  or `both`, to combine files changed through the current registry with Git
+  state and mark commit candidates.
+
+These tools use the guarded runtime with `shell=False` and never stage, commit,
+or otherwise mutate Git. Diff commands are path-limited and omit contents from
+runtime, generated, and secret-looking paths. Reviewer and Security can use all
+three tools; Tester can use status and changed-file metadata, and Planner can
+use status when existing dirty state affects a plan. Git-backed calls fail
+clearly outside a repository and in no-command mode, while a session-only
+changed-file query remains available because it starts no subprocess.
+
 Create a deterministic commit proposal with an explicit message:
 
 ```powershell

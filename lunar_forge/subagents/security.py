@@ -10,6 +10,9 @@ _ALLOWED_TOOLS = frozenset(
         "grep",
         "glob",
         "project_health",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
     }
 )
 
@@ -21,9 +24,10 @@ SECURITY_ROLE = SubagentRole(
     ),
     system_prompt_fragment=(
         "Act as the security reviewer. Trace trust and permission boundaries, flag "
-        "specific bypasses or unsafe defaults, and use project_health when repository "
-        "runtime or tracked-path signals are relevant. Do not mutate files or "
-        "execute commands. Existing safety rules are authoritative."
+        "specific bypasses or unsafe defaults. Use project_health and changed-file "
+        "Git metadata when runtime, generated, secret-looking, or tracked paths are "
+        "relevant. Do not mutate files or execute commands. Existing safety rules "
+        "are authoritative."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

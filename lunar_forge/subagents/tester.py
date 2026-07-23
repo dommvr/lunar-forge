@@ -13,6 +13,8 @@ _ALLOWED_TOOLS = frozenset(
         "read_file_with_line_numbers",
         "grep",
         "dependency_summary",
+        "git_status",
+        "list_changed_files",
     }
 )
 
@@ -25,8 +27,9 @@ TESTER_ROLE = SubagentRole(
     system_prompt_fragment=(
         "Act as the tester. Use the existing permission-gated command tools for "
         "focused validation. Use dependency_summary before guessing commands when "
-        "the validation route is unclear. For application-detected browser intent, "
-        "use available "
+        "the validation route is unclear, and use changed-file or Git status "
+        "metadata only to focus validation. For application-detected browser "
+        "intent, use available "
         "Playwright MCP tools or the built-in browser validation tool requested by "
         "the routing context instead of ordinary run_validation. Report whether "
         "browser validation ran, its final URL, page title, screenshot path, full-page "

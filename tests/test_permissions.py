@@ -124,10 +124,22 @@ def test_plan_and_no_command_modes_block_command_execution(tmp_path):
 
     assert "run_command" not in plan_registry.names()
     assert "run_command" not in no_command_registry.names()
-    assert {"project_health", "dependency_summary"}.issubset(plan_registry.names())
-    assert {"project_health", "dependency_summary"}.issubset(
+    read_only_intelligence_tools = {
+        "project_health",
+        "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
+    }
+    assert read_only_intelligence_tools.issubset(plan_registry.names())
+    assert read_only_intelligence_tools.issubset(
         no_command_registry.names()
     )
+    assert no_command_registry.execute("git_status", {})["ok"] is False
+    assert "No-command mode" in no_command_registry.execute(
+        "git_diff",
+        {},
+    )["error"]
 
     for mode, expected_reason in (
         ("plan", "Plan mode blocks"),

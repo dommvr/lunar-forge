@@ -13,6 +13,7 @@ _ALLOWED_TOOLS = frozenset(
         "detect_project",
         "project_health",
         "dependency_summary",
+        "git_status",
     }
 )
 
@@ -27,8 +28,9 @@ PLANNER_ROLE = SubagentRole(
         "AGENTS.md instructions, and return an ordered plan with likely files and "
         "validation. For broad review or onboarding work, use project_health "
         "before opening many files. Use dependency_summary when validation commands "
-        "are uncertain. Do not call broad tools for a tiny targeted edit. Never "
-        "edit files or run commands."
+        "are uncertain, and git_status when existing dirty state affects the plan. "
+        "Do not call broad tools for a tiny targeted edit. Never edit files or run "
+        "commands."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

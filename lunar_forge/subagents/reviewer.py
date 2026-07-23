@@ -11,6 +11,9 @@ _ALLOWED_TOOLS = frozenset(
         "glob",
         "project_health",
         "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
     }
 )
 
@@ -25,7 +28,8 @@ REVIEWER_ROLE = SubagentRole(
         "findings with file references, and do not modify project state. Prioritize "
         "correctness and maintainability over stylistic preferences. Use project "
         "health or dependency metadata only when the review is broad enough to need "
-        "it. Validation "
+        "it. Prefer list_changed_files and git_diff over rereading the whole project "
+        "when reviewing changes. Validation "
         "status belongs to tester and tool results. In parallel mode the tester may "
         "still be running. Do not make global browser-validation status claims or "
         "claims about whether screenshots, console errors, failed requests, page "

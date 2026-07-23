@@ -125,6 +125,10 @@ Use project intelligence deliberately:
   commands, call dependency_summary and prefer its bounded manifest metadata.
 - For a tiny targeted edit, do not call broad intelligence tools unless the
   user also requested a project-wide review. Tool calls are not a checklist.
+- Before a review, final change summary, or commit proposal, prefer
+  list_changed_files and then git_diff when Git changes exist. Do not request
+  repeated diffs when no files changed, and never use Git tools to stage or
+  mutate files.
 
 For precise file changes:
 - Prefer read_file_with_line_numbers before any line-based edit so the selected

@@ -14,10 +14,16 @@ from lunar_forge.permissions import PermissionLevel
 from lunar_forge.runtime.git import (
     create_git_commit,
     format_git_commit_result,
+    git_diff,
     git_status,
+    list_changed_files,
     prepare_git_commit,
 )
-from lunar_forge.tools.registry import Tool, ToolRegistry
+from lunar_forge.tools.registry import (
+    Tool,
+    ToolRegistry,
+    create_tool_registry,
+)
 
 
 class SequenceModel:
@@ -46,6 +52,7 @@ def _mock_git(
     status_output,
     *,
     diff_output="1 file changed",
+    detail_output="",
     fail_on=None,
 ):
     calls = []
@@ -59,6 +66,10 @@ def _mock_git(
             return _result(args, stdout=status_output)
         if args[:4] == ("diff", "--stat", "--no-ext-diff", "HEAD"):
             return _result(args, stdout=f"{diff_output}\n")
+        if args and args[0] == "diff" and "--stat" in args:
+            return _result(args, stdout=f"{diff_output}\n")
+        if args and args[0] == "diff" and "--unified=3" in args:
+            return _result(args, stdout=detail_output)
         if args[:2] == ("add", "--"):
             if fail_on == "add":
                 return _result(args, ok=False, stderr="git add failed")
@@ -104,6 +115,57 @@ def test_status_in_repository_returns_short_status(monkeypatch, tmp_path):
         {"status": " M", "path": "README.md"},
         {"status": "??", "path": "src/new.py"},
     ]
+
+
+def test_clean_repo_status_is_compact(monkeypatch, tmp_path):
+    calls = _mock_git(monkeypatch, tmp_path, "")
+
+    result = git_status(tmp_path)
+
+    assert result["ok"] is True
+    assert result["clean"] is True
+    assert result["status_short"] == []
+    assert result["modified_files"] == []
+    assert result["staged_files"] == []
+    assert result["untracked_files"] == []
+    assert result["counts"] == {
+        "changed": 0,
+        "modified": 0,
+        "staged": 0,
+        "untracked": 0,
+        "excluded": 0,
+    }
+    assert [args for _, args, _ in calls] == [
+        ("rev-parse", "--show-toplevel"),
+        ("status", "--short", "--untracked-files=all", "-z"),
+    ]
+
+
+def test_dirty_repo_status_classifies_staged_untracked_and_excluded(
+    monkeypatch,
+    tmp_path,
+):
+    _mock_git(
+        monkeypatch,
+        tmp_path,
+        "M  staged.py\0 M work.py\0?? new.py\0?? .env\0",
+    )
+
+    result = git_status(tmp_path)
+
+    assert result["ok"] is True
+    assert result["clean"] is False
+    assert result["modified_files"] == ["staged.py", "work.py"]
+    assert result["staged_files"] == ["staged.py"]
+    assert result["untracked_files"] == ["new.py", ".env"]
+    assert result["excluded_files"] == [".env"]
+    assert result["counts"] == {
+        "changed": 4,
+        "modified": 2,
+        "staged": 1,
+        "untracked": 2,
+        "excluded": 1,
+    }
 
 
 def test_commit_requires_approval_even_in_yes_mode(monkeypatch, tmp_path):
@@ -163,6 +225,200 @@ def test_no_command_blocks_status_without_git_execution(monkeypatch, tmp_path):
 
     assert result["ok"] is False
     assert "No-command mode" in result["error"]
+
+
+def test_git_diff_is_bounded_and_uses_only_read_only_git_commands(
+    monkeypatch,
+    tmp_path,
+):
+    detail = "\n".join(f"+line {index}" for index in range(20))
+    calls = _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M app.py\0?? .env\0?? dist/bundle.js\0",
+        diff_output="app.py | 20 ++++++++++++++++++++",
+        detail_output=detail,
+    )
+
+    result = git_diff(tmp_path, max_lines=5)
+
+    assert result["ok"] is True
+    assert result["files"] == ["app.py"]
+    assert result["excluded_files"] == []
+    assert result["untracked_files"] == [".env", "dist/bundle.js"]
+    assert result["summary"] == "app.py | 20 ++++++++++++++++++++"
+    assert result["line_count"] == 20
+    assert result["max_lines"] == 5
+    assert result["truncated"] is True
+    assert result["diff"].startswith("+line 0\n+line 1")
+    assert "line 6" not in result["diff"]
+    arguments = [args for _, args, _ in calls]
+    assert all(args[0] in {"rev-parse", "status", "diff"} for args in arguments)
+    assert not any(args[0] in {"add", "commit"} for args in arguments)
+    diff_arguments = [args for args in arguments if args[0] == "diff"]
+    assert len(diff_arguments) == 2
+    assert all("app.py" in args for args in diff_arguments)
+    assert all(".env" not in args for args in diff_arguments)
+    assert all("dist/bundle.js" not in args for args in diff_arguments)
+
+
+def test_git_diff_blocks_excluded_file_content(monkeypatch, tmp_path):
+    calls = _mock_git(monkeypatch, tmp_path, " M .env\0")
+
+    result = git_diff(tmp_path, path=".env")
+
+    assert result["ok"] is False
+    assert result["excluded_files"] == [".env"]
+    assert "excluded runtime, generated, or secret-looking" in result["error"]
+    assert not any(args[0] == "diff" for _, args, _ in calls)
+
+
+def test_git_diff_supports_staged_changes(monkeypatch, tmp_path):
+    calls = _mock_git(
+        monkeypatch,
+        tmp_path,
+        "M  staged.py\0 M unstaged.py\0",
+        diff_output="staged.py | 1 +",
+        detail_output="diff --git a/staged.py b/staged.py\n+staged\n",
+    )
+
+    result = git_diff(tmp_path, staged=True)
+
+    assert result["ok"] is True
+    assert result["staged"] is True
+    assert result["files"] == ["staged.py"]
+    diff_arguments = [
+        args for _, args, _ in calls if args and args[0] == "diff"
+    ]
+    assert len(diff_arguments) == 2
+    assert all("--cached" in args for args in diff_arguments)
+    assert all("unstaged.py" not in args for args in diff_arguments)
+
+
+def test_git_diff_and_changed_files_fail_outside_repository(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        git_module,
+        "_run_git",
+        lambda cwd, arguments, timeout_ms: _result(
+            arguments,
+            ok=False,
+            stderr="not a git repository",
+        ),
+    )
+
+    diff_result = git_diff(tmp_path)
+    changed_result = list_changed_files(tmp_path, source="git")
+
+    assert diff_result == {
+        "ok": False,
+        "error": "Project is not inside a Git repository.",
+    }
+    assert changed_result["ok"] is False
+    assert changed_result["source"] == "git"
+    assert changed_result["error"] == "Project is not inside a Git repository."
+
+
+def test_list_changed_files_combines_session_and_git_state(
+    monkeypatch,
+    tmp_path,
+):
+    _mock_git(
+        monkeypatch,
+        tmp_path,
+        (
+            " M app.py\0M  staged.py\0?? new.py\0?? .env\0"
+            "?? dist/bundle.js\0 M unrelated.py\0"
+        ),
+    )
+
+    result = list_changed_files(
+        tmp_path,
+        source="both",
+        session_files=("app.py", "new.py", ".env", "session_only.py"),
+    )
+    by_path = {item["path"]: item for item in result["files"]}
+
+    assert result["ok"] is True
+    assert result["staged_files"] == ["staged.py"]
+    assert result["untracked_files"] == ["new.py", ".env", "dist/bundle.js"]
+    assert result["excluded_files"] == [".env", "dist/bundle.js"]
+    assert result["commit_candidates"] == ["app.py", "new.py"]
+    assert by_path["app.py"] == {
+        "path": "app.py",
+        "session_changed": True,
+        "git_changed": True,
+        "git_modified": True,
+        "staged": False,
+        "untracked": False,
+        "status": " M",
+        "excluded": False,
+        "commit_candidate": True,
+    }
+    assert by_path["new.py"]["session_changed"] is True
+    assert by_path["new.py"]["untracked"] is True
+    assert by_path["staged.py"]["staged"] is True
+    assert by_path["staged.py"]["commit_candidate"] is False
+    assert by_path["session_only.py"]["git_changed"] is False
+    assert by_path["session_only.py"]["commit_candidate"] is False
+    assert by_path[".env"]["excluded"] is True
+
+
+def test_session_changed_files_work_without_git_or_commands(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        git_module,
+        "_run_git",
+        lambda *args, **kwargs: pytest.fail("Git execution was not expected"),
+    )
+
+    result = list_changed_files(
+        tmp_path,
+        source="session",
+        session_files=("app.py", "app.py", "../../../outside.py"),
+        mode="no-command",
+    )
+
+    assert result["ok"] is True
+    assert result["repository_root"] is None
+    assert result["session_files"] == ["app.py"]
+    assert result["git_files"] == []
+    assert result["commit_candidates"] == ["app.py"]
+
+
+def test_registry_tracks_successful_session_file_mutations(tmp_path):
+    registry = create_tool_registry(tmp_path, mode="yes")
+
+    write_result = registry.execute(
+        "write_file",
+        {"path": "created.py", "content": "value = 1\n"},
+    )
+    changed_result = registry.execute(
+        "list_changed_files",
+        {"source": "session"},
+    )
+
+    assert write_result["ok"] is True
+    assert registry.session_changed_files() == ("created.py",)
+    assert changed_result["ok"] is True
+    assert changed_result["session_files"] == ["created.py"]
+    assert changed_result["files"] == [
+        {
+            "path": "created.py",
+            "session_changed": True,
+            "git_changed": False,
+            "git_modified": False,
+            "staged": False,
+            "untracked": False,
+            "status": None,
+            "excluded": False,
+            "commit_candidate": True,
+        }
+    ]
 
 
 def test_generated_runtime_and_secret_files_are_excluded(monkeypatch, tmp_path):

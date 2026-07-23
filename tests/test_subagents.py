@@ -44,6 +44,7 @@ EXPECTED_ALLOWED_TOOLS = {
         "detect_project",
         "project_health",
         "dependency_summary",
+        "git_status",
     },
     "coder": {
         "list_dir",
@@ -64,6 +65,9 @@ EXPECTED_ALLOWED_TOOLS = {
         "glob",
         "project_health",
         "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
     },
     "tester": {
         "run_command",
@@ -74,6 +78,8 @@ EXPECTED_ALLOWED_TOOLS = {
         "read_file_with_line_numbers",
         "grep",
         "dependency_summary",
+        "git_status",
+        "list_changed_files",
     },
     "security": {
         "read_file",
@@ -81,6 +87,9 @@ EXPECTED_ALLOWED_TOOLS = {
         "grep",
         "glob",
         "project_health",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
     },
     "scaffolder": {"create_dir", "write_file", "run_command", "run_validation"},
 }

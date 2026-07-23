@@ -19,7 +19,14 @@ from lunar_forge.runtime.local_runner import resolve_executable
 DEFAULT_GIT_TIMEOUT_MS = 30_000
 MAX_GIT_OUTPUT_CHARACTERS = 50_000
 MAX_DIFF_SUMMARY_CHARACTERS = 20_000
+MAX_GIT_DIFF_CHARACTERS = 40_000
+DEFAULT_GIT_DIFF_MAX_LINES = 400
+MAX_GIT_DIFF_LINES = 2_000
 MAX_STATUS_ENTRIES = 1_000
+MAX_STATUS_PATH_SUMMARIES = 200
+MAX_CHANGED_FILE_ENTRIES = 500
+MAX_CHANGED_PATH_CHARACTERS = 1_000
+MAX_SESSION_PATH_CHARACTERS = 50_000
 MAX_PROPOSED_FILES = 200
 MAX_COMMIT_MESSAGE_CHARACTERS = 200
 _TRUNCATION_MARKER = "\n...[git output truncated]"
@@ -187,6 +194,27 @@ def git_status(
             "repository_root": str(repository_root),
             "status_short": [],
         }
+    modified_files = [
+        entry.path for entry in entries if entry.status != "??"
+    ]
+    staged_files = [
+        entry.path for entry in entries if _entry_is_staged(entry)
+    ]
+    untracked_files = [
+        entry.path for entry in entries if entry.status == "??"
+    ]
+    excluded_files = [
+        entry.path for entry in entries if _is_excluded_path(entry.path)
+    ]
+    path_groups_truncated = any(
+        len(paths) > MAX_STATUS_PATH_SUMMARIES
+        for paths in (
+            modified_files,
+            staged_files,
+            untracked_files,
+            excluded_files,
+        )
+    )
     return {
         "ok": True,
         "repository_root": str(repository_root),
@@ -197,7 +225,381 @@ def git_status(
             {"status": entry.status, "path": entry.path}
             for entry in entries
         ],
-        "truncated": command.truncated,
+        "modified_files": modified_files[:MAX_STATUS_PATH_SUMMARIES],
+        "staged_files": staged_files[:MAX_STATUS_PATH_SUMMARIES],
+        "untracked_files": untracked_files[:MAX_STATUS_PATH_SUMMARIES],
+        "excluded_files": excluded_files[:MAX_STATUS_PATH_SUMMARIES],
+        "counts": {
+            "changed": len(entries),
+            "modified": len(modified_files),
+            "staged": len(staged_files),
+            "untracked": len(untracked_files),
+            "excluded": len(excluded_files),
+        },
+        "path_groups_truncated": path_groups_truncated,
+        "truncated": command.truncated or path_groups_truncated,
+    }
+
+
+def git_diff(
+    project_root: str | Path,
+    path: str | None = None,
+    staged: bool = False,
+    max_lines: int | None = None,
+    *,
+    mode: str = "default",
+    timeout_ms: int = DEFAULT_GIT_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """Return a bounded, path-limited diff without exposing excluded files."""
+    if mode.strip().lower() == "no-command":
+        return {
+            "ok": False,
+            "error": "No-command mode blocks Git command execution.",
+        }
+    if not isinstance(staged, bool):
+        return {"ok": False, "error": "Git staged must be a boolean."}
+    line_limit = (
+        DEFAULT_GIT_DIFF_MAX_LINES
+        if max_lines is None
+        else max_lines
+    )
+    if (
+        isinstance(line_limit, bool)
+        or not isinstance(line_limit, int)
+        or line_limit < 1
+        or line_limit > MAX_GIT_DIFF_LINES
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "Git max_lines must be an integer from 1 to "
+                f"{MAX_GIT_DIFF_LINES}."
+            ),
+        }
+    if path is not None and (
+        not isinstance(path, str)
+        or not path.strip()
+        or path.strip() in {".", "./"}
+    ):
+        return {
+            "ok": False,
+            "error": "Git diff path must be a non-empty project-relative file path.",
+        }
+
+    status_result = git_status(
+        project_root,
+        mode=mode,
+        timeout_ms=timeout_ms,
+    )
+    if status_result.get("ok") is not True:
+        return {
+            "ok": False,
+            "error": status_result.get("error", "Could not inspect Git status."),
+        }
+    root = Path(str(status_result["project_root"])).resolve()
+    repository_root = Path(str(status_result["repository_root"])).resolve()
+    entries = _status_entries(status_result)
+
+    requested_path: str | None = None
+    if path is not None:
+        requested_path_result = _project_path_to_repository(
+            root,
+            repository_root,
+            path,
+        )
+        if requested_path_result[0] is False:
+            return {"ok": False, "error": requested_path_result[1]}
+        requested_path = requested_path_result[1]
+        if _is_excluded_path(requested_path):
+            return {
+                "ok": False,
+                "error": (
+                    "Git diff is unavailable for excluded runtime, generated, "
+                    "or secret-looking paths."
+                ),
+                "excluded_files": [requested_path],
+            }
+
+    relevant_entries = [
+        entry
+        for entry in entries
+        if (
+            _entry_is_staged(entry)
+            if staged
+            else _entry_has_worktree_change(entry)
+        )
+        and entry.status != "??"
+        and _path_is_within_project(repository_root, root, entry.path)
+    ]
+    excluded_files = _stable_unique(
+        [
+            entry.path
+            for entry in relevant_entries
+            if _is_excluded_path(entry.path)
+        ]
+    )
+    untracked_files = _stable_unique(
+        [
+            entry.path
+            for entry in entries
+            if entry.status == "??"
+            and _path_is_within_project(repository_root, root, entry.path)
+        ]
+    )
+    files = (
+        [requested_path]
+        if requested_path is not None
+        else _stable_unique(
+            [
+                entry.path
+                for entry in relevant_entries
+                if not _is_excluded_path(entry.path)
+            ]
+        )
+    )
+    files = [item for item in files if item is not None]
+    files_truncated = len(files) > MAX_CHANGED_FILE_ENTRIES
+    files = files[:MAX_CHANGED_FILE_ENTRIES]
+    if not files:
+        return {
+            "ok": True,
+            "repository_root": str(repository_root),
+            "project_root": str(root),
+            "path": path,
+            "staged": staged,
+            "files": [],
+            "excluded_files": excluded_files,
+            "untracked_files": untracked_files,
+            "summary": "No eligible tracked diff was available.",
+            "diff": "",
+            "line_count": 0,
+            "max_lines": line_limit,
+            "truncated": False,
+        }
+
+    cached_arguments = ("--cached",) if staged else ()
+    summary_result = _run_git(
+        repository_root,
+        (
+            "diff",
+            *cached_arguments,
+            "--stat",
+            "--no-ext-diff",
+            "--no-color",
+            "--",
+            *files,
+        ),
+        timeout_ms,
+    )
+    if not summary_result.ok:
+        return {
+            "ok": False,
+            "error": summary_result.error or "Could not read Git diff summary.",
+        }
+    diff_result = _run_git(
+        repository_root,
+        (
+            "diff",
+            *cached_arguments,
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=3",
+            "--",
+            *files,
+        ),
+        timeout_ms,
+    )
+    if not diff_result.ok:
+        return {
+            "ok": False,
+            "error": diff_result.error or "Could not read Git diff.",
+        }
+    diff_text, diff_truncated, line_count = _bounded_diff(
+        diff_result.stdout,
+        line_limit,
+    )
+    summary, summary_truncated = _bounded(
+        summary_result.stdout.strip(),
+        MAX_DIFF_SUMMARY_CHARACTERS,
+    )
+    return {
+        "ok": True,
+        "repository_root": str(repository_root),
+        "project_root": str(root),
+        "path": path,
+        "staged": staged,
+        "files": files,
+        "excluded_files": excluded_files[:MAX_CHANGED_FILE_ENTRIES],
+        "untracked_files": untracked_files[:MAX_CHANGED_FILE_ENTRIES],
+        "summary": summary,
+        "diff": diff_text,
+        "line_count": line_count,
+        "max_lines": line_limit,
+        "truncated": bool(
+            diff_result.truncated
+            or summary_result.truncated
+            or diff_truncated
+            or summary_truncated
+            or files_truncated
+            or len(excluded_files) > MAX_CHANGED_FILE_ENTRIES
+            or len(untracked_files) > MAX_CHANGED_FILE_ENTRIES
+        ),
+    }
+
+
+def list_changed_files(
+    project_root: str | Path,
+    source: str = "both",
+    *,
+    session_files: Sequence[str] = (),
+    mode: str = "default",
+    timeout_ms: int = DEFAULT_GIT_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """Combine bounded session-changed paths with current Git state."""
+    normalized_source = source.strip().lower() if isinstance(source, str) else ""
+    if normalized_source not in {"session", "git", "both"}:
+        return {
+            "ok": False,
+            "error": "Changed-file source must be one of: session, git, both.",
+        }
+    try:
+        root = _validated_project_root(project_root)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+    session_paths, session_truncated = _normalized_session_paths(
+        root,
+        session_files,
+    )
+    repository_root: Path | None = None
+    entries: tuple[GitStatusEntry, ...] = ()
+    outside_project_files: list[str] = []
+    if normalized_source in {"git", "both"}:
+        status_result = git_status(
+            root,
+            mode=mode,
+            timeout_ms=timeout_ms,
+        )
+        if status_result.get("ok") is not True:
+            return {
+                "ok": False,
+                "source": normalized_source,
+                "error": status_result.get(
+                    "error",
+                    "Could not inspect Git status.",
+                ),
+                "session_files": (
+                    session_paths[:MAX_CHANGED_FILE_ENTRIES]
+                    if normalized_source == "both"
+                    else []
+                ),
+            }
+        repository_root = Path(str(status_result["repository_root"])).resolve()
+        entries = _status_entries(status_result)
+        outside_project_files = [
+            entry.path
+            for entry in entries
+            if not _path_is_within_project(repository_root, root, entry.path)
+        ]
+        entries = tuple(
+            entry
+            for entry in entries
+            if _path_is_within_project(repository_root, root, entry.path)
+        )
+        session_paths = [
+            (root / path).resolve().relative_to(repository_root).as_posix()
+            for path in session_paths
+        ]
+
+    selected_session_paths = (
+        session_paths if normalized_source in {"session", "both"} else []
+    )
+    selected_entries = entries if normalized_source in {"git", "both"} else ()
+    session_set = set(selected_session_paths)
+    git_by_path = {entry.path: entry for entry in selected_entries}
+    all_paths = sorted(
+        session_set | set(git_by_path),
+        key=str.casefold,
+    )
+    files: list[dict[str, Any]] = []
+    commit_candidates: list[str] = []
+    excluded_files: list[str] = []
+    for changed_path in all_paths[:MAX_CHANGED_FILE_ENTRIES]:
+        entry = git_by_path.get(changed_path)
+        session_changed = changed_path in session_set
+        git_changed = entry is not None
+        excluded = _is_excluded_path(changed_path)
+        if normalized_source == "both":
+            candidate_signal = (
+                git_changed
+                and (session_changed or not session_set)
+            )
+        elif normalized_source == "git":
+            candidate_signal = git_changed
+        else:
+            candidate_signal = session_changed
+        commit_candidate = candidate_signal and not excluded
+        item = {
+            "path": changed_path,
+            "session_changed": session_changed,
+            "git_changed": git_changed,
+            "git_modified": (
+                git_changed and entry is not None and entry.status != "??"
+            ),
+            "staged": entry is not None and _entry_is_staged(entry),
+            "untracked": entry is not None and entry.status == "??",
+            "status": entry.status if entry is not None else None,
+            "excluded": excluded,
+            "commit_candidate": commit_candidate,
+        }
+        files.append(item)
+        if excluded:
+            excluded_files.append(changed_path)
+        elif commit_candidate:
+            commit_candidates.append(changed_path)
+
+    return {
+        "ok": True,
+        "source": normalized_source,
+        "repository_root": (
+            str(repository_root) if repository_root is not None else None
+        ),
+        "project_root": str(root),
+        "files": files,
+        "session_files": selected_session_paths[:MAX_CHANGED_FILE_ENTRIES],
+        "git_files": [
+            entry.path for entry in selected_entries
+        ][:MAX_CHANGED_FILE_ENTRIES],
+        "staged_files": [
+            entry.path for entry in selected_entries if _entry_is_staged(entry)
+        ][:MAX_CHANGED_FILE_ENTRIES],
+        "untracked_files": [
+            entry.path for entry in selected_entries if entry.status == "??"
+        ][:MAX_CHANGED_FILE_ENTRIES],
+        "excluded_files": excluded_files,
+        "commit_candidates": commit_candidates,
+        "outside_project_files": outside_project_files[
+            :MAX_CHANGED_FILE_ENTRIES
+        ],
+        "counts": {
+            "files": len(all_paths),
+            "session": len(selected_session_paths),
+            "git": len(selected_entries),
+            "staged": sum(
+                1 for entry in selected_entries if _entry_is_staged(entry)
+            ),
+            "untracked": sum(
+                1 for entry in selected_entries if entry.status == "??"
+            ),
+            "excluded": len(excluded_files),
+            "commit_candidates": len(commit_candidates),
+        },
+        "truncated": bool(
+            session_truncated
+            or len(all_paths) > MAX_CHANGED_FILE_ENTRIES
+            or len(selected_entries) > MAX_CHANGED_FILE_ENTRIES
+            or len(outside_project_files) > MAX_CHANGED_FILE_ENTRIES
+        ),
     }
 
 
@@ -654,6 +1056,86 @@ def _parse_short_status(output: str) -> tuple[GitStatusEntry, ...]:
     return tuple(entries)
 
 
+def _status_entries(result: dict[str, Any]) -> tuple[GitStatusEntry, ...]:
+    entries: list[GitStatusEntry] = []
+    for item in result.get("entries", []):
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        path = item.get("path")
+        if (
+            isinstance(status, str)
+            and len(status) == 2
+            and isinstance(path, str)
+            and path
+        ):
+            entries.append(GitStatusEntry(status=status, path=path))
+    return tuple(entries)
+
+
+def _entry_is_staged(entry: GitStatusEntry) -> bool:
+    return entry.status != "??" and entry.status[0] not in {" ", "?"}
+
+
+def _entry_has_worktree_change(entry: GitStatusEntry) -> bool:
+    return entry.status != "??" and entry.status[1] not in {" ", "?"}
+
+
+def _project_path_to_repository(
+    project_root: Path,
+    repository_root: Path,
+    path: str,
+) -> tuple[bool, str]:
+    raw_path = Path(path.strip())
+    if "\0" in path:
+        return False, "Git diff path contains an invalid null character."
+    if raw_path.is_absolute():
+        return False, "Git diff path must be project-relative."
+    candidate = (project_root / raw_path).resolve()
+    try:
+        candidate.relative_to(project_root)
+        relative = candidate.relative_to(repository_root).as_posix()
+    except ValueError:
+        return False, "Git diff path is outside the project root."
+    if candidate.exists() and not candidate.is_file():
+        return False, "Git diff path must identify a file."
+    return True, relative
+
+
+def _normalized_session_paths(
+    project_root: Path,
+    session_files: Sequence[str],
+) -> tuple[list[str], bool]:
+    paths: list[str] = []
+    truncated = False
+    character_count = 0
+    values = (
+        ()
+        if isinstance(session_files, (str, bytes))
+        else session_files
+    )
+    for raw_path in values:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = (project_root / raw_path).resolve()
+        try:
+            relative = candidate.relative_to(project_root).as_posix()
+        except ValueError:
+            continue
+        if relative in paths:
+            continue
+        if (
+            len(relative) > MAX_CHANGED_PATH_CHARACTERS
+            or character_count + len(relative) > MAX_SESSION_PATH_CHARACTERS
+            or len(paths) >= MAX_CHANGED_FILE_ENTRIES
+        ):
+            truncated = True
+            continue
+        paths.append(relative)
+        character_count += len(relative)
+    return paths, truncated
+
+
 def _session_repository_paths(
     project_root: Path,
     repository_root: Path,
@@ -736,6 +1218,24 @@ def _stable_unique(paths: Sequence[str]) -> list[str]:
         seen.add(path)
         result.append(path)
     return result
+
+
+def _bounded_diff(value: str, max_lines: int) -> tuple[str, bool, int]:
+    lines = value.splitlines()
+    original_line_count = len(lines)
+    selected = lines[:max_lines]
+    rendered = "\n".join(selected)
+    rendered, character_truncated = _bounded(
+        rendered,
+        MAX_GIT_DIFF_CHARACTERS,
+    )
+    line_truncated = original_line_count > max_lines
+    if line_truncated and not rendered.endswith(_TRUNCATION_MARKER):
+        rendered, _ = _bounded(
+            f"{rendered}{_TRUNCATION_MARKER}",
+            MAX_GIT_DIFF_CHARACTERS,
+        )
+    return rendered, line_truncated or character_truncated, original_line_count
 
 
 def _bounded(value: str, limit: int) -> tuple[str, bool]:

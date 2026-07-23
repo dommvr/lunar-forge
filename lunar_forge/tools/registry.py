@@ -26,6 +26,11 @@ from lunar_forge.tools.files import (
     replace_lines,
     write_file,
 )
+from lunar_forge.tools.git import (
+    git_diff,
+    git_status,
+    list_changed_files,
+)
 from lunar_forge.tools.project_health import project_health
 from lunar_forge.tools.search import glob_files, grep
 from lunar_forge.tools.shell import run_command
@@ -41,6 +46,7 @@ ToolHandler = Callable[..., dict[str, Any]]
 MAX_REGISTRY_RESULT_CHARACTERS = 200_000
 MAX_REGISTRY_RESULT_PREVIEW_CHARACTERS = 20_000
 MAX_REGISTERED_TOOLS = 256
+MAX_SESSION_CHANGED_FILES = 500
 PROVIDER_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 REDACTED_TOOL_VALUE = "[REDACTED]"
 _SENSITIVE_RESULT_KEYS = frozenset(
@@ -58,6 +64,9 @@ _SENSITIVE_RESULT_KEYS = frozenset(
         "cookie",
         "privatekey",
     }
+)
+_SESSION_FILE_MUTATION_TOOLS = frozenset(
+    {"write_file", "edit_file", "replace_lines", "insert_lines"}
 )
 
 
@@ -78,11 +87,17 @@ class ToolRegistry:
         self,
         tools: Iterable[Tool] = (),
         permission_manager: PermissionManager | None = None,
+        session_changed_files: list[str] | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._model_names_by_internal: dict[str, str] = {}
         self._internal_names_by_model: dict[str, str] = {}
         self._permission_manager = permission_manager or PermissionManager()
+        self._session_changed_files = (
+            session_changed_files
+            if session_changed_files is not None
+            else []
+        )
         for tool in tools:
             self.register(tool)
 
@@ -189,6 +204,7 @@ class ToolRegistry:
                 "ok": False,
                 "error": f"Tool {tool.name} returned an invalid result.",
             }
+        self._record_session_changed_file(tool.name, result)
         try:
             safe_result = _redact_sensitive_result_values(result)
             serialized = json.dumps(
@@ -214,6 +230,30 @@ class ToolRegistry:
                 bounded_result["error"] = "Tool error result exceeded the size limit."
             return bounded_result
         return safe_result
+
+    def session_changed_files(self) -> tuple[str, ...]:
+        """Return bounded files successfully changed through this registry."""
+        return tuple(self._session_changed_files)
+
+    def _record_session_changed_file(
+        self,
+        tool_name: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        if (
+            tool_name not in _SESSION_FILE_MUTATION_TOOLS
+            or result.get("ok") is not True
+        ):
+            return
+        path = result.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path in self._session_changed_files
+            or len(self._session_changed_files) >= MAX_SESSION_CHANGED_FILES
+        ):
+            return
+        self._session_changed_files.append(path)
 
 
 def provider_safe_tool_name(internal_name: str) -> str:
@@ -253,11 +293,25 @@ def create_read_only_registry(
     *,
     mode: str = "default",
     runtime_mode: str = "local",
+    session_changed_files: list[str] | None = None,
 ) -> ToolRegistry:
     """Create a registry containing only the current read-only tools."""
+    session_tracker = (
+        session_changed_files
+        if session_changed_files is not None
+        else []
+    )
     allow_git_inspection = (
         mode.strip().lower() != "no-command"
         and runtime_mode.strip().lower() != "no-command"
+    )
+    git_mode = (
+        "no-command"
+        if (
+            mode.strip().lower() == "no-command"
+            or runtime_mode.strip().lower() == "no-command"
+        )
+        else mode
     )
     return ToolRegistry(
         (
@@ -401,7 +455,87 @@ def create_read_only_registry(
                 },
                 handler=partial(dependency_summary, project_root),
             ),
-        )
+            Tool(
+                name="git_status",
+                description=(
+                    "Return bounded read-only Git status with compact modified, "
+                    "staged, untracked, and excluded path metadata."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=partial(
+                    git_status,
+                    project_root,
+                    mode=git_mode,
+                ),
+            ),
+            Tool(
+                name="git_diff",
+                description=(
+                    "Return a bounded staged or unstaged Git diff. Runtime, "
+                    "generated, and secret-looking file contents are excluded."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Optional project-relative file path to inspect."
+                            ),
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "Inspect the staged diff.",
+                            "default": False,
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 2000,
+                            "description": "Maximum diff lines to return.",
+                            "default": 400,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                handler=partial(
+                    git_diff,
+                    project_root,
+                    mode=git_mode,
+                ),
+            ),
+            Tool(
+                name="list_changed_files",
+                description=(
+                    "Combine current-session file changes with bounded Git state "
+                    "and mark staged, untracked, excluded, and commit-candidate "
+                    "paths."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "enum": ["session", "git", "both"],
+                            "description": "Changed-file source to inspect.",
+                            "default": "both",
+                        }
+                    },
+                    "additionalProperties": False,
+                },
+                handler=partial(
+                    list_changed_files,
+                    project_root,
+                    session_files=session_tracker,
+                    mode=git_mode,
+                ),
+            ),
+        ),
+        session_changed_files=session_tracker,
     )
 
 
@@ -415,13 +549,20 @@ def create_tool_registry(
     mcp_client: MCPClient | None = None,
     plugins: Sequence[LoadedPlugin] = (),
     plugin_resolver: EntrypointResolver | None = None,
+    session_changed_files: list[str] | None = None,
 ) -> ToolRegistry:
     """Create built-ins and explicitly enabled external extension tools."""
     normalized_mode = mode.strip().lower()
+    session_tracker = (
+        session_changed_files
+        if session_changed_files is not None
+        else []
+    )
     read_registry = create_read_only_registry(
         project_root,
         mode=normalized_mode,
         runtime_mode=runtime_mode,
+        session_changed_files=session_tracker,
     )
     tools = [read_registry.get(name) for name in read_registry.names()]
     if normalized_mode != "plan":
@@ -443,6 +584,7 @@ def create_tool_registry(
             mode=mode,
             approval_callback=approval_callback,
         ),
+        session_changed_files=session_tracker,
     )
     if mcp_client is not None:
         # Local import avoids making the central registry depend on an optional

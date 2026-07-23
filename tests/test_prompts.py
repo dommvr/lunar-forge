@@ -181,9 +181,12 @@ def test_plan_prompt_and_registry_remain_read_only(tmp_path):
     assert "Do not call mutation, command, or validation tools" in prompt
     assert schema_names == {
         "dependency_summary",
+        "git_diff",
+        "git_status",
         "glob",
         "grep",
         "list_dir",
+        "list_changed_files",
         "project_health",
         "read_file",
         "read_file_with_line_numbers",

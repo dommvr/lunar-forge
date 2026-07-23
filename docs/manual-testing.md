@@ -1055,6 +1055,7 @@ git config user.email "lunar-forge@example.invalid"
 "original" | Set-Content -LiteralPath note.txt -Encoding utf8
 git add note.txt
 git commit -m "Create baseline"
+"working change" | Set-Content -LiteralPath note.txt -Encoding utf8
 "unrelated" | Set-Content -LiteralPath unrelated.txt -Encoding utf8
 $GitExcludedDirectories = @(
     ".agent\artifacts\browser",
@@ -1081,6 +1082,29 @@ Pop-Location
 
 ```powershell
 lunar-forge git status --project $GitProject
+$env:GIT_TOOL_PROJECT = $GitProject
+@'
+import json
+import os
+from lunar_forge.tools.registry import create_tool_registry
+
+registry = create_tool_registry(
+    os.environ["GIT_TOOL_PROJECT"],
+    session_changed_files=["note.txt"],
+)
+print(json.dumps(registry.execute("git_status", {}), indent=2))
+print(json.dumps(
+    registry.execute(
+        "git_diff",
+        {"path": "note.txt", "staged": False, "max_lines": 40},
+    ),
+    indent=2,
+))
+print(json.dumps(
+    registry.execute("list_changed_files", {"source": "both"}),
+    indent=2,
+))
+'@ | python -
 lunar-forge --project $GitProject --commit --commit-message "Update note" "Use read_file_with_line_numbers, then replace_lines to replace line 1 of note.txt with updated. Do not run commands."
 Push-Location $GitProject
 git log -1 --format="%H %s"
@@ -1099,12 +1123,18 @@ makes no file changes; it should not display a Git approval prompt.
 
 **Expected result**
 
-Initial status shows `unrelated.txt` and `.agent` runtime files. The agent commit
-preview shows bounded status and diff output, labels only `note.txt` as changed
-by LunarForge and proposed for commit, lists `unrelated.txt` as not included,
-lists `.agent` browser artifacts, sessions, and checkpoints under excluded
-files. It also excludes `node_modules`, `dist`, `.next`, and `.env`, and shows
-`Proposed commit message: Update note`. Approval is required
+Initial status shows modified `note.txt`, `unrelated.txt`, and `.agent` runtime
+files. The three registry calls report compact status, a bounded diff containing
+only `note.txt`, and combined session/Git metadata. `note.txt` is both
+session-changed and Git-modified; `.agent`, `node_modules`, `dist`, `.next`, and
+`.env` are excluded and never appear as diff contents or commit candidates. No
+Git mutation or approval occurs for these read-only calls.
+
+The agent commit preview shows bounded status and diff output, labels only
+`note.txt` as changed by LunarForge and proposed for commit, lists
+`unrelated.txt` as not included, and lists `.agent` browser artifacts, sessions,
+and checkpoints under excluded files. It shows `Proposed commit message: Update
+note`. Approval is required
 despite `permissions.mode: yes`. An approved run ends with:
 
 ```text
@@ -1129,6 +1159,7 @@ the prompt must explicitly say something like `commit even if validation fails`.
 **Cleanup**
 
 ```powershell
+Remove-Item Env:\GIT_TOOL_PROJECT -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force -LiteralPath $GitProject
 ```
 
