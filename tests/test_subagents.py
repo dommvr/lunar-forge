@@ -111,6 +111,26 @@ def test_role_definitions_have_explicit_deny_by_default_tool_sets():
     assert TESTER_ROLE.allowed_tool_prefixes == ("mcp.playwright.",)
 
 
+def test_role_prompts_use_project_intelligence_deliberately():
+    planner = PLANNER_ROLE.system_prompt_fragment
+    reviewer = REVIEWER_ROLE.system_prompt_fragment
+    tester = TESTER_ROLE.system_prompt_fragment
+    security = SECURITY_ROLE.system_prompt_fragment
+
+    assert "broad review, onboarding, or feature-planning" in planner
+    assert "dependency_summary before" in planner
+    assert "tiny single-file edit" in planner
+    assert "list_changed_files before opening review files" in reviewer
+    assert "git_diff for relevant changed files" in reviewer
+    assert "Do not reread the whole project" in reviewer
+    assert "dependency_summary before selecting commands" in tester
+    assert "list_changed_files when it helps" in tester
+    assert "focus validation or failure inspection" in tester
+    assert "project_health and git_status" in security
+    assert "suspicious tracked runtime" in security
+    assert "git_diff for security-sensitive changes" in security
+
+
 def test_restricted_registry_exposes_only_role_allowlisted_tools():
     registry, calls = _registry_with_all_known_tools()
     restricted = RestrictedToolRegistry(registry, PLANNER_ROLE)
@@ -601,6 +621,102 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
         if event["event"] == "subagent_started"
     ]
     assert started == ["planner", "coder", "tester", "reviewer"]
+
+
+def test_final_summary_uses_authoritative_session_changed_files(tmp_path):
+    session_files: list[str] = []
+    changed_file_calls: list[str] = []
+
+    def list_session_changes(source="both"):
+        changed_file_calls.append(source)
+        return {
+            "ok": True,
+            "source": source,
+            "files": [
+                {
+                    "path": path,
+                    "session_changed": True,
+                    "git_changed": False,
+                    "excluded": False,
+                    "commit_candidate": True,
+                }
+                for path in session_files
+            ],
+            "session_files": list(session_files),
+            "git_files": [],
+            "staged_files": [],
+            "untracked_files": [],
+            "excluded_files": [],
+            "commit_candidates": list(session_files),
+            "truncated": False,
+        }
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="write_file",
+                description="Write a file.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {
+                    "ok": True,
+                    "path": arguments["path"],
+                },
+                permission=PermissionLevel.WRITE,
+            ),
+            Tool(
+                name="list_changed_files",
+                description="List session changes.",
+                parameters={"type": "object"},
+                handler=list_session_changes,
+            ),
+        ),
+        session_changed_files=session_files,
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(text="Plan: update authoritative.py."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="write_authoritative",
+                        name="write_file",
+                        arguments={
+                            "path": "authoritative.py",
+                            "content": "updated",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(text="Changed files:\n- coder-claimed.py"),
+            ModelResponse(text="Validation was not run."),
+            ModelResponse(
+                text=(
+                    "Changed files:\n"
+                    "- reviewer-claimed.py\n\n"
+                    "Validation:\n"
+                    "- Not run.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update the app", tmp_path, registry=registry)
+
+    assert changed_file_calls == ["session"]
+    assert "Changed files:\n- authoritative.py" in output
+    assert "reviewer-claimed.py" not in output
+    assert "coder-claimed.py" not in output
+    assert "Validation:\n- Not run." in output
+    assert "Subagents run:\n- planner\n- coder\n- tester\n- reviewer" in output
 
 
 def test_tester_command_results_replace_reviewer_not_run_summary(tmp_path):

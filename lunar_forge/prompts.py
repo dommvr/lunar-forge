@@ -119,16 +119,17 @@ Use bounded file reads and request narrower line ranges when more context is
 needed.
 
 Use project intelligence deliberately:
-- For broad project reviews, audits, explanations, or onboarding, call
-  project_health first and use its compact signals before opening many files.
+- For broad project reviews, audits, explanations, onboarding, or feature
+  planning, start with project_health and dependency_summary, then use their
+  compact signals before opening many files.
 - Before planning validation or guessing test, lint, build, or development
   commands, call dependency_summary and prefer its bounded manifest metadata.
 - For a tiny targeted edit, do not call broad intelligence tools unless the
   user also requested a project-wide review. Tool calls are not a checklist.
-- Before a review, final change summary, or commit proposal, prefer
-  list_changed_files and then git_diff when Git changes exist. Do not request
-  repeated diffs when no files changed, and never use Git tools to stage or
-  mutate files.
+- Before a review, final change summary, or commit proposal, call
+  list_changed_files first and use git_diff only when Git changes exist and
+  details are useful. Do not request repeated diffs when no files changed, and
+  never use Git tools to stage or mutate files.
 
 For precise file changes:
 - Prefer read_file_with_line_numbers before any line-based edit so the selected
@@ -342,9 +343,10 @@ def build_subagent_user_prompt(
     phase_instruction = {
         "planner": (
             "Inspect the project and return a concrete plan only. Include likely "
-            "files and validation; use project_health first for broad review or "
-            "onboarding and dependency_summary when validation is uncertain. Do "
-            "not implement it."
+            "files and validation; use project_health first for broad review, "
+            "onboarding, or feature planning, and dependency_summary before "
+            "choosing uncertain validation, build, or development commands. Keep "
+            "tiny single-file tasks narrowly scoped. Do not implement it."
         ),
         "coder": (
             "Use the planner handoff as context and implement the requested change. "
@@ -352,16 +354,22 @@ def build_subagent_user_prompt(
         ),
         "tester": (
             "Validate the current project state with the available approved tools. "
-            "Use dependency_summary before guessing uncertain commands. Report "
-            "commands and exact outcomes; do not edit files."
+            "Use dependency_summary before guessing uncertain commands and "
+            "list_changed_files when it helps focus validation or failure "
+            "inspection. Report commands and exact outcomes; do not edit files."
         ),
         "reviewer": (
             "Review the completed work and produce the concise final user-facing "
-            "summary required by the system prompt. Do not edit files."
+            "summary required by the system prompt. Start with list_changed_files, "
+            "then use git_diff for relevant changed files when Git is available; "
+            "do not reread the whole project when that evidence is enough. Do not "
+            "edit files."
         ),
         "security": (
             "Review the sensitive changed files and report concrete trust-boundary "
-            "findings. Do not edit files or run commands."
+            "findings. Use project_health and git_status for suspicious tracked "
+            "runtime, generated, or secret-looking paths, and git_diff for "
+            "security-sensitive changes. Do not edit files or run commands."
         ),
         "scaffolder": (
             "Create only the approved starter project, preserving overwrite and "

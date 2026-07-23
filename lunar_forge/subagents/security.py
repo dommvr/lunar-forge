@@ -24,10 +24,11 @@ SECURITY_ROLE = SubagentRole(
     ),
     system_prompt_fragment=(
         "Act as the security reviewer. Trace trust and permission boundaries, flag "
-        "specific bypasses or unsafe defaults. Use project_health and changed-file "
-        "Git metadata when runtime, generated, secret-looking, or tracked paths are "
-        "relevant. Do not mutate files or execute commands. Existing safety rules "
-        "are authoritative."
+        "specific bypasses or unsafe defaults. Use project_health and git_status to "
+        "find suspicious tracked runtime, generated, or secret-looking paths. Use "
+        "git_diff for security-sensitive changes and list_changed_files to keep the "
+        "review scoped. Do not mutate files or execute commands. Existing safety "
+        "rules are authoritative."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

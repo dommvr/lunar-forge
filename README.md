@@ -349,12 +349,13 @@ never parsed, manifest results are bounded, and credential-shaped returned text
 is redacted. In no-command mode, `project_health` skips its optional read-only
 Git check while retaining filesystem health signals.
 
-The agent prompt uses `project_health` first for broad review, audit,
-explanation, and onboarding work, and uses `dependency_summary` before guessing
-validation commands. Small targeted edits should continue to inspect only the
-relevant files. Planner and Reviewer can use both tools, Tester can use
-dependency metadata, and Security can use project health; all remain read-only
-through the central permission registry and are available in plan mode.
+The agent prompt uses `project_health` plus `dependency_summary` for broad
+review, audit, explanation, onboarding, and feature-planning work, and uses
+dependency metadata before guessing validation commands. Small targeted edits
+continue to inspect only the relevant files. Planner and Reviewer can use both
+tools, Tester can use dependency metadata, and Security can use project health;
+all remain read-only through the central permission registry and are available
+in plan mode.
 
 ### Optional subagent mode
 
@@ -531,6 +532,17 @@ three tools; Tester can use status and changed-file metadata, and Planner can
 use status when existing dirty state affects a plan. Git-backed calls fail
 clearly outside a repository and in no-command mode, while a session-only
 changed-file query remains available because it starts no subprocess.
+
+Tool use is task-scaled: Reviewer starts from changed-file metadata and requests
+a bounded diff only when useful; Tester uses dependency metadata when command
+selection is uncertain and changed files when validation needs focus; Security
+combines project health and Git status before inspecting security-sensitive
+diffs. After successful session mutations, the application performs one
+session-only `list_changed_files` read and replaces any model-authored
+`Changed files` list with that authoritative bounded result. The same file set
+scopes an opt-in commit proposal, whose existing guarded preparation adds Git
+status and diff-summary evidence. No-change and plan-mode tasks do not trigger
+this finalization query.
 
 Create a deterministic commit proposal with an explicit message:
 

@@ -807,6 +807,33 @@ def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
             ModelResponse(text="Changed files:\n- app.py"),
         )
     )
+    session_files: list[str] = []
+    changed_file_calls: list[str] = []
+
+    def list_session_changes(source="both"):
+        changed_file_calls.append(source)
+        return {
+            "ok": True,
+            "source": source,
+            "files": [
+                {
+                    "path": path,
+                    "session_changed": True,
+                    "git_changed": False,
+                    "excluded": False,
+                    "commit_candidate": True,
+                }
+                for path in session_files
+            ],
+            "session_files": list(session_files),
+            "git_files": [],
+            "staged_files": [],
+            "untracked_files": [],
+            "excluded_files": [],
+            "commit_candidates": list(session_files),
+            "truncated": False,
+        }
+
     registry = ToolRegistry(
         (
             Tool(
@@ -819,7 +846,14 @@ def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
                 },
                 permission=PermissionLevel.WRITE,
             ),
-        )
+            Tool(
+                name="list_changed_files",
+                description="List session changes.",
+                parameters={"type": "object"},
+                handler=list_session_changes,
+            ),
+        ),
+        session_changed_files=session_files,
     )
     captured = {}
 
@@ -857,6 +891,7 @@ def test_agent_logs_git_proposal_approval_and_hash(monkeypatch, tmp_path):
         offer_commit=True,
     )
 
+    assert changed_file_calls == ["session"]
     assert captured["session_files"] == ("app.py",)
     assert "Git:\n" in output
     assert "Files changed by LunarForge (proposed for commit):\n- app.py" in output

@@ -63,6 +63,8 @@ MAX_SUBAGENT_ERROR_CHARACTERS = 500
 MAX_BROWSER_VALIDATION_RECORDS = 20
 MAX_COMMAND_EXECUTION_RECORDS = 50
 MAX_RECORDED_COMMAND_CHARACTERS = 500
+MAX_FINAL_CHANGED_FILES = 100
+MAX_FINAL_CHANGED_PATH_CHARACTERS = 500
 FINAL_SUMMARY_SECTION_NAMES = frozenset(
     {
         "changed files",
@@ -334,13 +336,22 @@ class CodeAgent:
                     mode=normalized_mode,
                     browser_intent=browser_intent,
                 )
+                final_text, authoritative_changed_files = (
+                    _finalize_changed_files_summary(
+                        subagent_result.text,
+                        registry=tools,
+                        changed_files=subagent_result.changed_files,
+                        mode=normalized_mode,
+                        session=session,
+                    )
+                )
                 final_output = self._finalize_git_commit_offer(
-                    subagent_result.text,
+                    final_text,
                     request=request,
                     root=root,
                     mode=normalized_mode,
                     session=session,
-                    changed_files=subagent_result.changed_files,
+                    changed_files=authoritative_changed_files,
                     validation_evidence=subagent_result.validation_evidence,
                     offer_commit=offer_commit,
                     commit_message=commit_message,
@@ -475,13 +486,22 @@ class CodeAgent:
                         validation_evidence,
                         mode=normalized_mode,
                     )
+                    final_text, authoritative_changed_files = (
+                        _finalize_changed_files_summary(
+                            final_text,
+                            registry=tools,
+                            changed_files=changed_files,
+                            mode=normalized_mode,
+                            session=session,
+                        )
+                    )
                     final_text = self._finalize_git_commit_offer(
                         final_text,
                         request=request,
                         root=root,
                         mode=normalized_mode,
                         session=session,
-                        changed_files=changed_files,
+                        changed_files=authoritative_changed_files,
                         validation_evidence=validation_evidence,
                         offer_commit=offer_commit,
                         commit_message=commit_message,
@@ -1491,6 +1511,118 @@ def _changed_path(tool_name: str, result: Mapping[str, Any]) -> str | None:
         return None
     path = result.get("path")
     return path if isinstance(path, str) and path else None
+
+
+def _finalize_changed_files_summary(
+    text: str,
+    *,
+    registry: ToolRegistry,
+    changed_files: Sequence[str],
+    mode: str,
+    session: SessionLogger | None,
+) -> tuple[str, tuple[str, ...]]:
+    """Reconcile the model summary with bounded session mutation evidence."""
+    fallback_files = _bounded_changed_file_paths(
+        changed_files,
+        registry.session_changed_files(),
+    )
+    if mode == "plan" or not fallback_files:
+        return text, fallback_files
+
+    authoritative_files = fallback_files
+    source = "session mutation results"
+    tool_result: Mapping[str, Any] | None = None
+    if "list_changed_files" in registry.names():
+        tool_result = registry.execute(
+            "list_changed_files",
+            {"source": "session"},
+        )
+        if tool_result.get("ok") is True:
+            tool_files = _bounded_changed_file_paths(
+                tool_result.get("session_files", ()),
+            )
+            if tool_files:
+                authoritative_files = tool_files
+                source = "list_changed_files"
+
+    _log_session(
+        session,
+        "changed_files_summary",
+        source=source,
+        changed_files=list(authoritative_files),
+        list_changed_files_ok=(
+            tool_result.get("ok") is True if tool_result is not None else None
+        ),
+    )
+    return (
+        _apply_authoritative_changed_files(text, authoritative_files),
+        authoritative_files,
+    )
+
+
+def _bounded_changed_file_paths(
+    *sources: object,
+) -> tuple[str, ...]:
+    paths: list[str] = []
+    for source in sources:
+        if not isinstance(source, Sequence) or isinstance(source, (str, bytes)):
+            continue
+        for value in source:
+            if not isinstance(value, str):
+                continue
+            path = value.strip()
+            if not path or path in paths:
+                continue
+            paths.append(path)
+            if len(paths) >= 500:
+                return tuple(paths)
+    return tuple(paths)
+
+
+def _apply_authoritative_changed_files(
+    text: str,
+    changed_files: Sequence[str],
+) -> str:
+    displayed_paths = tuple(changed_files[:MAX_FINAL_CHANGED_FILES])
+    changed_block = ["Changed files:"]
+    changed_block.extend(
+        f"- {_bounded_changed_path(path)}" for path in displayed_paths
+    )
+    if len(changed_files) > len(displayed_paths):
+        changed_block.append("- [Additional session-changed files omitted.]")
+
+    output_lines: list[str] = []
+    inserted = False
+    skipping_changed_section = False
+    for line in text.rstrip().splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading == "changed files":
+            if not inserted:
+                output_lines.extend(changed_block)
+                inserted = True
+            skipping_changed_section = True
+            continue
+        if skipping_changed_section:
+            if heading is None:
+                continue
+            skipping_changed_section = False
+            if output_lines and output_lines[-1].strip():
+                output_lines.append("")
+        output_lines.append(line)
+
+    if not inserted:
+        body = text.strip()
+        changed_text = "\n".join(changed_block)
+        if body:
+            return f"{changed_text}\n\n{body}"
+        return changed_text
+    return "\n".join(output_lines).strip()
+
+
+def _bounded_changed_path(path: str) -> str:
+    if len(path) <= MAX_FINAL_CHANGED_PATH_CHARACTERS:
+        return path
+    return f"{path[: MAX_FINAL_CHANGED_PATH_CHARACTERS - 3]}..."
 
 
 def _request_allows_commit_after_failed_validation(request: str) -> bool:

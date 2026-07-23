@@ -40,9 +40,24 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "Use replace_lines" in prompt
     assert "Use insert_lines" in prompt
     assert "Keep using edit_file" in prompt
-    assert "call\n  project_health first" in prompt
+    assert "start with project_health and dependency_summary" in prompt
     assert "call dependency_summary" in prompt
     assert "tiny targeted edit" in prompt
+
+
+def test_system_prompt_scales_project_intelligence_to_the_task():
+    prompt = build_system_prompt(PROJECT_INFO, "No extra instructions.", "default")
+
+    assert "broad project reviews" in prompt
+    assert "onboarding, or feature\n  planning" in prompt
+    assert "start with project_health and dependency_summary" in prompt
+    assert "Before planning validation" in prompt
+    assert "call dependency_summary" in prompt
+    assert "Before a review, final change summary, or commit proposal" in prompt
+    assert "call\n  list_changed_files first" in prompt
+    assert "use git_diff only when Git changes exist" in prompt
+    assert "For a tiny targeted edit" in prompt
+    assert "Tool calls are not a checklist" in prompt
 
 
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():
@@ -260,3 +275,14 @@ def test_subagent_handoff_is_bounded_and_cannot_expand_permissions():
     assert "[planner]\nPlan output" in prompt
     assert "- app.py" in prompt
     assert "subject to the existing tool approval policy" in prompt
+
+
+def test_subagent_handoffs_include_role_specific_intelligence_guidance():
+    planner = build_subagent_user_prompt("Plan a feature", PLANNER_ROLE)
+    tester = build_subagent_user_prompt("Validate a feature", TESTER_ROLE)
+
+    assert "broad review, onboarding, or feature planning" in planner
+    assert "dependency_summary before" in planner
+    assert "tiny single-file tasks narrowly scoped" in planner
+    assert "dependency_summary before guessing uncertain commands" in tester
+    assert "list_changed_files when it helps focus validation" in tester
