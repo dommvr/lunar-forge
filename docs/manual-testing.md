@@ -206,6 +206,65 @@ read-only and follows the concise project guidance.
 Remove-Item -Recurse -Force -LiteralPath $InspectProject
 ```
 
+## Read-only project intelligence
+
+**Purpose**
+
+Confirm that `project_health` and `dependency_summary` return compact metadata
+without running project code, reading lockfile bodies, or enabling commands in
+no-command mode.
+
+**Setup**
+
+```powershell
+$IntelProject = Join-Path $ManualRoot "intelligence-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $IntelProject "tests") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $IntelProject "dist") | Out-Null
+"# Intelligence demo" | Set-Content -LiteralPath (Join-Path $IntelProject "README.md") -Encoding utf8
+"Use bounded inspection." | Set-Content -LiteralPath (Join-Path $IntelProject "AGENTS.md") -Encoding utf8
+"dist/" | Set-Content -LiteralPath (Join-Path $IntelProject ".gitignore") -Encoding utf8
+@'
+{
+  "scripts": {"test": "vitest run", "build": "vite build", "dev": "vite"},
+  "dependencies": {"react": "^19"},
+  "devDependencies": {"vite": "^7", "vitest": "^3"}
+}
+'@ | Set-Content -LiteralPath (Join-Path $IntelProject "package.json") -Encoding utf8
+"lockfile body is intentionally not parsed" | Set-Content -LiteralPath (Join-Path $IntelProject "package-lock.json") -Encoding utf8
+```
+
+**Command**
+
+```powershell
+$env:INTEL_PROJECT = $IntelProject
+@'
+import json
+import os
+from lunar_forge.tools.registry import create_tool_registry
+
+registry = create_tool_registry(os.environ["INTEL_PROJECT"], mode="no-command")
+print(json.dumps(registry.execute("project_health", {}), indent=2))
+print(json.dumps(registry.execute("dependency_summary", {}), indent=2))
+'@ | python -
+```
+
+**Expected result**
+
+Both results have `ok: true`. Health reports the README, `AGENTS.md`, tests,
+package markers, `.gitignore`, `dist`, and npm validation hints; its
+`tracked_path_check` is `skipped_no_command`. Dependency metadata reports npm,
+React/Vite, the three scripts, bounded dependency lists, and likely `npm test`,
+`npm run build`, and `npm run dev` commands. The invalid lockfile body causes no
+parse error because lockfile contents are not read. No approval prompt appears
+and no project command runs.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\INTEL_PROJECT -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force -LiteralPath $IntelProject
+```
+
 ## 5. Line tools
 
 **Purpose**

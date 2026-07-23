@@ -40,6 +40,9 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "Use replace_lines" in prompt
     assert "Use insert_lines" in prompt
     assert "Keep using edit_file" in prompt
+    assert "call\n  project_health first" in prompt
+    assert "call dependency_summary" in prompt
+    assert "tiny targeted edit" in prompt
 
 
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():
@@ -177,9 +180,11 @@ def test_plan_prompt_and_registry_remain_read_only(tmp_path):
     assert "Use only read/search tools" in prompt
     assert "Do not call mutation, command, or validation tools" in prompt
     assert schema_names == {
+        "dependency_summary",
         "glob",
         "grep",
         "list_dir",
+        "project_health",
         "read_file",
         "read_file_with_line_numbers",
     }

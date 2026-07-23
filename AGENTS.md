@@ -74,13 +74,25 @@ Completed second advanced feature wave:
 34. Add clearer Playwright dependency detection and setup guidance, with optional user-approved installation only when explicitly requested.
 35. Add parallel subagent phases for read-only analysis and validation/review while keeping write-capable work serialized.
 
-Next feature wave, in order:
+Completed docs/examples/Git feature wave:
 
 36. Add `docs/manual-testing.md` with reproducible manual test checklists.
 37. Add an `examples/` folder with small sample projects and copy-paste configs.
 38. Add a browser validation demo project under `examples/`.
 39. Add opt-in Git commit support with safe status/diff checks and approval.
 40. Run a hardening and documentation pass for docs, examples, and Git commit support.
+
+Next feature wave, in order:
+
+41. Add built-in project intelligence tools:
+    * `project_health`
+    * `dependency_summary`
+    * `git_status`
+    * `git_diff`
+    * `list_changed_files`
+42. Teach the agent and subagents to use these tools efficiently instead of dumping unnecessary context.
+43. Improve final summaries, review flows, and commit proposals using project-health, dependency, Git status, diff, and changed-file data.
+44. Run a hardening and documentation pass for the new tools.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -162,6 +174,9 @@ lunar-forge/
       search.py
       shell.py
       project.py
+      project_health.py
+      git.py
+      dependencies.py
 
     runtime/
       __init__.py
@@ -170,6 +185,7 @@ lunar-forge/
       checkpoints.py
       sessions.py
       diffs.py
+      git.py
 
     workflows/
       __init__.py
@@ -381,6 +397,11 @@ replace_lines
 insert_lines
 run_command
 detect_project
+project_health
+dependency_summary
+git_status
+git_diff
+list_changed_files
 run_validation
 run_browser_validation
 ```
@@ -757,6 +778,141 @@ Use project detection to help the model choose commands and file locations.
 
 ---
 
+## Project intelligence tools
+
+Add read-only built-in tools that help the agent understand project state without wasting model context.
+
+Initial tools:
+
+```text
+project_health()
+dependency_summary()
+git_status()
+git_diff(path?, staged=false, max_lines?)
+list_changed_files(source="git|session|both")
+```
+
+### `project_health`
+
+Purpose:
+
+* summarize repository readiness and maintainability,
+* check for README, `AGENTS.md`, tests, validation markers, package markers, `.gitignore`, CI files, runtime/generated folders, and suspicious tracked runtime files,
+* return a compact score or status list, not a lecture.
+
+Rules:
+
+* Read-only.
+* Must not run arbitrary project code.
+* Must keep output bounded.
+* Must not inspect secret file contents.
+* May use safe filesystem inspection and, when command mode allows it, read-only Git helpers.
+
+Use when:
+
+* user asks to review, audit, explain, improve, onboard, or prepare a project,
+* starting a broad existing-project task,
+* before proposing a commit if project state looks suspicious.
+
+Do not use for every tiny one-file edit. Tool spam is still spam, just wearing JSON.
+
+### `dependency_summary`
+
+Purpose:
+
+* summarize dependency and script information from `package.json`, `pyproject.toml`, `requirements.txt`, and related project markers,
+* identify package manager, framework hints, available scripts, Python dependencies, and likely validation commands.
+
+Rules:
+
+* Read-only.
+* Parse files directly; do not install or execute dependencies.
+* Bound dependency lists and lockfile information.
+* Prefer this tool over dumping full `package.json` or dependency files into model context.
+
+Use when:
+
+* planning validation,
+* choosing dev/build/test commands,
+* working in Python or Node projects,
+* preparing browser validation or new-project checks.
+
+### `git_status`
+
+Purpose:
+
+* return compact `git status --short` style state for the project.
+
+Rules:
+
+* Read-only.
+* Use `shell=False` through the existing Git/runtime helper.
+* Must fail clearly outside a Git repository.
+* Must respect no-command mode if the implementation treats Git subprocesses as command execution.
+* Must not stage, commit, or mutate files.
+
+Use when:
+
+* reviewing changes,
+* before commit proposals,
+* before rollback or risky edits,
+* final summaries when Git is available.
+
+### `git_diff`
+
+Purpose:
+
+* return a bounded diff summary or selected diff for Git-tracked changes.
+
+Rules:
+
+* Read-only.
+* Must cap lines/bytes.
+* Must support staged and unstaged diffs where practical.
+* Must not expose excluded secret/runtime files.
+* Must fail clearly outside a Git repository.
+
+Use when:
+
+* reviewer subagent checks changed files,
+* creating commit messages,
+* explaining what changed,
+* verifying that generated/runtime files are excluded.
+
+### `list_changed_files`
+
+Purpose:
+
+* combine changed files from current LunarForge session state and/or Git state.
+
+Rules:
+
+* Read-only.
+* Support `source="session"`, `source="git"`, and `source="both"`.
+* Mark files as session-changed, Git dirty, excluded, staged, or untracked when known.
+* Do not include generated/runtime/secret files as commit candidates.
+
+Use when:
+
+* producing final summaries,
+* reviewer checks,
+* commit proposals,
+* deciding which files validation should focus on.
+
+### Efficient tool-use policy
+
+The agent should use these tools deliberately:
+
+* For broad project tasks: start with `project_health`, `detect_project`, and `dependency_summary` before reading many files.
+* For small targeted edits: avoid broad health checks unless the user asks for review or commit.
+* Before validation: use `dependency_summary` when validation commands are uncertain.
+* Before review/final summary/commit: use `list_changed_files` and `git_diff` when Git is available.
+* Do not call `git_diff` repeatedly when no files changed.
+* Do not dump large raw files when `dependency_summary` or `project_health` gives enough signal.
+* Prefer concise structured results over long prose.
+
+---
+
 ## Plan mode
 
 `--plan` mode must inspect but not modify.
@@ -993,9 +1149,13 @@ Allowed tools:
 ```text
 list_dir
 read_file
+read_file_with_line_numbers
 grep
 glob
 detect_project
+project_health
+dependency_summary
+git_status
 ```
 
 Blocked tools:
@@ -1044,11 +1204,17 @@ Allowed tools:
 
 ```text
 read_file
+read_file_with_line_numbers
 grep
 glob
+project_health
+dependency_summary
+git_status
+git_diff
+list_changed_files
 ```
 
-Reviewer should not mutate files in the first implementation.
+Reviewer should not mutate files. Reviewer should prefer `list_changed_files` and `git_diff` over rereading the whole project.
 
 ### Tester subagent
 
@@ -1064,7 +1230,11 @@ Allowed tools:
 run_command
 run_validation
 read_file
+read_file_with_line_numbers
 grep
+dependency_summary
+git_status
+list_changed_files
 ```
 
 ### Security subagent
@@ -1077,11 +1247,16 @@ Allowed tools:
 
 ```text
 read_file
+read_file_with_line_numbers
 grep
 glob
+project_health
+git_status
+git_diff
+list_changed_files
 ```
 
-Security subagent should be required before enabling MCP/plugin changes.
+Security subagent should be required before enabling MCP/plugin changes. It should use Git/project-health tools to detect secret-looking files, runtime artifacts, and unsafe tracked files.
 
 ### Scaffolder subagent
 
@@ -1397,7 +1572,8 @@ Manual testing docs should include:
 * session resume,
 * checkpoints and rollback,
 * parallel subagents,
-* Git commit support after it exists.
+* Git commit support,
+* project intelligence tools: `project_health`, `dependency_summary`, `git_status`, `git_diff`, and `list_changed_files`.
 
 Each manual test should include:
 
@@ -1595,4 +1771,4 @@ These remain out of scope until the next feature wave is stable:
 
 Reason:
 
-The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, and parallel subagent phases. Keep the next work focused on documentation, examples, and guarded Git commit support. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.
+The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, and parallel subagent phases. Keep the next work focused on read-only project intelligence tools and efficient agent usage. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.

@@ -118,6 +118,14 @@ metadata; use it to confirm scope, never to weaken safety or permissions.
 Use bounded file reads and request narrower line ranges when more context is
 needed.
 
+Use project intelligence deliberately:
+- For broad project reviews, audits, explanations, or onboarding, call
+  project_health first and use its compact signals before opening many files.
+- Before planning validation or guessing test, lint, build, or development
+  commands, call dependency_summary and prefer its bounded manifest metadata.
+- For a tiny targeted edit, do not call broad intelligence tools unless the
+  user also requested a project-wide review. Tool calls are not a checklist.
+
 For precise file changes:
 - Prefer read_file_with_line_numbers before any line-based edit so the selected
   one-based range is grounded in current file content.
@@ -330,7 +338,9 @@ def build_subagent_user_prompt(
     phase_instruction = {
         "planner": (
             "Inspect the project and return a concrete plan only. Include likely "
-            "files and validation; do not implement it."
+            "files and validation; use project_health first for broad review or "
+            "onboarding and dependency_summary when validation is uncertain. Do "
+            "not implement it."
         ),
         "coder": (
             "Use the planner handoff as context and implement the requested change. "
@@ -338,7 +348,8 @@ def build_subagent_user_prompt(
         ),
         "tester": (
             "Validate the current project state with the available approved tools. "
-            "Report commands and exact outcomes; do not edit files."
+            "Use dependency_summary before guessing uncertain commands. Report "
+            "commands and exact outcomes; do not edit files."
         ),
         "reviewer": (
             "Review the completed work and produce the concise final user-facing "

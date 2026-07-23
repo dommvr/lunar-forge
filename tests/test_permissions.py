@@ -1,4 +1,5 @@
 import json
+from importlib import import_module
 
 from lunar_forge.permissions import (
     PermissionDecision,
@@ -15,6 +16,9 @@ from lunar_forge.tools.registry import (
     ToolRegistry,
     create_tool_registry,
 )
+
+
+project_health_module = import_module("lunar_forge.tools.project_health")
 
 
 def test_permission_decision_defaults_to_empty_reason():
@@ -120,6 +124,10 @@ def test_plan_and_no_command_modes_block_command_execution(tmp_path):
 
     assert "run_command" not in plan_registry.names()
     assert "run_command" not in no_command_registry.names()
+    assert {"project_health", "dependency_summary"}.issubset(plan_registry.names())
+    assert {"project_health", "dependency_summary"}.issubset(
+        no_command_registry.names()
+    )
 
     for mode, expected_reason in (
         ("plan", "Plan mode blocks"),
@@ -133,6 +141,43 @@ def test_plan_and_no_command_modes_block_command_execution(tmp_path):
         )
         assert decision.allowed is False
         assert expected_reason in decision.reason
+
+
+def test_no_command_project_health_skips_git_without_requesting_approval(
+    monkeypatch,
+    tmp_path,
+):
+    def unexpected_git(root):
+        raise AssertionError("No-command health inspection must not execute Git")
+
+    monkeypatch.setattr(
+        project_health_module,
+        "_tracked_suspicious_paths",
+        unexpected_git,
+    )
+    registries = (
+        create_tool_registry(
+            tmp_path,
+            mode="no-command",
+            approval_callback=lambda request: (_ for _ in ()).throw(
+                AssertionError("Read-only tools must not request approval")
+            ),
+        ),
+        create_tool_registry(
+            tmp_path,
+            mode="default",
+            runtime_mode="no-command",
+            approval_callback=lambda request: (_ for _ in ()).throw(
+                AssertionError("Read-only tools must not request approval")
+            ),
+        ),
+    )
+
+    for registry in registries:
+        result = registry.execute("project_health", {})
+
+        assert result["ok"] is True
+        assert result["tracked_path_check"] == "skipped_no_command"
 
 
 def test_plan_mode_allows_approved_plan_safe_network_read():

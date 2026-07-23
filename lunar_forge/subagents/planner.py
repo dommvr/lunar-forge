@@ -11,6 +11,8 @@ _ALLOWED_TOOLS = frozenset(
         "grep",
         "glob",
         "detect_project",
+        "project_health",
+        "dependency_summary",
     }
 )
 
@@ -23,7 +25,10 @@ PLANNER_ROLE = SubagentRole(
     system_prompt_fragment=(
         "Act as the planner. Inspect only what is needed, account for applicable "
         "AGENTS.md instructions, and return an ordered plan with likely files and "
-        "validation. Never edit files or run commands."
+        "validation. For broad review or onboarding work, use project_health "
+        "before opening many files. Use dependency_summary when validation commands "
+        "are uncertain. Do not call broad tools for a tiny targeted edit. Never "
+        "edit files or run commands."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

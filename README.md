@@ -330,6 +330,32 @@ a bounded unified diff. The mutation tools are not registered in plan mode.
 Coder subagents can use all three tools through their own restricted registry;
 read-only roles receive only the numbered reader.
 
+### Read-only project intelligence
+
+Two compact built-in tools reduce broad file dumps and command guessing:
+
+- `project_health()` reports README and root/nested `AGENTS.md` presence, test
+  markers, package markers, validation hints, `.gitignore`, CI configuration,
+  generated/runtime folders, and suspicious tracked/runtime paths when bounded
+  Git inspection is safely available.
+- `dependency_summary()` statically parses bounded metadata from `package.json`,
+  `pyproject.toml`, `requirements.txt`, `setup.cfg`, and literal values in
+  `setup.py`. It reports package-manager hints, scripts, bounded direct and
+  development dependencies, Python dependencies and console entry points,
+  framework hints, and likely validation/development/build commands.
+
+Neither tool installs dependencies or runs project code. Lockfile bodies are
+never parsed, manifest results are bounded, and credential-shaped returned text
+is redacted. In no-command mode, `project_health` skips its optional read-only
+Git check while retaining filesystem health signals.
+
+The agent prompt uses `project_health` first for broad review, audit,
+explanation, and onboarding work, and uses `dependency_summary` before guessing
+validation commands. Small targeted edits should continue to inspect only the
+relevant files. Planner and Reviewer can use both tools, Tester can use
+dependency metadata, and Security can use project health; all remain read-only
+through the central permission registry and are available in plan mode.
+
 ### Optional subagent mode
 
 Single-agent execution remains the default. Pass `--subagents`, or set

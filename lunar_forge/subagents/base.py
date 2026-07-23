@@ -17,6 +17,8 @@ BUILTIN_SUBAGENT_TOOLS = frozenset(
         "read_file_with_line_numbers",
         "grep",
         "glob",
+        "project_health",
+        "dependency_summary",
         "create_dir",
         "write_file",
         "edit_file",

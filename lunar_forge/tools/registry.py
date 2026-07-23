@@ -15,6 +15,7 @@ from lunar_forge.permissions import (
     PermissionLevel,
     PermissionManager,
 )
+from lunar_forge.tools.dependencies import dependency_summary
 from lunar_forge.tools.files import (
     create_dir,
     edit_file,
@@ -25,6 +26,7 @@ from lunar_forge.tools.files import (
     replace_lines,
     write_file,
 )
+from lunar_forge.tools.project_health import project_health
 from lunar_forge.tools.search import glob_files, grep
 from lunar_forge.tools.shell import run_command
 
@@ -246,8 +248,17 @@ def _redact_sensitive_result_values(value: Any) -> Any:
     return value
 
 
-def create_read_only_registry(project_root: str | Path) -> ToolRegistry:
+def create_read_only_registry(
+    project_root: str | Path,
+    *,
+    mode: str = "default",
+    runtime_mode: str = "local",
+) -> ToolRegistry:
     """Create a registry containing only the current read-only tools."""
+    allow_git_inspection = (
+        mode.strip().lower() != "no-command"
+        and runtime_mode.strip().lower() != "no-command"
+    )
     return ToolRegistry(
         (
             Tool(
@@ -358,6 +369,38 @@ def create_read_only_registry(project_root: str | Path) -> ToolRegistry:
                 },
                 handler=partial(glob_files, project_root),
             ),
+            Tool(
+                name="project_health",
+                description=(
+                    "Return a compact read-only project readiness summary. Use "
+                    "this first for broad reviews, audits, explanations, or "
+                    "onboarding, but not for routine tiny edits."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=partial(
+                    project_health,
+                    project_root,
+                    allow_git=allow_git_inspection,
+                ),
+            ),
+            Tool(
+                name="dependency_summary",
+                description=(
+                    "Statically summarize bounded dependency, script, framework, "
+                    "and likely command metadata without reading lockfile bodies "
+                    "or running project code. Use before guessing validation."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=partial(dependency_summary, project_root),
+            ),
         )
     )
 
@@ -375,7 +418,11 @@ def create_tool_registry(
 ) -> ToolRegistry:
     """Create built-ins and explicitly enabled external extension tools."""
     normalized_mode = mode.strip().lower()
-    read_registry = create_read_only_registry(project_root)
+    read_registry = create_read_only_registry(
+        project_root,
+        mode=normalized_mode,
+        runtime_mode=runtime_mode,
+    )
     tools = [read_registry.get(name) for name in read_registry.names()]
     if normalized_mode != "plan":
         tools.extend(_write_tools(project_root))

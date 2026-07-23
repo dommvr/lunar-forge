@@ -4,7 +4,13 @@ from lunar_forge.subagents.base import BUILTIN_SUBAGENT_TOOLS, SubagentRole
 
 
 _ALLOWED_TOOLS = frozenset(
-    {"read_file", "read_file_with_line_numbers", "grep", "glob"}
+    {
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "project_health",
+    }
 )
 
 SECURITY_ROLE = SubagentRole(
@@ -15,8 +21,9 @@ SECURITY_ROLE = SubagentRole(
     ),
     system_prompt_fragment=(
         "Act as the security reviewer. Trace trust and permission boundaries, flag "
-        "specific bypasses or unsafe defaults, and do not mutate files or execute "
-        "commands. Existing safety rules are authoritative."
+        "specific bypasses or unsafe defaults, and use project_health when repository "
+        "runtime or tracked-path signals are relevant. Do not mutate files or "
+        "execute commands. Existing safety rules are authoritative."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

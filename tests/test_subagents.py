@@ -42,6 +42,8 @@ EXPECTED_ALLOWED_TOOLS = {
         "grep",
         "glob",
         "detect_project",
+        "project_health",
+        "dependency_summary",
     },
     "coder": {
         "list_dir",
@@ -55,7 +57,14 @@ EXPECTED_ALLOWED_TOOLS = {
         "replace_lines",
         "insert_lines",
     },
-    "reviewer": {"read_file", "read_file_with_line_numbers", "grep", "glob"},
+    "reviewer": {
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "project_health",
+        "dependency_summary",
+    },
     "tester": {
         "run_command",
         "run_validation",
@@ -64,8 +73,15 @@ EXPECTED_ALLOWED_TOOLS = {
         "read_file",
         "read_file_with_line_numbers",
         "grep",
+        "dependency_summary",
     },
-    "security": {"read_file", "read_file_with_line_numbers", "grep", "glob"},
+    "security": {
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "project_health",
+    },
     "scaffolder": {"create_dir", "write_file", "run_command", "run_validation"},
 }
 

@@ -4,7 +4,14 @@ from lunar_forge.subagents.base import BUILTIN_SUBAGENT_TOOLS, SubagentRole
 
 
 _ALLOWED_TOOLS = frozenset(
-    {"read_file", "read_file_with_line_numbers", "grep", "glob"}
+    {
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "project_health",
+        "dependency_summary",
+    }
 )
 
 REVIEWER_ROLE = SubagentRole(
@@ -16,7 +23,9 @@ REVIEWER_ROLE = SubagentRole(
     system_prompt_fragment=(
         "Act as the reviewer. Inspect the relevant changed files, report concrete "
         "findings with file references, and do not modify project state. Prioritize "
-        "correctness and maintainability over stylistic preferences. Validation "
+        "correctness and maintainability over stylistic preferences. Use project "
+        "health or dependency metadata only when the review is broad enough to need "
+        "it. Validation "
         "status belongs to tester and tool results. In parallel mode the tester may "
         "still be running. Do not make global browser-validation status claims or "
         "claims about whether screenshots, console errors, failed requests, page "
