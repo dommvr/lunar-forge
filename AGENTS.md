@@ -63,7 +63,7 @@ Completed advanced feature wave:
 29. Add UI/browser validation with Playwright.
 30. Add a safe plugin system and plugin diagnostics.
 
-Next feature wave, in order:
+Completed second advanced feature wave:
 
 31. Add better file inspection and edit tools:
     * `read_file_with_line_numbers`
@@ -74,7 +74,15 @@ Next feature wave, in order:
 34. Add clearer Playwright dependency detection and setup guidance, with optional user-approved installation only when explicitly requested.
 35. Add parallel subagent phases for read-only analysis and validation/review while keeping write-capable work serialized.
 
-The basic read-plan-edit-validate MVP and first advanced tool wave already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
+Next feature wave, in order:
+
+36. Add `docs/manual-testing.md` with reproducible manual test checklists.
+37. Add an `examples/` folder with small sample projects and copy-paste configs.
+38. Add a browser validation demo project under `examples/`.
+39. Add opt-in Git commit support with safe status/diff checks and approval.
+40. Run a hardening and documentation pass for docs, examples, and Git commit support.
+
+The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
 ---
 
@@ -115,6 +123,21 @@ lunar-forge/
   README.md
   .gitignore
   AGENTS.md
+
+  docs/
+    manual-testing.md
+
+  examples/
+    README.md
+    projects/
+      browser-demo/
+      static-site/
+      vite-react/
+      python-cli/
+      flask-api/
+      fastapi-api/
+    mcp/
+      playwright/
 
   lunar_forge/
     __init__.py
@@ -1249,6 +1272,55 @@ Behavior:
 
 ---
 
+
+## Git commit support
+
+Git support should be opt-in and conservative.
+
+Goals:
+
+* Let LunarForge optionally create a Git commit after a successful task.
+* Keep Git history clean by committing only intended changes.
+* Never commit automatically by default.
+* Never commit unrelated dirty files without clearly showing them.
+* Never commit secrets, generated artifacts, or runtime `.agent/` files.
+* Never commit after failed validation unless the user explicitly requests it.
+
+Suggested CLI behavior:
+
+```bash
+lunar-forge "Add pricing page" --commit
+lunar-forge "Add pricing page" --commit --commit-message "Add pricing page"
+lunar-forge git status --project ./my-app
+lunar-forge git commit --project ./my-app --message "Add pricing page"
+```
+
+Rules:
+
+* `--commit` means “offer to commit after successful work,” not “commit without asking.”
+* Git commands must use `shell=False`.
+* Commit support must work only inside a Git repository.
+* Before committing, show `git status --short` and a bounded diff summary.
+* Prefer committing files changed by the current LunarForge session.
+* If unrelated dirty files exist, show them and do not include them unless the user explicitly approves.
+* Commit message should be concise and derived from the completed task.
+* Commit action requires approval even in permissive modes.
+* Plan mode must never commit.
+* No-command mode must block Git command execution.
+* Session logs should record Git status, selected files, approval, and commit hash when available.
+
+Suggested internal helpers:
+
+```text
+git_status
+git_diff_summary
+git_commit
+```
+
+Git commit support is useful, but it must remain a guarded finalization step. Git history is not a landfill, no matter how confidently tools keep treating it like one.
+
+---
+
 ## Plugin system
 
 Plugins are a later feature and must be safer than convenient. Convenient plugin systems are how tools become malware with a README.
@@ -1298,6 +1370,73 @@ Plugin rules:
 * Plugin command/network/filesystem access must be declared and permission-gated.
 * Plugin exceptions must be contained and returned as tool errors.
 * Plugin results must be JSON-serializable and bounded.
+
+
+## Documentation and examples
+
+The repository should include documentation and runnable examples.
+
+Required docs:
+
+```text
+docs/manual-testing.md
+```
+
+Manual testing docs should include:
+
+* installation and config checks,
+* plan mode,
+* basic project inspection,
+* line edit tools,
+* new-project scaffolding,
+* validation workflow,
+* managed browser validation,
+* Playwright setup,
+* Playwright MCP,
+* plugin diagnostics,
+* session resume,
+* checkpoints and rollback,
+* parallel subagents,
+* Git commit support after it exists.
+
+Each manual test should include:
+
+* setup,
+* command,
+* expected output,
+* cleanup notes.
+
+Required examples:
+
+```text
+examples/
+  README.md
+  projects/
+    browser-demo/
+    static-site/
+    vite-react/
+    python-cli/
+    flask-api/
+    fastapi-api/
+  mcp/
+    playwright/
+```
+
+Example rules:
+
+* Examples should be small, readable, and cheap to run.
+* Examples should not require secrets.
+* Examples should not include generated dependency folders such as `node_modules`.
+* Browser demo should be a real Vite/React app or minimal frontend project suitable for:
+  * managed server validation,
+  * full-page screenshots,
+  * console-error collection,
+  * Playwright MCP inspection.
+* MCP Playwright example should include copy-paste `.agent/config.yaml` and `.agent/mcp.yaml` examples.
+* Examples should include README files with exact commands.
+* Do not add plugin examples in this batch unless explicitly requested later.
+
+---
 
 ## Testing
 
@@ -1452,9 +1591,8 @@ These remain out of scope until the next feature wave is stable:
 * vector database,
 * semantic code index,
 * multi-repo workspace mode,
-* automatic git commits,
 * cloud execution.
 
 Reason:
 
-The next feature wave already adds nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, and plugins. That is enough complexity. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.
+The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, and parallel subagent phases. Keep the next work focused on documentation, examples, and guarded Git commit support. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.

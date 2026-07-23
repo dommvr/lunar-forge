@@ -469,6 +469,16 @@ existing project. Plan mode selects and describes the starter without writing
 files, creating `.agent`, or running commands. Final output includes validation
 and run instructions.
 
+## Runnable examples
+
+Small source-only projects and copy-paste commands live in the
+[examples guide](examples/README.md). The collection includes static HTML,
+Vite/React, Python CLI, Flask, and FastAPI projects plus a dedicated
+[browser validation demo](examples/projects/browser-demo/) with full-page
+content, interactive controls, optional console-error collection, managed Vite
+validation, and Playwright MCP configuration examples. Generated dependency and
+build directories are not checked in.
+
 ## Validation
 
 The permission-gated `run_validation` tool chooses likely commands from project
@@ -633,75 +643,11 @@ execution and state in `runtime/`, and small project workflows in `workflows/`.
 
 ## Manual testing checklist
 
-Use a disposable target project for checks that intentionally edit files or
-start processes.
-
-- [ ] Run the automated baseline from the LunarForge repository:
-
-  ```bash
-  python -m pytest -q
-  python -B -m compileall lunar_forge
-  git diff --check
-  ```
-
-- [ ] Ask LunarForge to read a disposable file with line numbers, replace an
-  inclusive range, and insert once with `after_line: 0`. Confirm the reported
-  diff is bounded, the file keeps its newline convention, and the original is
-  present under `.agent/checkpoints/`.
-
-- [ ] Repeat the edit request with `--plan`. Confirm no file changes, command
-  execution, checkpoint, or session artifact is created.
-
-- [ ] Review and run optional browser setup. Confirm both commands are printed
-  before approval, denial stops immediately, and no install command runs under
-  `permissions.mode: no-command`:
-
-  ```bash
-  lunar-forge browser-setup --project .
-  ```
-
-- [ ] With a local site already running, exercise viewport and full-page modes
-  and confirm the returned screenshot stays under the selected project:
-
-  ```bash
-  lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend
-  lunar-forge browser-validate http://127.0.0.1:5173 --project ./frontend --full-page --width 1440 --height 1200
-  ```
-
-- [ ] Exercise managed mode. Confirm the exact dev command requires approval,
-  startup failures include only bounded stdout/stderr, and the process is no
-  longer listening after success, timeout, validation failure, or interruption:
-
-  ```bash
-  lunar-forge browser-validate --serve "npm run dev" --url http://localhost:5173 --project ./frontend
-  ```
-
-- [ ] Ask the model to check a screenshot, layout, console errors, a click, and
-  a localhost page. Confirm it chooses browser validation or available
-  Playwright MCP tools instead of curl/basic HTTP validation. Confirm it does
-  not install dependencies or start a server without approval.
-
-  ```bash
-  lunar-forge --project ./frontend "Start the dev server if needed, inspect the UI in a browser, capture a full-page screenshot, and report console errors."
-  ```
-
-  Confirm the final Browser validation section says `passed` and includes the
-  URL, title, screenshot path, both error counts, and `Full-page screenshot: yes`.
-  It must not also claim that browser validation did not run, no screenshot was
-  captured, or console errors were not inspected.
-
-- [ ] Enable parallel subagents with either configuration or the CLI flag (both
-  are not required), run a disposable change, and confirm the final report lists
-  serialized Coder/Scaffolder work and the `post-edit: tester, reviewer` group:
-
-  ```bash
-  lunar-forge --project ./my-app --parallel-subagents "Make a small documented change"
-  ```
-
-- [ ] Inspect the resulting project-local session JSONL. Confirm each subagent
-  lifecycle event has `role`, `phase`, and `parallel_group_id`, records are valid
-  one-line JSON under concurrent completion, and test environment secret values
-  do not appear in the file.
+See the comprehensive, Windows-friendly
+[manual testing guide](docs/manual-testing.md). It covers installation,
+configuration, plan and no-command modes, file inspection and line edits, all
+six project starters, validation, browser setup and managed validation,
+Playwright MCP, plugin diagnostics, sessions, rollback, and parallel subagents.
 
 ## Known limitations
 
