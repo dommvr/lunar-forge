@@ -25,6 +25,8 @@ dist/
 .DS_Store
 Thumbs.db
 
+.agent/
+
 TODO.md
 AGENTS.md
 CLAUDE.md

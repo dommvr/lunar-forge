@@ -54,8 +54,8 @@ def test_system_prompt_scales_project_intelligence_to_the_task():
     assert "Before planning validation" in prompt
     assert "call dependency_summary" in prompt
     assert "Before a review, final change summary, or commit proposal" in prompt
-    assert "call\n  list_changed_files first" in prompt
-    assert "use git_diff only when Git changes exist" in prompt
+    assert "call git_status and\n  list_changed_files first" in prompt
+    assert "Use git_diff only when Git changes exist" in prompt
     assert "For a tiny targeted edit" in prompt
     assert "Tool calls are not a checklist" in prompt
 
@@ -284,5 +284,7 @@ def test_subagent_handoffs_include_role_specific_intelligence_guidance():
     assert "broad review, onboarding, or feature planning" in planner
     assert "dependency_summary before" in planner
     assert "tiny single-file tasks narrowly scoped" in planner
+    assert "git_status and list_changed_files" in planner
+    assert "git_diff only when changed-file details are needed" in planner
     assert "dependency_summary before guessing uncertain commands" in tester
     assert "list_changed_files when it helps focus validation" in tester

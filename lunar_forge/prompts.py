@@ -126,10 +126,10 @@ Use project intelligence deliberately:
   commands, call dependency_summary and prefer its bounded manifest metadata.
 - For a tiny targeted edit, do not call broad intelligence tools unless the
   user also requested a project-wide review. Tool calls are not a checklist.
-- Before a review, final change summary, or commit proposal, call
-  list_changed_files first and use git_diff only when Git changes exist and
-  details are useful. Do not request repeated diffs when no files changed, and
-  never use Git tools to stage or mutate files.
+- Before a review, final change summary, or commit proposal, call git_status and
+  list_changed_files first. Use git_diff only when Git changes exist and
+  changed-file details are useful. Do not request repeated diffs when no files
+  changed, and never use Git tools to stage, commit, or mutate files.
 
 For precise file changes:
 - Prefer read_file_with_line_numbers before any line-based edit so the selected
@@ -346,7 +346,10 @@ def build_subagent_user_prompt(
             "files and validation; use project_health first for broad review, "
             "onboarding, or feature planning, and dependency_summary before "
             "choosing uncertain validation, build, or development commands. Keep "
-            "tiny single-file tasks narrowly scoped. Do not implement it."
+            "tiny single-file tasks narrowly scoped. Use git_status and "
+            "list_changed_files before planning a review or commit, and git_diff "
+            "only when changed-file details are needed. Do not implement or commit "
+            "anything."
         ),
         "coder": (
             "Use the planner handoff as context and implement the requested change. "
@@ -360,16 +363,18 @@ def build_subagent_user_prompt(
         ),
         "reviewer": (
             "Review the completed work and produce the concise final user-facing "
-            "summary required by the system prompt. Start with list_changed_files, "
-            "then use git_diff for relevant changed files when Git is available; "
-            "do not reread the whole project when that evidence is enough. Do not "
-            "edit files."
+            "summary required by the system prompt. Start with git_status and "
+            "list_changed_files, then use git_diff only for relevant changed-file "
+            "details; do not reread the whole project when that evidence is enough. "
+            "Do not edit files or request a commit."
         ),
         "security": (
             "Review the sensitive changed files and report concrete trust-boundary "
-            "findings. Use project_health and git_status for suspicious tracked "
-            "runtime, generated, or secret-looking paths, and git_diff for "
-            "security-sensitive changes. Do not edit files or run commands."
+            "findings. Use project_health and dependency_summary for broad context, "
+            "git_status and list_changed_files for suspicious tracked runtime, "
+            "generated, or secret-looking paths, and git_diff only for relevant "
+            "security-sensitive details. Do not edit files, run project commands, "
+            "or request a commit."
         ),
         "scaffolder": (
             "Create only the approved starter project, preserving overwrite and "

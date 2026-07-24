@@ -360,14 +360,14 @@ checks and are never returned by `git_diff`.
 The agent prompt uses `project_health` plus `dependency_summary` for broad
 review, audit, explanation, onboarding, and feature-planning work, and uses
 dependency metadata before guessing validation commands. Small targeted edits
-continue to inspect only the relevant files. Planner and Reviewer can use both
-tools, Tester can use dependency metadata, and Security can use project health;
-all remain read-only through the central permission registry and are available
-in plan mode. Provider-facing names are normalized and collision-checked by the
-central registry; these five names already satisfy the provider-safe pattern
-unchanged. The tools return provider-neutral dictionaries and contain no
-LiteLLM, OpenAI, or Anthropic translation code—provider adapters remain under
-`lunar_forge/model_clients/`.
+continue to inspect only the relevant files. Planner, Reviewer, and Security can
+use all five read-only intelligence tools; Tester receives only the dependency
+and changed-file metadata useful for validation. All remain read-only through
+the central permission registry and are available in plan mode. Provider-facing
+names are normalized and collision-checked by the central registry; these five
+names already satisfy the provider-safe pattern unchanged. The tools return
+provider-neutral dictionaries and contain no LiteLLM, OpenAI, or Anthropic
+translation code—provider adapters remain under `lunar_forge/model_clients/`.
 
 ### Optional subagent mode
 

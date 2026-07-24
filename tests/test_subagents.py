@@ -45,6 +45,8 @@ EXPECTED_ALLOWED_TOOLS = {
         "project_health",
         "dependency_summary",
         "git_status",
+        "git_diff",
+        "list_changed_files",
     },
     "coder": {
         "list_dir",
@@ -87,6 +89,7 @@ EXPECTED_ALLOWED_TOOLS = {
         "grep",
         "glob",
         "project_health",
+        "dependency_summary",
         "git_status",
         "git_diff",
         "list_changed_files",
@@ -120,15 +123,21 @@ def test_role_prompts_use_project_intelligence_deliberately():
     assert "broad review, onboarding, or feature-planning" in planner
     assert "dependency_summary before" in planner
     assert "tiny single-file edit" in planner
-    assert "list_changed_files before opening review files" in reviewer
-    assert "git_diff for relevant changed files" in reviewer
+    assert "git_status and list_changed_files" in planner
+    assert "git_diff only when changed-file details are needed" in planner
+    assert (
+        "git_status and list_changed_files before opening review files"
+        in reviewer
+    )
+    assert "git_diff only" in reviewer
     assert "Do not reread the whole project" in reviewer
     assert "dependency_summary before selecting commands" in tester
     assert "list_changed_files when it helps" in tester
     assert "focus validation or failure inspection" in tester
-    assert "project_health and git_status" in security
+    assert "project_health and dependency_summary" in security
+    assert "git_status and list_changed_files" in security
     assert "suspicious tracked runtime" in security
-    assert "git_diff for security-sensitive changes" in security
+    assert "git_diff only" in security
 
 
 def test_restricted_registry_exposes_only_role_allowlisted_tools():
@@ -144,6 +153,72 @@ def test_restricted_registry_exposes_only_role_allowlisted_tools():
 
     assert result["ok"] is True
     assert calls == ["read_file"]
+
+
+def test_planner_can_use_git_diff_and_list_changed_files():
+    registry, calls = _registry_with_all_known_tools()
+    restricted = PLANNER_ROLE.restrict(registry)
+
+    diff_result = restricted.execute("git_diff", {"max_lines": 20})
+    changed_result = restricted.execute(
+        "list_changed_files",
+        {"source": "both"},
+    )
+
+    assert diff_result["ok"] is True
+    assert changed_result["ok"] is True
+    assert calls == ["git_diff", "list_changed_files"]
+
+
+@pytest.mark.parametrize(
+    "role",
+    (PLANNER_ROLE, REVIEWER_ROLE, SECURITY_ROLE),
+    ids=lambda role: role.name,
+)
+def test_read_only_roles_cannot_mutate_files_or_commit(role):
+    calls = []
+
+    def handler(tool_name):
+        def run(**arguments):
+            calls.append(tool_name)
+            return {"ok": True}
+
+        return run
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="write_file",
+                description="Write a file.",
+                parameters={"type": "object"},
+                handler=handler("write_file"),
+                permission=PermissionLevel.WRITE,
+            ),
+            Tool(
+                name="git_commit",
+                description="Commit files.",
+                parameters={"type": "object"},
+                handler=handler("git_commit"),
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+    restricted = role.restrict(registry)
+
+    write_result = restricted.execute(
+        "write_file",
+        {"path": "blocked.txt", "content": "blocked"},
+    )
+    commit_result = restricted.execute(
+        "git_commit",
+        {"message": "Blocked"},
+    )
+
+    assert write_result["ok"] is False
+    assert write_result["blocked_by_subagent"] is True
+    assert commit_result["ok"] is False
+    assert commit_result["blocked_by_subagent"] is True
+    assert calls == []
 
 
 def test_tester_registry_exposes_browser_and_playwright_mcp_tools():
@@ -1370,6 +1445,23 @@ def test_subagent_plan_mode_runs_only_planner_without_writing(tmp_path):
 
     assert len(model.calls) == 1
     assert model.calls[0]["role"] == "planner"
+    assert {
+        "project_health",
+        "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
+    }.issubset(model.calls[0]["tools"])
+    assert {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+        "run_command",
+        "run_validation",
+        "git_commit",
+    }.isdisjoint(model.calls[0]["tools"])
     assert "Subagents run:\n- planner" in output
     assert not (tmp_path / ".agent").exists()
 
