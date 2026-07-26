@@ -75,6 +75,9 @@ _DISPLAY_SECRET_ASSIGNMENT = re.compile(
 _DISPLAY_API_KEY = re.compile(
     r"(?i)\b(?:sk-(?:ant-)?|gh[pousr]_|github_pat_)[a-z0-9_-]{8,}\b"
 )
+_BARE_PYTHON_INTERPRETERS = frozenset(
+    {"python", "python.exe", "py", "py.exe"}
+)
 
 
 def dangerous_command_reason(command: str) -> str | None:
@@ -97,6 +100,20 @@ def normalized_dangerous_command_reason(command: str) -> str | None:
     except ValueError:
         return None
     return dangerous_command_reason(normalized)
+
+
+def is_bare_python_interpreter_command(command: str) -> bool:
+    """Return whether a command only starts an interactive Python interpreter."""
+    if not isinstance(command, str) or not command.strip():
+        return False
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if len(arguments) != 1:
+        return False
+    executable = arguments[0].replace("\\", "/").rsplit("/", 1)[-1]
+    return executable.casefold() in _BARE_PYTHON_INTERPRETERS
 
 
 @dataclass
@@ -125,6 +142,17 @@ class PermissionManager:
                     reason="Command must be a string.",
                 )
             if isinstance(command, str):
+                if (
+                    tool_name == "run_command"
+                    and is_bare_python_interpreter_command(command)
+                ):
+                    return PermissionDecision(
+                        allowed=False,
+                        reason=(
+                            "Bare Python interpreter commands are not meaningful "
+                            "checks. Use a module, script, or compile command."
+                        ),
+                    )
                 dangerous_pattern = dangerous_command_reason(command)
                 if dangerous_pattern is None:
                     dangerous_pattern = normalized_dangerous_command_reason(command)

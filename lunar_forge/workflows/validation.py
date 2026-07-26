@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lunar_forge.permissions import is_bare_python_interpreter_command
 from lunar_forge.project_detection import ProjectInfo, detect_project
 from lunar_forge.runtime.local_runner import DEFAULT_TIMEOUT_MS, run_local_command
 from lunar_forge.tools.files import safe_path
@@ -93,7 +94,7 @@ def _select_validation_commands(
     languages = project_info["languages"]
 
     if "python" in languages:
-        commands.append("python -m compileall .")
+        commands.append("python -B -m compileall .")
         if _has_pytest_tests_or_config(root):
             commands.append("pytest")
 
@@ -105,7 +106,19 @@ def _select_validation_commands(
                 if script in scripts:
                     commands.append(_package_script_command(package_manager, script))
 
-    return commands
+    return [
+        command
+        for command in commands
+        if _is_validation_command_candidate(command)
+    ]
+
+
+def _is_validation_command_candidate(command: str) -> bool:
+    return (
+        isinstance(command, str)
+        and bool(command.strip())
+        and not is_bare_python_interpreter_command(command)
+    )
 
 
 def _has_pytest_tests_or_config(root: Path) -> bool:

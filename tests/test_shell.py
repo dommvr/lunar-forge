@@ -226,3 +226,57 @@ def test_shell_dispatch_preserves_local_mode(monkeypatch, tmp_path):
         "command": "python --version",
         "timeout_ms": 1234,
     }
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("python", "python.exe", "py", "py.exe"),
+)
+def test_bare_python_interpreters_are_blocked_before_dispatch(
+    monkeypatch,
+    tmp_path,
+    command,
+):
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("Bare interpreter must not reach a runner")
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_local_command",
+        unexpected_runner,
+    )
+
+    result = run_command(tmp_path, command)
+
+    assert result["ok"] is False
+    assert result["exit_code"] is None
+    assert "not meaningful checks" in result["error"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "python -m pytest",
+        "python -B -m compileall .",
+        "python app.py",
+    ),
+)
+def test_meaningful_python_commands_remain_dispatchable(
+    monkeypatch,
+    tmp_path,
+    command,
+):
+    captured = []
+
+    def fake_runner(project_root, selected_command, timeout_ms):
+        captured.append(selected_command)
+        return {"ok": True, "command": selected_command, "exit_code": 0}
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_local_command",
+        fake_runner,
+    )
+
+    result = run_command(tmp_path, command)
+
+    assert result["ok"] is True
+    assert captured == [command]

@@ -61,6 +61,8 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "inventing or finalizing validation commands" in prompt
     assert "Do not call ci_summary when" in prompt
     assert "Do not call every introspection tool for\n  every small task" in prompt
+    assert "Never use bare `python`, `python.exe`, `py`, or `py.exe`" in prompt
+    assert "prefer `python -B -m compileall .`" in prompt
 
 
 def test_system_prompt_scales_project_intelligence_to_the_task():

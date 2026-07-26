@@ -809,10 +809,14 @@ with `shell=False`.
 The permission-gated `run_validation` tool chooses likely commands from project
 markers:
 
-- Python: `python -m compileall .`, plus `pytest` when tests or pytest
+- Python: `python -B -m compileall .`, plus `pytest` when tests or pytest
   configuration exist.
 - Node: package-manager-aware `test`, `lint`, and `build` scripts when present in
   `package.json`.
+
+Bare `python`, `python.exe`, `py`, and `py.exe` commands are rejected as
+non-checks. Module commands, compile commands, and targeted script runs remain
+available through the normal execution permission path.
 
 Validation uses the same approved local or Docker command runner and reports
 every result. No detected commands is a successful, explicit no-op.
@@ -958,7 +962,10 @@ calls are inert records and are never replayed automatically. Use
 `--summary-only` for model-free inspection or `--plan` to continue without
 writes. Add `--show-usage` to a run or resumed run for a compact aggregate in
 the final output, or combine it with `resume --summary-only` to inspect the
-stored session total. Normal final output remains unchanged without the flag.
+stored session total. In plan mode, usage is accumulated in memory so
+`--show-usage --plan` reports exact provider totals or labeled estimates without
+creating `.agent` runtime files. Normal final output remains unchanged without
+the flag.
 
 ## Development
 

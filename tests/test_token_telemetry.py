@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -206,3 +207,81 @@ def test_agent_estimates_usage_when_provider_metadata_is_missing(tmp_path):
         usage["input_tokens"] + usage["output_tokens"]
     )
     assert "Model usage:" not in output
+
+
+def test_plan_show_usage_uses_in_memory_estimates_without_runtime_files(tmp_path):
+    class PlanModel:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, tools=None):
+            self.calls.append(list(tools or []))
+            return ModelResponse(
+                text="Read-only implementation plan.",
+                model="openai/gpt-test",
+            )
+
+    model = PlanModel()
+
+    output = CodeAgent(AppConfig(), model_client=model).run(
+        "Plan a parser cleanup.",
+        tmp_path,
+        mode="plan",
+        show_usage=True,
+    )
+
+    assert "Model usage:" in output
+    assert "- Calls: 1 (0 exact, 1 estimated)" in output
+    assert re.search(r"- Input tokens: [1-9]\d*", output)
+    assert re.search(r"- Output tokens: [1-9]\d*", output)
+    assert re.search(r"- Total tokens: [1-9]\d*", output)
+    assert "unavailable in plan mode" not in output
+    assert "Session log: disabled in plan mode" in output
+    assert not (tmp_path / ".agent").exists()
+
+    exposed_names = {
+        schema["function"]["name"]
+        for schema in model.calls[0]
+    }
+    assert {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+        "run_command",
+        "run_validation",
+        "run_browser_validation",
+        "run_managed_browser_validation",
+        "git_commit",
+    }.isdisjoint(exposed_names)
+
+
+def test_plan_show_usage_preserves_exact_provider_totals(tmp_path):
+    model = SingleResponseModel(
+        ModelResponse(
+            text="Exact-usage plan.",
+            model="gpt-test",
+            usage=ModelUsage(
+                input_tokens=90,
+                output_tokens=10,
+                total_tokens=100,
+                model="gpt-test",
+                provider="openai",
+                exact=True,
+            ),
+        )
+    )
+
+    output = CodeAgent(AppConfig(), model_client=model).run(
+        "Plan a documentation cleanup.",
+        tmp_path,
+        mode="plan",
+        show_usage=True,
+    )
+
+    assert "- Calls: 1 (1 exact, 0 estimated)" in output
+    assert "- Input tokens: 90" in output
+    assert "- Output tokens: 10" in output
+    assert "- Total tokens: 100" in output
+    assert not (tmp_path / ".agent").exists()

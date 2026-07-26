@@ -1237,6 +1237,75 @@ def test_tester_command_results_replace_reviewer_not_run_summary(tmp_path):
     assert "Commands run:\n- None" not in output
 
 
+def test_run_command_results_replace_reviewer_not_run_summary(tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(text="Plan: update app.py, then check it."),
+            ModelResponse(text="Implementation complete."),
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="command",
+                        name="run_command",
+                        arguments={"command": "python app.py"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="The runtime check passed."),
+            ModelResponse(
+                text=(
+                    "No validation result provided.\n\n"
+                    "Validation:\n"
+                    "- Not run (review-only phase).\n\n"
+                    "Commands run:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_command",
+                description="Run a command.",
+                parameters={"type": "object"},
+                handler=lambda command: {
+                    "ok": True,
+                    "command": command,
+                    "exit_code": 0,
+                    "stdout": "ok\n",
+                    "stderr": "",
+                    "duration_ms": 1,
+                    "truncated": False,
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: True,
+    ).run("Update app.py and check the result.", tmp_path, registry=registry)
+
+    assert (
+        "Validation:\n"
+        "- Commands were run; no dedicated validation workflow was selected."
+    ) in output
+    assert (
+        "Commands run:\n"
+        "- python app.py: passed "
+        "(authoritative tool result; via run_command; exit code 0)"
+    ) in output
+    assert "Validation:\n- Not run" not in output
+    assert "no validation result provided" not in output.casefold()
+    assert "review-only phase" not in output.casefold()
+    assert "Commands run:\n- None" not in output
+
+
 @pytest.mark.parametrize(
     ("parallel", "include_reviewer_finding"),
     ((False, True), (True, True), (False, False)),

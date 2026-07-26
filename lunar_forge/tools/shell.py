@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
+from lunar_forge.permissions import is_bare_python_interpreter_command
 from lunar_forge.runtime.docker_runner import run_docker_command
 from lunar_forge.runtime.local_runner import (
     DEFAULT_TIMEOUT_MS,
@@ -24,6 +25,20 @@ def run_command(
 ) -> dict[str, Any]:
     """Dispatch a bounded command to the configured application-owned runner."""
     normalized_mode = runtime_mode.strip().lower()
+    if (
+        normalized_mode == "local"
+        and is_bare_python_interpreter_command(command)
+    ):
+        return {
+            "ok": False,
+            "runtime": normalized_mode,
+            "command": command,
+            "exit_code": None,
+            "error": (
+                "Bare Python interpreter commands are not meaningful checks. "
+                "Use a module, script, or compile command."
+            ),
+        }
     if normalized_mode == "local":
         return run_local_command(project_root, command, timeout_ms)
     if normalized_mode == "docker":

@@ -151,7 +151,7 @@ New-Item -ItemType Directory -Force -Path $PlanProject | Out-Null
 **Command**
 
 ```powershell
-lunar-forge --project $PlanProject --plan --commit "Inspect note.txt and plan how to replace alpha with beta. List the file and validation steps, but do not edit anything."
+lunar-forge --show-usage --project $PlanProject --plan --commit "Inspect note.txt and plan how to replace alpha with beta. List the file and validation steps, but do not edit anything."
 Get-Content -LiteralPath (Join-Path $PlanProject "note.txt")
 Test-Path -LiteralPath (Join-Path $PlanProject ".agent")
 ```
@@ -161,7 +161,9 @@ Test-Path -LiteralPath (Join-Path $PlanProject ".agent")
 LunarForge describes the goal, likely changed file, and validation approach.
 `note.txt` still contains `alpha`, the final `Test-Path` prints `False`, and no
 write or command approval prompt appears. The Git section says plan mode blocks
-the commit, and no Git approval prompt appears.
+the commit, and no Git approval prompt appears. The final output includes calls,
+input tokens, output tokens, total tokens, and exact/estimated counts; it still
+reports `Session log: disabled in plan mode`.
 
 **Cleanup**
 
@@ -1364,7 +1366,7 @@ Approve the `Run detected validation commands` request.
 
 **Expected result**
 
-The result lists `python -m compileall .` and `pytest`; both exit with code 0;
+The result lists `python -B -m compileall .` and `pytest`; both exit with code 0;
 the overall message says all validation commands passed; and no file edit is
 made.
 

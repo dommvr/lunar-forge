@@ -45,7 +45,7 @@ def test_python_validation_always_chooses_compileall_but_not_unneeded_pytest(
     result = run_validation(tmp_path)
 
     assert result["ok"] is True
-    assert result["commands"] == ["python -m compileall ."]
+    assert result["commands"] == ["python -B -m compileall ."]
     assert executed == result["commands"]
     json.dumps(result)
 
@@ -71,7 +71,7 @@ def test_python_validation_includes_pytest_for_tests_or_config(
 
     result = run_validation(tmp_path)
 
-    assert result["commands"] == ["python -m compileall .", "pytest"]
+    assert result["commands"] == ["python -B -m compileall .", "pytest"]
 
 
 @pytest.mark.parametrize(
@@ -158,7 +158,7 @@ def test_validation_fails_when_any_command_fails(monkeypatch, tmp_path):
     result = run_validation(tmp_path)
 
     assert result["ok"] is False
-    assert result["commands"] == ["python -m compileall .", "pytest"]
+    assert result["commands"] == ["python -B -m compileall .", "pytest"]
     assert "failed" in result["message"]
 
 
@@ -187,3 +187,56 @@ def test_validation_tool_requires_execution_permission_and_plan_hides_it(tmp_pat
     assert requests[0].tool_name == "run_validation"
     assert requests[0].permission is PermissionLevel.EXECUTE
     assert requests[0].description == "Run detected validation commands."
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("python", "python.exe", "py", "py.exe"),
+)
+def test_validation_command_candidates_reject_bare_python_interpreters(command):
+    assert validation_module._is_validation_command_candidate(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("python", "python.exe", "py", "py.exe"),
+)
+def test_model_suggested_bare_interpreters_are_denied_before_approval(
+    tmp_path,
+    command,
+):
+    approval_requests = []
+    registry = create_tool_registry(
+        tmp_path,
+        mode="default",
+        approval_callback=lambda request: approval_requests.append(request) or True,
+    )
+
+    result = registry.execute("run_command", {"command": command})
+
+    assert result["ok"] is False
+    assert result["permission_denied"] is True
+    assert "not meaningful checks" in result["error"]
+    assert approval_requests == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "python -m pytest",
+        "python -B -m compileall .",
+        "python app.py",
+    ),
+)
+def test_validation_command_candidates_allow_meaningful_python_commands(command):
+    assert validation_module._is_validation_command_candidate(command) is True
+
+
+def test_single_python_file_prefers_compileall_validation(monkeypatch, tmp_path):
+    (tmp_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    executed = _record_successful_commands(monkeypatch)
+
+    result = run_validation(tmp_path)
+
+    assert result["commands"] == ["python -B -m compileall ."]
+    assert executed == result["commands"]

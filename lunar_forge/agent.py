@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from lunar_forge.config import AppConfig, load_config
@@ -141,6 +142,68 @@ class AgentError(RuntimeError):
     """Raised when the bounded agent loop cannot produce a final response."""
 
 
+@dataclass
+class _RunUsageTotals:
+    """Thread-safe in-memory usage totals for runs without session files."""
+
+    _totals: dict[str, int] = field(
+        default_factory=lambda: {
+            "model_calls": 0,
+            "exact_calls": 0,
+            "estimated_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+        repr=False,
+    )
+    _lock: Any = field(default_factory=Lock, repr=False, compare=False)
+
+    def record(self, usage: ModelUsage) -> None:
+        with self._lock:
+            self._totals["model_calls"] += 1
+            classification = "exact_calls" if usage.exact else "estimated_calls"
+            self._totals[classification] += 1
+            for key, value in (
+                ("input_tokens", usage.input_tokens),
+                ("output_tokens", usage.output_tokens),
+                ("total_tokens", usage.total_tokens),
+            ):
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                ):
+                    self._totals[key] += value
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._totals)
+
+
+@dataclass(frozen=True)
+class _UsageTrackingModelClient:
+    """Record model usage without creating a plan-mode session file."""
+
+    delegate: ModelClient
+    totals: _RunUsageTotals
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ModelResponse:
+        tool_schemas = tools or ()
+        response = self.delegate.complete(messages, tools)
+        usage, _ = _model_usage_for_call(
+            response,
+            messages=messages,
+            tool_schemas=tool_schemas,
+        )
+        self.totals.record(usage)
+        return response
+
+
 @dataclass(frozen=True)
 class SubagentPhaseResult:
     text: str
@@ -269,6 +332,11 @@ class CodeAgent:
         root = Path(project_root).expanduser().resolve()
         normalized_mode = mode.strip().lower()
         session = _start_session(root, normalized_mode)
+        in_memory_usage_totals = (
+            _RunUsageTotals()
+            if show_usage and session is None
+            else None
+        )
         if resumed_from:
             _log_session(
                 session,
@@ -317,7 +385,10 @@ class CodeAgent:
                 else:
                     readonly_tools = registry
                     readonly_tools.set_permission_manager(permission_manager)
-                model_client = self.model_client or self._create_model_client()
+                model_client = _track_model_usage(
+                    self.model_client or self._create_model_client(),
+                    in_memory_usage_totals,
+                )
                 return self._run_explicit_readonly_fast_path(
                     request=request,
                     parsed_request=explicit_readonly_request,
@@ -326,6 +397,7 @@ class CodeAgent:
                     session=session,
                     mode=normalized_mode,
                     show_usage=show_usage,
+                    usage_totals=in_memory_usage_totals,
                 )
             mcp_client = (
                 MCPClient(
@@ -401,7 +473,10 @@ class CodeAgent:
                     | set(tools.relevant_tool_names(request))
                 )
             )
-            model_client = self.model_client or self._create_model_client()
+            model_client = _track_model_usage(
+                self.model_client or self._create_model_client(),
+                in_memory_usage_totals,
+            )
             system_prompt = build_system_prompt(
                 project_info,
                 instructions,
@@ -454,6 +529,11 @@ class CodeAgent:
                     session,
                     normalized_mode,
                     show_usage=show_usage,
+                    usage_totals=(
+                        in_memory_usage_totals.snapshot()
+                        if in_memory_usage_totals is not None
+                        else None
+                    ),
                 )
 
             messages: list[dict[str, Any]] = [
@@ -627,6 +707,11 @@ class CodeAgent:
                         session,
                         normalized_mode,
                         show_usage=show_usage,
+                        usage_totals=(
+                            in_memory_usage_totals.snapshot()
+                            if in_memory_usage_totals is not None
+                            else None
+                        ),
                     )
                 raise AgentError("Model returned neither text nor tool calls.")
 
@@ -654,6 +739,7 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
         show_usage: bool,
+        usage_totals: _RunUsageTotals | None,
     ) -> str:
         """Execute one parsed read-only tool, then summarize without tool schemas."""
         tool_name = parsed_request.tool_name
@@ -770,6 +856,11 @@ class CodeAgent:
             session,
             mode,
             show_usage=show_usage,
+            usage_totals=(
+                usage_totals.snapshot()
+                if usage_totals is not None
+                else None
+            ),
         )
 
     def _finalize_git_commit_offer(
@@ -1818,22 +1909,24 @@ def _tool_schema_names(
     return tuple(names)
 
 
-def _log_model_usage(
-    session: SessionLogger | None,
+def _track_model_usage(
+    model_client: ModelClient,
+    totals: _RunUsageTotals | None,
+) -> ModelClient:
+    if totals is None:
+        return model_client
+    return _UsageTrackingModelClient(model_client, totals)
+
+
+def _model_usage_for_call(
     response: ModelResponse,
     *,
     messages: Sequence[Mapping[str, Any]],
     tool_schemas: Sequence[Mapping[str, Any]],
-    step: int,
-    phase: str,
-    role: str,
-    task_profile: TaskProfile | str,
-    parallel_group_id: str | None = None,
+    phase: str | None = None,
+    role: str | None = None,
     embedded_tool_result: str | None = None,
-) -> None:
-    if session is None:
-        return
-
+) -> tuple[ModelUsage, dict[str, int]]:
     context_components = _context_component_estimates(
         messages,
         tool_schemas,
@@ -1856,6 +1949,33 @@ def _log_model_usage(
         phase=phase,
         role=role,
         exact=False,
+    )
+    return usage, context_components
+
+
+def _log_model_usage(
+    session: SessionLogger | None,
+    response: ModelResponse,
+    *,
+    messages: Sequence[Mapping[str, Any]],
+    tool_schemas: Sequence[Mapping[str, Any]],
+    step: int,
+    phase: str,
+    role: str,
+    task_profile: TaskProfile | str,
+    parallel_group_id: str | None = None,
+    embedded_tool_result: str | None = None,
+) -> None:
+    if session is None:
+        return
+
+    usage, context_components = _model_usage_for_call(
+        response,
+        messages=messages,
+        tool_schemas=tool_schemas,
+        phase=phase,
+        role=role,
+        embedded_tool_result=embedded_tool_result,
     )
     _log_session(
         session,
@@ -2048,12 +2168,15 @@ def _append_session_note(
     mode: str,
     *,
     show_usage: bool = False,
+    usage_totals: Mapping[str, Any] | None = None,
 ) -> str:
     if show_usage:
         if session is not None:
             text = f"{text}\n\n{format_model_usage_totals(session.usage_totals)}"
+        elif usage_totals is not None:
+            text = f"{text}\n\n{format_model_usage_totals(usage_totals)}"
         else:
-            text = f"{text}\n\nModel usage: unavailable in plan mode."
+            text = f"{text}\n\nModel usage: no model calls recorded."
     if session is not None:
         note = session.relative_path
     elif mode == "plan":
@@ -2569,7 +2692,10 @@ def _finalize_validation_summary(
     reviewer_advisory: bool = False,
 ) -> str:
     final_text = text.rstrip()
-    if not evidence.validation_commands_run:
+    if (
+        not evidence.validation_commands_run
+        and not evidence.command_executions
+    ):
         final_text = re.sub(
             r"(?i)run detected validation commands\.?",
             "No detected validation commands were run.",
@@ -2667,10 +2793,12 @@ def _apply_authoritative_command_summary(
         for record in evidence.command_executions
         if record.source == "run_validation"
     ]
-    replaced_sections = {"commands run"}
-    if validation_records:
-        replaced_sections.add("validation")
-    retained_text = _remove_summary_sections(text, replaced_sections)
+    retained_text = _remove_false_validation_claims(
+        _remove_summary_sections(
+            text,
+            {"commands run", "validation"},
+        )
+    )
 
     blocks = [retained_text] if retained_text else []
     if validation_records:
@@ -2680,6 +2808,11 @@ def _apply_authoritative_command_summary(
             for record in validation_records
         )
         blocks.append("\n".join(validation_lines))
+    else:
+        blocks.append(
+            "Validation:\n"
+            "- Commands were run; no dedicated validation workflow was selected."
+        )
 
     command_lines = ["Commands run:"]
     command_lines.extend(
@@ -2690,6 +2823,19 @@ def _apply_authoritative_command_summary(
         command_lines.append("- Additional command execution records were truncated.")
     blocks.append("\n".join(command_lines))
     return "\n\n".join(blocks)
+
+
+def _remove_false_validation_claims(text: str) -> str:
+    conflict_markers = (
+        "no validation result provided",
+        "review-only phase",
+    )
+    retained = [
+        line
+        for line in text.splitlines()
+        if not any(marker in line.casefold() for marker in conflict_markers)
+    ]
+    return _clean_reviewer_block(retained)
 
 
 def _format_command_execution(
