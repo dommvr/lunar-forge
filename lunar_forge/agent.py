@@ -85,6 +85,29 @@ APPLICATION_OWNED_SUMMARY_SECTIONS = frozenset(
         "session log",
     }
 )
+REVIEWER_ADVISORY_HEADING_MARKERS = frozenset(
+    {
+        "concern",
+        "defect",
+        "finding",
+        "issue",
+        "maintainability",
+        "problem",
+        "risk",
+        "warning",
+    }
+)
+_NO_REVIEWER_CONCERN_PATTERN = re.compile(
+    r"(?i)^(?:"
+    r"none|n/?a|nothing to report|looks good|"
+    r"no (?:concerns?|defects?|findings?|issues?|problems?|risks?|warnings?)"
+    r"(?: (?:detected|found|identified|observed|to report))?|"
+    r"all (?:checks? )?passed|"
+    r"success(?:ful|fully)?\b.*|"
+    r"(?:read_json|read_yaml|read_many_files|list_symbols|ci_summary)\b.*"
+    r"\b(?:ok|passed|succeeded|successful|expected)\b.*"
+    r")\.?$"
+)
 
 
 class AgentError(RuntimeError):
@@ -1912,8 +1935,6 @@ def _finalize_validation_summary(
             final_text,
         )
     final_text = _apply_authoritative_command_summary(final_text, evidence)
-    if not browser_intent.detected and not evidence.browser_validations:
-        return final_text
 
     if reviewer_advisory:
         browser_passed = any(
@@ -1926,12 +1947,22 @@ def _finalize_validation_summary(
         summary_text, advisory_text = _partition_reviewer_output(final_text)
         final_blocks: list[str] = []
         if advisory_text:
-            final_blocks.append(
-                f"Reviewer findings (advisory):\n{advisory_text}"
-            )
+            if _has_genuine_reviewer_findings(advisory_text):
+                final_blocks.append(
+                    f"Reviewer findings (advisory):\n{advisory_text}"
+                )
+            else:
+                ordinary_text = _without_reviewer_advisory_headings(
+                    advisory_text
+                )
+                if ordinary_text:
+                    final_blocks.append(ordinary_text)
         if summary_text:
             final_blocks.append(summary_text)
         final_text = "\n\n".join(final_blocks)
+
+    if not browser_intent.detected and not evidence.browser_validations:
+        return final_text
 
     lines = ["Browser validation:"]
     if final_text:
@@ -2142,7 +2173,7 @@ def _partition_reviewer_output(text: str) -> tuple[str, str]:
     """Separate normal final-summary sections from reviewer findings."""
     summary_lines: list[str] = []
     advisory_lines: list[str] = []
-    destination = advisory_lines
+    destination = summary_lines
     suppress_section = False
 
     for line in text.splitlines():
@@ -2150,8 +2181,17 @@ def _partition_reviewer_output(text: str) -> tuple[str, str]:
         if heading in FINAL_SUMMARY_SECTION_NAMES:
             destination = summary_lines
             suppress_section = heading in APPLICATION_OWNED_SUMMARY_SECTIONS
-        elif heading is not None:
+        elif (
+            heading is not None
+            and (
+                _is_reviewer_advisory_heading(heading)
+                or destination is advisory_lines
+            )
+        ):
             destination = advisory_lines
+            suppress_section = False
+        elif heading is not None:
+            destination = summary_lines
             suppress_section = False
 
         if not suppress_section:
@@ -2161,6 +2201,45 @@ def _partition_reviewer_output(text: str) -> tuple[str, str]:
         _clean_reviewer_block(summary_lines),
         _clean_reviewer_block(advisory_lines),
     )
+
+
+def _is_reviewer_advisory_heading(heading: str) -> bool:
+    words = {
+        word.removesuffix("s")
+        for word in re.findall(r"[a-z]+", heading.casefold())
+    }
+    return bool(words & REVIEWER_ADVISORY_HEADING_MARKERS)
+
+
+def _has_genuine_reviewer_findings(text: str) -> bool:
+    for line in text.splitlines():
+        statement = line.strip().lstrip("-* ").strip()
+        if not statement:
+            continue
+        heading = _reviewer_section_heading(line)
+        if heading is not None and _is_reviewer_advisory_heading(heading):
+            continue
+        if _NO_REVIEWER_CONCERN_PATTERN.fullmatch(statement):
+            if (
+                not statement.casefold().startswith(
+                    ("no ", "none", "n/a", "nothing")
+                )
+                and _is_reviewer_advisory_heading(statement)
+            ):
+                return True
+            continue
+        return True
+    return False
+
+
+def _without_reviewer_advisory_headings(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading is not None and _is_reviewer_advisory_heading(heading):
+            continue
+        lines.append(line)
+    return _clean_reviewer_block(lines)
 
 
 def _reviewer_section_heading(line: str) -> str | None:

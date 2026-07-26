@@ -1236,6 +1236,130 @@ def test_browser_success_is_authoritative_over_reviewer_text(
     assert "errors were not inspected" in raw_session
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "relative_path", "content"),
+    (
+        (
+            "read_json",
+            "examples/projects/browser-demo/package.json",
+            '{"name": "browser-demo"}\n',
+        ),
+        (
+            "list_symbols",
+            "examples/projects/browser-demo/src/App.jsx",
+            "export default function App() { return null; }\n",
+        ),
+    ),
+)
+def test_structured_read_only_paths_do_not_add_browser_or_advisory_noise(
+    tmp_path,
+    tool_name,
+    relative_path,
+    content,
+):
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+
+    class SuccessfulReadOnlyModel:
+        def __init__(self):
+            self.reviewer_calls = 0
+
+        def complete(self, messages, tools=None):
+            system_prompt = str(messages[0]["content"])
+            role_line = next(
+                line
+                for line in system_prompt.splitlines()
+                if line.startswith("Active subagent role:")
+            )
+            role = role_line.partition(":")[2].strip()
+            if role != "reviewer":
+                return ModelResponse(text=f"{role.title()} completed.")
+
+            self.reviewer_calls += 1
+            if self.reviewer_calls == 1:
+                schema_names = {
+                    schema["function"]["name"] for schema in (tools or [])
+                }
+                assert tool_name in schema_names
+                return ModelResponse(
+                    text="",
+                    tool_calls=(
+                        ToolCall(
+                            id="inspect",
+                            name=tool_name,
+                            arguments={"path": relative_path},
+                        ),
+                    ),
+                )
+            return ModelResponse(
+                text=(
+                    "Findings:\n"
+                    f"- Successfully inspected {relative_path} with {tool_name}."
+                    "\n\n"
+                    "Changed files:\n"
+                    "- None.\n\n"
+                    "Validation:\n"
+                    "- Not needed for this read-only inspection.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None."
+                )
+            )
+
+    model = SuccessfulReadOnlyModel()
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+    ).run(
+        f"Use {tool_name} to inspect {relative_path}.",
+        tmp_path,
+    )
+
+    assert model.reviewer_calls == 2
+    assert f"Successfully inspected {relative_path} with {tool_name}." in output
+    assert "Reviewer findings (advisory):" not in output
+    assert "Browser validation:" not in output
+    assert "Browser validation: Not run" not in output
+
+
+def test_genuine_non_browser_reviewer_findings_keep_advisory_header(tmp_path):
+    (tmp_path / "app.py").write_text("def run():\n    return True\n", encoding="utf-8")
+
+    class ReviewerFindingModel:
+        def complete(self, messages, tools=None):
+            system_prompt = str(messages[0]["content"])
+            role_line = next(
+                line
+                for line in system_prompt.splitlines()
+                if line.startswith("Active subagent role:")
+            )
+            role = role_line.partition(":")[2].strip()
+            if role == "reviewer":
+                return ModelResponse(
+                    text=(
+                        "Warnings:\n"
+                        "- app.py has a maintainability issue: run lacks a docstring."
+                        "\n\n"
+                        "Changed files:\n"
+                        "- None.\n\n"
+                        "Validation:\n"
+                        "- Not run."
+                    )
+                )
+            return ModelResponse(text=f"{role.title()} completed.")
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=ReviewerFindingModel(),
+    ).run("Review app.py without changing it.", tmp_path)
+
+    assert "Reviewer findings (advisory):" in output
+    assert "app.py has a maintainability issue" in output
+    assert "Browser validation:" not in output
+
+
 def test_browser_intent_plan_mode_does_not_start_server(tmp_path):
     (tmp_path / "package.json").write_text(
         json.dumps({"devDependencies": {"vite": "latest"}, "scripts": {"dev": "vite"}}),

@@ -24,24 +24,94 @@ _START_SERVER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _FULL_PAGE_PATTERN = re.compile(r"\bfull[- ]page\b", re.IGNORECASE)
-_INTERACTIVE_BROWSER_PATTERN = re.compile(
-    r"\b(?:accessibility|click|form)\b|\binspect\s+(?:the\s+)?page\b",
+_BROWSER_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:check|inspect|launch|open|render|review|run|test|use|validate|view)\b"
+    r"[^\r\n]{0,120}\bbrowser\b|"
+    r"\bbrowser\b[^\r\n]{0,60}\b"
+    r"(?:automation|check|inspection|rendering|test|validation)\b|"
+    r"\bin\s+(?:a|the)\s+browser\b",
     re.IGNORECASE,
 )
+_UI_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:check|inspect|open|render|review|test|validate|view)\b"
+    r"[^\r\n]{0,80}\bui\b|"
+    r"\bui\b[^\r\n]{0,40}\b"
+    r"(?:check|inspection|rendering|review|test|validation)\b",
+    re.IGNORECASE,
+)
+_VISUAL_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:check|inspect|perform|render|review|test|validate)\b"
+    r"[^\r\n]{0,80}\bvisual\b|"
+    r"\bvisual\b[^\r\n]{0,40}\b"
+    r"(?:check|inspection|rendering|review|test|validation)\b",
+    re.IGNORECASE,
+)
+_ACCESSIBILITY_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:capture|check|inspect|review|test|validate)\b"
+    r"[^\r\n]{0,80}\baccessibility\b|"
+    r"\baccessibility\b[^\r\n]{0,40}\b"
+    r"(?:check|inspection|review|snapshot|test|validation)\b",
+    re.IGNORECASE,
+)
+_CLICK_BEHAVIOR_PATTERN = re.compile(
+    r"\bclick(?:ing)?\s+(?:a|an|on|the)\b|"
+    r"\bclick\b[^\r\n]{0,80}\b"
+    r"(?:button|control|element|link|menu|tab)\b",
+    re.IGNORECASE,
+)
+_FORM_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:fill|inspect|interact\s+with|submit|test|validate)\b"
+    r"[^\r\n]{0,80}\bforms?\b|"
+    r"\bforms?\b[^\r\n]{0,40}\b"
+    r"(?:interaction|submission|test|validation)\b",
+    re.IGNORECASE,
+)
+_LAYOUT_BEHAVIOR_PATTERN = re.compile(
+    r"\b(?:check|inspect|render|review|test|validate)\b"
+    r"[^\r\n]{0,80}\blayout\b|"
+    r"\blayout\b[^\r\n]{0,40}\b"
+    r"(?:check|inspection|rendering|review|test|validation)\b",
+    re.IGNORECASE,
+)
+_INTERACTIVE_BROWSER_PATTERN = re.compile(
+    r"\b(?:capture|check|fill|inspect|interact\s+with|review|submit|test|"
+    r"validate)\b[^\r\n]{0,80}\b(?:accessibility|forms?)\b|"
+    r"\bclick(?:ing)?\s+(?:a|an|on|the)\b|"
+    r"\binspect\s+(?:the\s+)?page\b",
+    re.IGNORECASE,
+)
+_FILE_PATH_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"(?:[A-Za-z]:)?(?:[\\/]|\.{1,2}[\\/])?"
+    r"(?:[A-Za-z0-9_@.+-]+[\\/])+"
+    r"[A-Za-z0-9_@.+-]+\.[A-Za-z][A-Za-z0-9]{0,15}"
+    r"|[A-Za-z0-9_@+-]+\.[A-Za-z][A-Za-z0-9]{0,15}"
+    r")",
+)
 _BROWSER_INTENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("browser", re.compile(r"\bbrowser\b", re.IGNORECASE)),
-    ("UI", re.compile(r"\bui\b", re.IGNORECASE)),
+    ("browser", _BROWSER_BEHAVIOR_PATTERN),
+    ("UI", _UI_BEHAVIOR_PATTERN),
     ("screenshot", re.compile(r"\bscreenshots?\b", re.IGNORECASE)),
     ("full-page screenshot", re.compile(r"\bfull[- ]page\s+screenshots?\b", re.IGNORECASE)),
-    ("visual", re.compile(r"\bvisual\b", re.IGNORECASE)),
+    ("visual", _VISUAL_BEHAVIOR_PATTERN),
     ("page rendering", re.compile(r"\bpage\s+rendering\b", re.IGNORECASE)),
     ("console errors", re.compile(r"\bconsole\s+errors?\b", re.IGNORECASE)),
-    ("accessibility", re.compile(r"\baccessibility\b", re.IGNORECASE)),
+    ("accessibility", _ACCESSIBILITY_BEHAVIOR_PATTERN),
     ("inspect page", re.compile(r"\binspect\s+(?:the\s+)?page\b", re.IGNORECASE)),
-    ("click", re.compile(r"\bclick\b", re.IGNORECASE)),
-    ("form", re.compile(r"\bforms?\b", re.IGNORECASE)),
-    ("layout", re.compile(r"\blayout\b", re.IGNORECASE)),
+    ("click", _CLICK_BEHAVIOR_PATTERN),
+    ("form", _FORM_BEHAVIOR_PATTERN),
+    ("layout", _LAYOUT_BEHAVIOR_PATTERN),
     ("localhost URL", re.compile(r"\blocalhost\b|https?://127\.0\.0\.1", re.IGNORECASE)),
+    (
+        "local frontend check",
+        re.compile(
+            r"\b(?:check|inspect|review|test|validate)\s+(?:the\s+)?"
+            r"(?:local\s+)?front[- ]?end\b|"
+            r"\blocal\s+front[- ]?end\s+"
+            r"(?:check|inspection|review|test|validation)\b",
+            re.IGNORECASE,
+        ),
+    ),
     ("start dev server", _START_SERVER_PATTERN),
 )
 
@@ -65,8 +135,11 @@ def detect_browser_intent(
 ) -> BrowserIntent:
     """Detect UI/browser work and attach bounded project execution hints."""
     text = request if isinstance(request, str) else str(request)
+    intent_text = _FILE_PATH_REFERENCE_PATTERN.sub(" ", text)
     signals = tuple(
-        label for label, pattern in _BROWSER_INTENT_PATTERNS if pattern.search(text)
+        label
+        for label, pattern in _BROWSER_INTENT_PATTERNS
+        if pattern.search(intent_text)
     )
     detected = bool(signals)
     explicit_url_match = _LOCAL_URL_PATTERN.search(text)
@@ -87,12 +160,15 @@ def detect_browser_intent(
     return BrowserIntent(
         detected=detected,
         signals=signals,
-        start_server=detected and _START_SERVER_PATTERN.search(text) is not None,
-        full_page=detected and _FULL_PAGE_PATTERN.search(text) is not None,
+        start_server=(
+            detected and _START_SERVER_PATTERN.search(intent_text) is not None
+        ),
+        full_page=detected and _FULL_PAGE_PATTERN.search(intent_text) is not None,
         url=url,
         dev_command=dev_command,
         prefer_playwright_mcp=(
-            detected and _INTERACTIVE_BROWSER_PATTERN.search(text) is not None
+            detected
+            and _INTERACTIVE_BROWSER_PATTERN.search(intent_text) is not None
         ),
     )
 

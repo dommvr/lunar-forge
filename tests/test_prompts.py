@@ -156,6 +156,44 @@ def test_browser_intent_detects_natural_request_and_vite_hints():
 @pytest.mark.parametrize(
     "user_request",
     (
+        (
+            "Use read_json to inspect "
+            "examples/projects/browser-demo/package.json."
+        ),
+        (
+            "Use list_symbols on "
+            "examples/projects/browser-demo/src/App.jsx."
+        ),
+        "Use list_symbols on App.jsx.",
+    ),
+)
+def test_file_paths_do_not_trigger_browser_intent(user_request):
+    intent = detect_browser_intent(user_request, PROJECT_INFO)
+
+    assert intent.detected is False
+    assert intent.signals == ()
+    assert intent.url is None
+    assert intent.dev_command is None
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    (
+        (
+            "Open examples/projects/browser-demo/src/App.jsx in a browser "
+            "and capture a screenshot."
+        ),
+        "Validate the local frontend and report console errors.",
+        "Run browser validation for examples/projects/browser-demo.",
+    ),
+)
+def test_explicit_browser_behavior_with_paths_remains_detected(user_request):
+    assert detect_browser_intent(user_request, PROJECT_INFO).detected is True
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    (
         "Open this in a browser",
         "Inspect the UI",
         "Capture a screenshot",
