@@ -77,6 +77,24 @@ def test_system_prompt_scales_project_intelligence_to_the_task():
     assert "Tool calls are not a checklist" in prompt
 
 
+def test_system_and_subagent_prompts_name_active_task_profiles():
+    base_prompt = build_system_prompt(
+        PROJECT_INFO,
+        "No extra instructions.",
+        "default",
+        task_profile="review_only",
+    )
+    subagent_prompt = build_subagent_system_prompt(
+        base_prompt,
+        REVIEWER_ROLE,
+        task_profile="review_only",
+    )
+
+    assert "Active task profile: review_only" in base_prompt
+    assert "Only the profile-relevant provider-safe tool schemas" in base_prompt
+    assert "Active model-call task profile: review_only" in subagent_prompt
+
+
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():
     prompt = build_system_prompt(PROJECT_INFO, "No extra instructions.", "default")
 

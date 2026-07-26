@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from lunar_forge.permissions import PermissionManager
-from lunar_forge.tools.registry import ToolRegistry
+from lunar_forge.tools.registry import TaskProfile, ToolRegistry
 
 
 BUILTIN_SUBAGENT_TOOLS = frozenset(
@@ -139,6 +139,10 @@ class RestrictedToolRegistry:
         *,
         read_only: bool = False,
         allow_execute: bool = True,
+        profile: TaskProfile | str | None = None,
+        requested_tools: Iterable[str] = (),
+        browser_intent: bool = False,
+        commit_requested: bool = False,
     ) -> list[dict[str, Any]]:
         allowed_names = set(self.names())
         return [
@@ -146,6 +150,10 @@ class RestrictedToolRegistry:
             for schema in self._registry.schemas(
                 read_only=read_only,
                 allow_execute=allow_execute,
+                profile=profile,
+                requested_tools=requested_tools,
+                browser_intent=browser_intent,
+                commit_requested=commit_requested,
             )
             if self._registry.internal_name_for(_schema_tool_name(schema) or "")
             in allowed_names

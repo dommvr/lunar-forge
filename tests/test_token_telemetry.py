@@ -147,6 +147,7 @@ def test_agent_logs_and_aggregates_exact_usage_without_secrets(
     assert usage["output_tokens"] == 25
     assert usage["total_tokens"] == 225
     assert usage["provider"] == "openai"
+    assert usage["task_profile"] == "review_only"
     assert usage["phase"] == "agent"
     assert usage["role"] == "agent"
     assert usage["exact"] is True

@@ -5,11 +5,20 @@ import pytest
 
 from lunar_forge.permissions import PermissionLevel
 from lunar_forge.tools.registry import (
+    BROWSER_TOOL_NAMES,
+    COMMAND_TOOL_NAMES,
+    GIT_INSPECTION_TOOLS,
     PROVIDER_TOOL_NAME_PATTERN,
+    READ_NAVIGATION_TOOLS,
+    PROJECT_INSPECTION_TOOLS,
+    TaskProfile,
     Tool,
     ToolRegistry,
+    WRITE_TOOL_NAMES,
     create_tool_registry,
     provider_safe_tool_name,
+    select_task_profile,
+    tool_names_for_profile,
 )
 from lunar_forge.tools.structured_readers import MAX_REQUEST_PATH_CHARACTERS
 
@@ -194,6 +203,248 @@ def test_plan_registry_exposes_context_suite_without_write_or_command_tools(
         "run_validation",
         "git_commit",
     }.isdisjoint(registry.names())
+
+
+def _profile_schema_names(registry, profile, **kwargs):
+    return {
+        registry.internal_name_for(schema["function"]["name"])
+        for schema in registry.schemas(profile=profile, **kwargs)
+    }
+
+
+def test_task_profile_selection_is_deterministic():
+    cases = (
+        (
+            "Run read_json on package.json and summarize scripts.",
+            {},
+            TaskProfile.EXPLICIT_READONLY,
+            ("read_json",),
+        ),
+        (
+            "Plan how to update the parser.",
+            {"mode": "plan"},
+            TaskProfile.PLAN_ONLY,
+            (),
+        ),
+        (
+            "Review the current diff without changing files.",
+            {},
+            TaskProfile.REVIEW_ONLY,
+            (),
+        ),
+        (
+            "Implement parser support.",
+            {},
+            TaskProfile.EDIT_TASK,
+            (),
+        ),
+        (
+            "Update the UI and capture a screenshot.",
+            {"browser_intent": True},
+            TaskProfile.BROWSER_TASK,
+            (),
+        ),
+        (
+            "Update docs and commit them.",
+            {"commit_requested": True},
+            TaskProfile.COMMIT_TASK,
+            (),
+        ),
+        (
+            "Create a new starter.",
+            {"new_project": True},
+            TaskProfile.NEW_PROJECT,
+            (),
+        ),
+    )
+
+    for request, kwargs, expected_profile, expected_tools in cases:
+        selection = select_task_profile(request, **kwargs)
+        assert selection.profile is expected_profile
+        assert selection.requested_tools == expected_tools
+
+
+def test_explicit_readonly_exposes_requested_and_minimal_support_only(tmp_path):
+    registry = create_tool_registry(tmp_path, mode="default")
+
+    assert _profile_schema_names(
+        registry,
+        TaskProfile.EXPLICIT_READONLY,
+        requested_tools=("read_json",),
+    ) == {"read_json"}
+    assert _profile_schema_names(
+        registry,
+        TaskProfile.EXPLICIT_READONLY,
+        requested_tools=("list_symbols",),
+    ) == {"list_symbols", "read_file_with_line_numbers"}
+    assert _profile_schema_names(
+        registry,
+        TaskProfile.EXPLICIT_READONLY,
+        requested_tools=("git_diff",),
+    ) == {"git_diff", "git_status"}
+
+
+def test_plan_review_edit_and_new_project_profiles_have_bounded_sets(tmp_path):
+    registry = create_tool_registry(tmp_path, mode="default")
+    available = set(registry.names())
+    read_only = (
+        READ_NAVIGATION_TOOLS
+        | PROJECT_INSPECTION_TOOLS
+        | GIT_INSPECTION_TOOLS
+    ) & available
+
+    plan_tools = _profile_schema_names(registry, TaskProfile.PLAN_ONLY)
+    review_tools = _profile_schema_names(registry, TaskProfile.REVIEW_ONLY)
+    edit_tools = _profile_schema_names(registry, TaskProfile.EDIT_TASK)
+    new_project_tools = _profile_schema_names(
+        registry,
+        TaskProfile.NEW_PROJECT,
+    )
+
+    assert plan_tools == read_only
+    assert review_tools == read_only
+    assert edit_tools == (
+        read_only | WRITE_TOOL_NAMES | COMMAND_TOOL_NAMES
+    )
+    assert new_project_tools == {
+        "list_dir",
+        "read_file",
+        "read_json",
+        "read_yaml",
+        "dependency_summary",
+        "create_dir",
+        "write_file",
+        "run_command",
+        "run_validation",
+    }
+    assert BROWSER_TOOL_NAMES.isdisjoint(edit_tools)
+
+
+def test_browser_commit_and_no_command_gates_are_explicit(tmp_path):
+    registry = create_tool_registry(tmp_path, mode="default")
+    registry.register(
+        Tool(
+            name="git_commit",
+            description="Synthetic commit execution helper.",
+            parameters={"type": "object"},
+            handler=lambda **arguments: {"ok": True},
+            permission=PermissionLevel.EXECUTE,
+        )
+    )
+
+    browser_hidden = _profile_schema_names(
+        registry,
+        TaskProfile.BROWSER_TASK,
+        browser_intent=False,
+    )
+    browser_visible = _profile_schema_names(
+        registry,
+        TaskProfile.BROWSER_TASK,
+        browser_intent=True,
+    )
+    commit_hidden = _profile_schema_names(
+        registry,
+        TaskProfile.COMMIT_TASK,
+        commit_requested=False,
+    )
+    commit_visible = _profile_schema_names(
+        registry,
+        TaskProfile.COMMIT_TASK,
+        commit_requested=True,
+    )
+    no_command = _profile_schema_names(
+        registry,
+        TaskProfile.COMMIT_TASK,
+        commit_requested=True,
+        allow_execute=False,
+    )
+
+    assert BROWSER_TOOL_NAMES.isdisjoint(browser_hidden)
+    assert BROWSER_TOOL_NAMES <= browser_visible
+    assert "git_commit" not in commit_hidden
+    assert "git_commit" in commit_visible
+    assert {
+        "run_command",
+        "run_validation",
+        "git_commit",
+    }.isdisjoint(no_command)
+
+
+def test_plan_profile_omits_extensions_mutation_browser_and_commit_tools():
+    registry = ToolRegistry(
+        (
+            _tool("read_file"),
+            _tool("example.echo"),
+            _tool("mcp.playwright.browser_navigate"),
+            Tool(
+                name="write_file",
+                description="Write.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.WRITE,
+            ),
+            Tool(
+                name="run_managed_browser_validation",
+                description="Start a server.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.EXECUTE,
+            ),
+            Tool(
+                name="git_commit",
+                description="Commit.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    names = _profile_schema_names(
+        registry,
+        TaskProfile.PLAN_ONLY,
+        read_only=True,
+        requested_tools=(
+            "example.echo",
+            "mcp.playwright.browser_navigate",
+            "git_commit",
+        ),
+        browser_intent=True,
+        commit_requested=True,
+    )
+
+    assert names == {"read_file"}
+
+
+def test_relevant_extensions_keep_provider_safe_mapping():
+    registry = ToolRegistry(
+        (
+            _tool("read_file"),
+            _tool("example.echo"),
+            _tool("mcp.playwright.browser_navigate"),
+        )
+    )
+
+    plugin_schemas = registry.schemas(
+        profile=TaskProfile.EDIT_TASK,
+        requested_tools=registry.relevant_tool_names("Use the example plugin"),
+    )
+    browser_schemas = registry.schemas(
+        profile=TaskProfile.BROWSER_TASK,
+        browser_intent=True,
+    )
+
+    assert {
+        schema["function"]["name"] for schema in plugin_schemas
+    } == {"read_file", "example_echo"}
+    assert {
+        schema["function"]["name"] for schema in browser_schemas
+    } == {"read_file", "mcp_playwright_browser_navigate"}
+    assert tool_names_for_profile(
+        TaskProfile.EXPLICIT_READONLY,
+        requested_tools=("read_json",),
+        available_tools=("read_json", "write_file"),
+    ) == ("read_json",)
 
 
 def test_provider_sdk_imports_are_isolated_to_model_clients():

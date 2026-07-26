@@ -305,6 +305,28 @@ a short plan before the first edit, permission-gated changes, and validation
 when practical. If validation fails, the agent is instructed to attempt at most
 one focused fix.
 
+### Task-profile tool filtering
+
+Every model call receives a deterministic profile-specific tool subset instead
+of the full registry. Direct requests such as `Run read_json on package.json`
+use `explicit_readonly`; plan mode uses `plan_only`; audits and diff inspection
+use `review_only`; normal changes use `edit_task`; explicit browser work uses
+`browser_task`; opted-in commit flows use `commit_task`; and scaffolding uses
+`new_project`. Subagent role allowlists are applied after the task profile, so a
+role can only narrow the selected set.
+
+Plan mode never exposes mutation, command, managed-browser-server, plugin, or
+commit schemas. No-command mode removes execution and commit schemas. Browser
+tools and Playwright MCP tools require detected browser intent, while other
+enabled MCP/plugin tools require a relevant explicit request. Permission checks
+still run when a visible tool is called; schema visibility does not authorize
+execution.
+
+Non-plan session logs record a `tool_schema_selection` event before each model
+call with the selected profile, exposed count, and a bounded provider-safe name
+list. The matching `model_usage` event records the same profile and exact schema
+count so context-size changes can be compared without logging raw schemas.
+
 ### Bounded file inspection and precise edits
 
 The model-facing file tools include three line-oriented operations in addition
@@ -874,13 +896,13 @@ path checks prevent restoring outside the project.
 
 Non-plan agent runs write redacted JSONL events to
 `.agent/sessions/<timestamp>.jsonl`. Events include prompts, assistant messages,
-model usage, tool calls and results, denials, and errors. Provider-reported token
-counts are recorded as exact when available. Otherwise, LunarForge records a
-clearly labeled estimate based on character counts. Usage events include message
-and exposed-tool counts plus numeric context-size estimates; they do not include
-raw environment values. API-key-like values and environment values are redacted,
-event sizes are bounded, and the `sessions` command lists only filenames and
-sizes; it does not print log contents.
+model usage, tool-schema selections, tool calls and results, denials, and errors.
+Provider-reported token counts are recorded as exact when available. Otherwise,
+LunarForge records a clearly labeled estimate based on character counts. Usage
+events include message and exposed-tool counts plus numeric context-size
+estimates; they do not include raw environment values. API-key-like values and
+environment values are redacted, event sizes are bounded, and the `sessions`
+command lists only filenames and sizes; it does not print log contents.
 
 Resume validates that the session is project-local, loads a bounded redacted
 history, and starts a new session that references the old one. Historical tool

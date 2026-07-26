@@ -57,8 +57,14 @@ from lunar_forge.subagents import (
     WorkflowKind,
     requires_security_analysis,
     requires_security_review,
+    task_profile_for_role,
 )
-from lunar_forge.tools.registry import ToolRegistry, create_tool_registry
+from lunar_forge.tools.registry import (
+    TaskProfile,
+    ToolRegistry,
+    create_tool_registry,
+    select_task_profile,
+)
 
 
 MAX_STEPS = 30
@@ -71,6 +77,7 @@ MAX_RECORDED_COMMAND_CHARACTERS = 500
 MAX_FINAL_CHANGED_FILES = 100
 MAX_FINAL_CHANGED_PATH_CHARACTERS = 500
 TOKEN_ESTIMATE_CHARACTERS_PER_TOKEN = 4
+MAX_LOGGED_TOOL_SCHEMA_NAMES = 100
 FINAL_SUMMARY_SECTION_NAMES = frozenset(
     {
         "changed files",
@@ -340,6 +347,18 @@ class CodeAgent:
                     dev_command=browser_intent.dev_command,
                     url=browser_intent.url,
                 )
+            task_selection = select_task_profile(
+                request,
+                mode=normalized_mode,
+                browser_intent=browser_intent.detected,
+                commit_requested=offer_commit,
+            )
+            requested_tools = tuple(
+                sorted(
+                    set(task_selection.requested_tools)
+                    | set(tools.relevant_tool_names(request))
+                )
+            )
             model_client = self.model_client or self._create_model_client()
             system_prompt = build_system_prompt(
                 project_info,
@@ -348,6 +367,7 @@ class CodeAgent:
                 runtime_mode=self.config.runtime.mode,
                 allow_network=self.config.runtime.allow_network,
                 browser_intent=browser_intent,
+                task_profile=task_selection.profile.value,
             )
             historical_messages = _resume_history_messages(resume_messages)
             subagents_enabled = (
@@ -423,11 +443,23 @@ class CodeAgent:
             tool_schemas = tools.schemas(
                 read_only=normalized_mode == "plan",
                 allow_execute=normalized_mode not in {"plan", "no-command"},
+                profile=task_selection.profile,
+                requested_tools=requested_tools,
+                browser_intent=browser_intent.detected,
+                commit_requested=offer_commit,
             )
             validation_evidence = ValidationEvidence()
             changed_files: list[str] = []
 
             for step in range(self.max_steps):
+                _log_tool_schema_selection(
+                    session,
+                    tool_schemas,
+                    step=step,
+                    task_profile=task_selection.profile,
+                    phase="agent",
+                    role="agent",
+                )
                 response = model_client.complete(messages, tool_schemas)
                 _log_model_usage(
                     session,
@@ -437,6 +469,7 @@ class CodeAgent:
                     step=step,
                     phase="agent",
                     role="agent",
+                    task_profile=task_selection.profile,
                 )
                 _log_session(
                     session,
@@ -1088,6 +1121,23 @@ class CodeAgent:
         session: SessionLogger | None,
         mode: str,
     ) -> SubagentPhaseResult:
+        browser_intent_detected = detect_browser_intent(request).detected
+        base_selection = select_task_profile(
+            request,
+            mode=mode,
+            browser_intent=browser_intent_detected,
+        )
+        task_profile = task_profile_for_role(
+            role,
+            base_selection.profile,
+            browser_intent=browser_intent_detected,
+        )
+        requested_tools = tuple(
+            sorted(
+                set(base_selection.requested_tools)
+                | set(registry.relevant_tool_names(request))
+            )
+        )
         _log_session(
             session,
             "subagent_started",
@@ -1098,7 +1148,11 @@ class CodeAgent:
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
-                "content": build_subagent_system_prompt(system_prompt, role),
+                "content": build_subagent_system_prompt(
+                    system_prompt,
+                    role,
+                    task_profile=task_profile.value,
+                ),
             }
         ]
         _append_historical_messages(messages, historical_messages)
@@ -1124,6 +1178,9 @@ class CodeAgent:
                 session=session,
                 mode=mode,
                 max_steps=self.max_steps,
+                task_profile=task_profile,
+                requested_tools=requested_tools,
+                browser_intent=browser_intent_detected,
             )
         except Exception as exc:
             _log_session(
@@ -1165,14 +1222,29 @@ def _run_subagent_model_loop(
     session: SessionLogger | None,
     mode: str,
     max_steps: int,
+    task_profile: TaskProfile,
+    requested_tools: Sequence[str],
+    browser_intent: bool,
 ) -> SubagentPhaseResult:
     tool_schemas = tools.schemas(
         read_only=mode == "plan",
         allow_execute=mode not in {"plan", "no-command"},
+        profile=task_profile,
+        requested_tools=requested_tools,
+        browser_intent=browser_intent,
     )
     changed_files: list[str] = []
     validation_evidence = ValidationEvidence()
     for step in range(max_steps):
+        _log_tool_schema_selection(
+            session,
+            tool_schemas,
+            step=step,
+            task_profile=task_profile,
+            phase=phase,
+            role=role.name,
+            parallel_group_id=parallel_group_id,
+        )
         response = model_client.complete(messages, tool_schemas)
         _log_model_usage(
             session,
@@ -1183,6 +1255,7 @@ def _run_subagent_model_loop(
             phase=phase,
             role=role.name,
             parallel_group_id=parallel_group_id,
+            task_profile=task_profile,
         )
         _log_session(
             session,
@@ -1382,6 +1455,52 @@ def _log_session(
         return
 
 
+def _log_tool_schema_selection(
+    session: SessionLogger | None,
+    tool_schemas: Sequence[Mapping[str, Any]],
+    *,
+    step: int,
+    task_profile: TaskProfile | str,
+    phase: str,
+    role: str,
+    parallel_group_id: str | None = None,
+) -> None:
+    names = _tool_schema_names(tool_schemas)
+    profile_name = (
+        task_profile.value
+        if isinstance(task_profile, TaskProfile)
+        else str(task_profile)
+    )
+    _log_session(
+        session,
+        "tool_schema_selection",
+        step=step,
+        task_profile=profile_name,
+        phase=phase,
+        role=role,
+        parallel_group_id=parallel_group_id,
+        exposed_tool_count=len(names),
+        exposed_tool_names=names[:MAX_LOGGED_TOOL_SCHEMA_NAMES],
+        exposed_tool_names_truncated=(
+            len(names) > MAX_LOGGED_TOOL_SCHEMA_NAMES
+        ),
+    )
+
+
+def _tool_schema_names(
+    tool_schemas: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    names: list[str] = []
+    for schema in tool_schemas:
+        function = schema.get("function")
+        if not isinstance(function, Mapping):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return tuple(names)
+
+
 def _log_model_usage(
     session: SessionLogger | None,
     response: ModelResponse,
@@ -1391,6 +1510,7 @@ def _log_model_usage(
     step: int,
     phase: str,
     role: str,
+    task_profile: TaskProfile | str,
     parallel_group_id: str | None = None,
 ) -> None:
     if session is None:
@@ -1422,6 +1542,11 @@ def _log_model_usage(
         session,
         "model_usage",
         step=step,
+        task_profile=(
+            task_profile.value
+            if isinstance(task_profile, TaskProfile)
+            else str(task_profile)
+        ),
         phase=phase or usage.phase,
         role=role or usage.role,
         parallel_group_id=parallel_group_id,

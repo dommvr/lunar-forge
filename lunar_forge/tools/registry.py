@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -83,6 +84,256 @@ _SENSITIVE_RESULT_KEYS = frozenset(
 _SESSION_FILE_MUTATION_TOOLS = frozenset(
     {"write_file", "edit_file", "replace_lines", "insert_lines"}
 )
+READ_NAVIGATION_TOOLS = frozenset(
+    {
+        "list_dir",
+        "read_file",
+        "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
+        "grep",
+        "glob",
+    }
+)
+PROJECT_INSPECTION_TOOLS = frozenset(
+    {
+        "detect_project",
+        "project_health",
+        "ci_summary",
+        "dependency_summary",
+    }
+)
+GIT_INSPECTION_TOOLS = frozenset(
+    {"git_status", "git_diff", "list_changed_files"}
+)
+WRITE_TOOL_NAMES = frozenset(
+    {"create_dir", "write_file", "edit_file", "replace_lines", "insert_lines"}
+)
+COMMAND_TOOL_NAMES = frozenset({"run_command", "run_validation"})
+BROWSER_TOOL_NAMES = frozenset(
+    {"run_browser_validation", "run_managed_browser_validation"}
+)
+COMMIT_EXECUTION_TOOL_NAMES = frozenset({"git_commit"})
+READ_ONLY_PROFILE_TOOLS = (
+    READ_NAVIGATION_TOOLS | PROJECT_INSPECTION_TOOLS | GIT_INSPECTION_TOOLS
+)
+BUILTIN_TASK_PROFILE_TOOLS = (
+    READ_ONLY_PROFILE_TOOLS
+    | WRITE_TOOL_NAMES
+    | COMMAND_TOOL_NAMES
+    | BROWSER_TOOL_NAMES
+    | COMMIT_EXECUTION_TOOL_NAMES
+)
+_EXPLICIT_READONLY_SUPPORT = {
+    "grep": frozenset({"read_file"}),
+    "glob": frozenset({"read_file"}),
+    "list_symbols": frozenset({"read_file_with_line_numbers"}),
+    "git_diff": frozenset({"git_status"}),
+    "list_changed_files": frozenset({"git_status"}),
+}
+_MUTATION_INTENT_PATTERN = re.compile(
+    r"(?i)\b(?:add|build|change|create|delete|edit|fix|implement|insert|"
+    r"refactor|remove|replace|scaffold|update|write)\b"
+)
+_NO_MUTATION_PATTERN = re.compile(
+    r"(?i)\b(?:do not|don't|dont|never)\s+"
+    r"(?:change|edit|modify|write)\b|"
+    r"\bwithout\s+(?:changing|editing|modifying|writing)\b|"
+    r"\bread[- ]only\b"
+)
+_REVIEW_INTENT_PATTERN = re.compile(
+    r"(?i)\b(?:audit|explain|inspect|review|summarize)\b|"
+    r"\bcommit\s+readiness\b|"
+    r"\b(?:git\s+)?diff\b"
+)
+
+
+class TaskProfile(str, Enum):
+    """Bounded model-facing tool sets for one task or subagent call."""
+
+    EXPLICIT_READONLY = "explicit_readonly"
+    PLAN_ONLY = "plan_only"
+    REVIEW_ONLY = "review_only"
+    EDIT_TASK = "edit_task"
+    BROWSER_TASK = "browser_task"
+    COMMIT_TASK = "commit_task"
+    NEW_PROJECT = "new_project"
+
+
+@dataclass(frozen=True)
+class TaskProfileSelection:
+    """Deterministic profile selection plus explicitly requested read tools."""
+
+    profile: TaskProfile
+    requested_tools: tuple[str, ...] = ()
+
+
+def select_task_profile(
+    request: str,
+    *,
+    mode: str = "default",
+    browser_intent: bool = False,
+    commit_requested: bool = False,
+    new_project: bool = False,
+) -> TaskProfileSelection:
+    """Choose one conservative task profile from explicit runtime context."""
+    normalized_mode = str(mode).strip().lower()
+    text = request if isinstance(request, str) else str(request)
+    requested_read_tools = _mentioned_names(text, READ_ONLY_PROFILE_TOOLS)
+
+    if normalized_mode == "plan":
+        return TaskProfileSelection(TaskProfile.PLAN_ONLY)
+    if new_project:
+        return TaskProfileSelection(TaskProfile.NEW_PROJECT)
+    if commit_requested:
+        return TaskProfileSelection(TaskProfile.COMMIT_TASK)
+
+    mutation_intent = (
+        _MUTATION_INTENT_PATTERN.search(text) is not None
+        and _NO_MUTATION_PATTERN.search(text) is None
+    )
+    if requested_read_tools and not mutation_intent:
+        return TaskProfileSelection(
+            TaskProfile.EXPLICIT_READONLY,
+            requested_read_tools,
+        )
+    if browser_intent:
+        return TaskProfileSelection(TaskProfile.BROWSER_TASK)
+    if _REVIEW_INTENT_PATTERN.search(text) is not None and not mutation_intent:
+        return TaskProfileSelection(TaskProfile.REVIEW_ONLY)
+    return TaskProfileSelection(TaskProfile.EDIT_TASK)
+
+
+def tool_names_for_profile(
+    profile: TaskProfile | str,
+    *,
+    requested_tools: Iterable[str] = (),
+    available_tools: Iterable[str] | None = None,
+    browser_intent: bool = False,
+    commit_requested: bool = False,
+) -> tuple[str, ...]:
+    """Return stable internal names allowed by one profile before role filtering."""
+    resolved = _normalize_task_profile(profile)
+    requested = {
+        name.strip()
+        for name in requested_tools
+        if isinstance(name, str) and name.strip()
+    }
+    if resolved is TaskProfile.EXPLICIT_READONLY:
+        allowed = set(requested & READ_ONLY_PROFILE_TOOLS)
+        for name in tuple(allowed):
+            allowed.update(_EXPLICIT_READONLY_SUPPORT.get(name, ()))
+    elif resolved in {TaskProfile.PLAN_ONLY, TaskProfile.REVIEW_ONLY}:
+        allowed = set(READ_ONLY_PROFILE_TOOLS)
+    elif resolved is TaskProfile.EDIT_TASK:
+        allowed = set(
+            READ_ONLY_PROFILE_TOOLS | WRITE_TOOL_NAMES | COMMAND_TOOL_NAMES
+        )
+    elif resolved is TaskProfile.BROWSER_TASK:
+        allowed = set(
+            READ_ONLY_PROFILE_TOOLS
+            | WRITE_TOOL_NAMES
+            | COMMAND_TOOL_NAMES
+            | BROWSER_TOOL_NAMES
+        )
+    elif resolved is TaskProfile.COMMIT_TASK:
+        allowed = set(
+            READ_ONLY_PROFILE_TOOLS
+            | WRITE_TOOL_NAMES
+            | COMMAND_TOOL_NAMES
+            | COMMIT_EXECUTION_TOOL_NAMES
+        )
+    else:
+        allowed = set(
+            {
+                "list_dir",
+                "read_file",
+                "read_json",
+                "read_yaml",
+                "dependency_summary",
+                "create_dir",
+                "write_file",
+                "run_command",
+                "run_validation",
+            }
+        )
+
+    available = set(available_tools) if available_tools is not None else None
+    if resolved not in {
+        TaskProfile.EXPLICIT_READONLY,
+        TaskProfile.PLAN_ONLY,
+        TaskProfile.REVIEW_ONLY,
+    }:
+        relevant_extensions = requested - BUILTIN_TASK_PROFILE_TOOLS
+        if available is not None:
+            relevant_extensions &= available
+        allowed.update(relevant_extensions)
+
+    if browser_intent and resolved in {
+        TaskProfile.BROWSER_TASK,
+        TaskProfile.COMMIT_TASK,
+        TaskProfile.NEW_PROJECT,
+    }:
+        allowed.update(BROWSER_TOOL_NAMES)
+        if available is not None:
+            allowed.update(
+                name for name in available if name.startswith("mcp.playwright.")
+            )
+    else:
+        allowed.difference_update(BROWSER_TOOL_NAMES)
+
+    if not (
+        resolved is TaskProfile.COMMIT_TASK and commit_requested
+    ):
+        allowed.difference_update(COMMIT_EXECUTION_TOOL_NAMES)
+
+    if available is not None:
+        allowed.intersection_update(available)
+    return tuple(sorted(allowed))
+
+
+def _normalize_task_profile(profile: TaskProfile | str) -> TaskProfile:
+    if isinstance(profile, TaskProfile):
+        return profile
+    if not isinstance(profile, str):
+        raise ValueError("Task profile must be a string or TaskProfile.")
+    normalized = profile.strip().lower().replace("-", "_")
+    try:
+        return TaskProfile(normalized)
+    except ValueError as exc:
+        supported = ", ".join(item.value for item in TaskProfile)
+        raise ValueError(
+            f"Unknown task profile {profile!r}. Expected one of: {supported}."
+        ) from exc
+
+
+def _mentioned_names(text: str, names: Iterable[str]) -> tuple[str, ...]:
+    mentioned = []
+    for name in sorted(set(names)):
+        pattern = re.compile(
+            rf"(?i)(?<![a-zA-Z0-9_-]){re.escape(name)}"
+            rf"(?![a-zA-Z0-9_-])"
+        )
+        if pattern.search(text):
+            mentioned.append(name)
+    return tuple(mentioned)
+
+
+def _external_tool_is_relevant(request: str, internal_name: str) -> bool:
+    if internal_name in BUILTIN_TASK_PROFILE_TOOLS:
+        return False
+    request_words = set(re.findall(r"[a-zA-Z0-9]+", request.casefold()))
+    tool_words = {
+        word
+        for word in re.findall(r"[a-zA-Z0-9]+", internal_name.casefold())
+        if word not in {"mcp", "plugin", "plugins", "tool", "tools"}
+    }
+    if len(request_words & tool_words) >= 2:
+        return True
+    namespace = internal_name.split(".", 1)[0].casefold()
+    return "plugin" in request_words and namespace in request_words
 
 
 @dataclass(frozen=True)
@@ -142,6 +393,19 @@ class ToolRegistry:
         """Return stable internal names for diagnostics and permission policy."""
         return tuple(sorted(self._tools))
 
+    def relevant_tool_names(self, request: str) -> tuple[str, ...]:
+        """Return registered tools explicitly named or clearly matched by intent."""
+        text = request if isinstance(request, str) else str(request)
+        mentioned = []
+        for internal_name in self.names():
+            model_name = self._model_names_by_internal[internal_name]
+            if _mentioned_names(
+                text,
+                (internal_name, model_name),
+            ) or _external_tool_is_relevant(text, internal_name):
+                mentioned.append(internal_name)
+        return tuple(mentioned)
+
     def model_name_for(self, internal_name: str) -> str:
         """Return the provider-safe alias for a registered internal tool name."""
         return self._model_names_by_internal[internal_name]
@@ -161,8 +425,25 @@ class ToolRegistry:
         *,
         read_only: bool = False,
         allow_execute: bool = True,
+        profile: TaskProfile | str | None = None,
+        requested_tools: Iterable[str] = (),
+        browser_intent: bool = False,
+        commit_requested: bool = False,
     ) -> list[dict[str, Any]]:
         """Return LiteLLM/OpenAI-compatible function tool schemas."""
+        profile_names = (
+            None
+            if profile is None
+            else set(
+                tool_names_for_profile(
+                    profile,
+                    requested_tools=requested_tools,
+                    available_tools=self._tools,
+                    browser_intent=browser_intent,
+                    commit_requested=commit_requested,
+                )
+            )
+        )
         return [
             {
                 "type": "function",
@@ -173,11 +454,15 @@ class ToolRegistry:
                 },
             }
             for tool in sorted(self._tools.values(), key=lambda item: item.name)
+            if profile_names is None or tool.name in profile_names
             if not read_only
             or tool.permission is PermissionLevel.READ
             or tool.plan_safe
             if allow_execute
-            or tool.permission is not PermissionLevel.EXECUTE
+            or (
+                tool.permission is not PermissionLevel.EXECUTE
+                and tool.name not in COMMIT_EXECUTION_TOOL_NAMES
+            )
         ]
 
     def execute(

@@ -296,6 +296,7 @@ def build_system_prompt(
     runtime_mode: str = "local",
     allow_network: bool = False,
     browser_intent: BrowserIntent | None = None,
+    task_profile: str | None = None,
 ) -> str:
     """Build system context from project metadata, instructions, and mode."""
     normalized_mode = mode.strip().lower() or "default"
@@ -336,10 +337,20 @@ def build_system_prompt(
         sort_keys=True,
     )
     browser_guidance = _browser_intent_guidance(browser_intent)
+    profile_guidance = (
+        (
+            f"Active task profile: {task_profile}\n"
+            "Only the profile-relevant provider-safe tool schemas are exposed "
+            "for this model call.\n"
+        )
+        if task_profile
+        else ""
+    )
     return (
         f"{SYSTEM_PROMPT.strip()}\n\n"
         f"Current mode: {normalized_mode}\n"
         f"Mode requirements: {mode_guidance}\n\n"
+        f"{profile_guidance}"
         f"Runtime mode: {normalized_runtime}\n"
         f"Runtime requirements: {runtime_guidance}\n\n"
         f"Detected project information:\n{project_json}\n\n"
@@ -408,6 +419,8 @@ def build_user_prompt(request: str) -> str:
 def build_subagent_system_prompt(
     base_prompt: str,
     role: SubagentRole,
+    *,
+    task_profile: str | None = None,
 ) -> str:
     """Add mandatory role boundaries to the normal safety prompt."""
     allowed_entries = [*sorted(role.allowed_tools)]
@@ -416,9 +429,15 @@ def build_subagent_system_prompt(
     )
     allowed = ", ".join(allowed_entries) or "None"
     blocked = ", ".join(sorted(role.blocked_tools)) or "None"
+    profile_line = (
+        f"Active model-call task profile: {task_profile}\n"
+        if task_profile
+        else ""
+    )
     return (
         f"{base_prompt.rstrip()}\n\n"
         f"Active subagent role: {role.name}\n"
+        f"{profile_line}"
         f"Role purpose: {role.purpose}\n"
         f"Role instructions: {role.system_prompt_fragment}\n"
         f"Allowed tools: {allowed}\n"

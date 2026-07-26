@@ -26,8 +26,9 @@ from lunar_forge.subagents import (
     build_phase_plan,
     get_subagent_role,
     requires_security_review,
+    task_profile_for_role,
 )
-from lunar_forge.tools.registry import Tool, ToolRegistry
+from lunar_forge.tools.registry import TaskProfile, Tool, ToolRegistry
 from lunar_forge.workflows.new_project import (
     format_new_project_result,
     run_new_project,
@@ -637,6 +638,40 @@ def test_orchestrator_rejects_unknown_workflows_and_duplicate_roles():
         SubagentOrchestrator((PLANNER_ROLE, PLANNER_ROLE))
 
 
+def test_role_task_profiles_compose_with_base_profile():
+    assert task_profile_for_role(
+        PLANNER_ROLE,
+        TaskProfile.EDIT_TASK,
+    ) is TaskProfile.PLAN_ONLY
+    assert task_profile_for_role(
+        CODER_ROLE,
+        TaskProfile.BROWSER_TASK,
+        browser_intent=True,
+    ) is TaskProfile.EDIT_TASK
+    assert task_profile_for_role(
+        TESTER_ROLE,
+        TaskProfile.BROWSER_TASK,
+        browser_intent=True,
+    ) is TaskProfile.BROWSER_TASK
+    assert task_profile_for_role(
+        REVIEWER_ROLE,
+        TaskProfile.COMMIT_TASK,
+    ) is TaskProfile.REVIEW_ONLY
+    assert task_profile_for_role(
+        SECURITY_ROLE,
+        TaskProfile.EDIT_TASK,
+    ) is TaskProfile.REVIEW_ONLY
+    assert task_profile_for_role(
+        SCAFFOLDER_ROLE,
+        TaskProfile.NEW_PROJECT,
+    ) is TaskProfile.NEW_PROJECT
+    for role in (CODER_ROLE, TESTER_ROLE, REVIEWER_ROLE):
+        assert task_profile_for_role(
+            role,
+            TaskProfile.EXPLICIT_READONLY,
+        ) is TaskProfile.EXPLICIT_READONLY
+
+
 def test_exported_roles_are_the_canonical_definitions():
     assert SUBAGENT_ROLES == {
         "planner": PLANNER_ROLE,
@@ -660,6 +695,35 @@ def test_single_agent_mode_remains_the_default(tmp_path):
     assert len(model.calls) == 1
     assert "Subagents run:" not in output
     assert output.startswith("Single-agent response.")
+
+
+def test_model_call_logs_selected_profile_and_provider_safe_schema_names(
+    tmp_path,
+):
+    model = SequenceModel((ModelResponse(text="JSON summary."),))
+
+    CodeAgent(AppConfig(), model_client=model).run(
+        "Run read_json on package.json and summarize scripts.",
+        tmp_path,
+    )
+
+    assert model.calls[0]["tools"] == {"read_json"}
+    session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
+    events = [
+        json.loads(line)
+        for line in session_file.read_text(encoding="utf-8").splitlines()
+    ]
+    selection = next(
+        event for event in events if event["event"] == "tool_schema_selection"
+    )
+    usage = next(event for event in events if event["event"] == "model_usage")
+
+    assert selection["data"]["task_profile"] == "explicit_readonly"
+    assert selection["data"]["exposed_tool_count"] == 1
+    assert selection["data"]["exposed_tool_names"] == ["read_json"]
+    assert selection["data"]["exposed_tool_names_truncated"] is False
+    assert usage["data"]["task_profile"] == "explicit_readonly"
+    assert usage["data"]["tool_schema_count"] == 1
 
 
 def test_single_agent_browser_intent_exposes_and_runs_managed_tool(tmp_path):

@@ -15,6 +15,7 @@ from lunar_forge.subagents.reviewer import REVIEWER_ROLE
 from lunar_forge.subagents.scaffolder import SCAFFOLDER_ROLE
 from lunar_forge.subagents.security import SECURITY_ROLE
 from lunar_forge.subagents.tester import TESTER_ROLE
+from lunar_forge.tools.registry import TaskProfile
 
 
 class WorkflowKind(str, Enum):
@@ -225,6 +226,47 @@ def build_phase_plan(
     )
 
 
+def task_profile_for_role(
+    role: SubagentRole | str,
+    base_profile: TaskProfile | str,
+    *,
+    browser_intent: bool = False,
+) -> TaskProfile:
+    """Compose a task profile with a role's narrower static allowlist."""
+    role_name = role.name if isinstance(role, SubagentRole) else str(role)
+    normalized_role = role_name.strip().lower()
+    try:
+        resolved_base = (
+            base_profile
+            if isinstance(base_profile, TaskProfile)
+            else TaskProfile(str(base_profile).strip().lower().replace("-", "_"))
+        )
+    except ValueError as exc:
+        raise ValueError(f"Unknown base task profile: {base_profile!r}") from exc
+
+    if resolved_base in {
+        TaskProfile.EXPLICIT_READONLY,
+        TaskProfile.PLAN_ONLY,
+        TaskProfile.REVIEW_ONLY,
+    }:
+        return resolved_base
+    if normalized_role == "planner":
+        return TaskProfile.PLAN_ONLY
+    if normalized_role in {"reviewer", "security"}:
+        return TaskProfile.REVIEW_ONLY
+    if normalized_role == "coder":
+        return TaskProfile.EDIT_TASK
+    if normalized_role == "tester":
+        return (
+            TaskProfile.BROWSER_TASK
+            if browser_intent
+            else TaskProfile.EDIT_TASK
+        )
+    if normalized_role == "scaffolder":
+        return TaskProfile.NEW_PROJECT
+    raise ValueError(f"Unknown subagent role for task profiling: {role_name!r}")
+
+
 def requires_security_analysis(request: str) -> bool:
     """Conservatively detect prompts that name a sensitive trust boundary."""
     normalized = str(request).casefold()
@@ -292,4 +334,5 @@ __all__ = [
     "build_phase_plan",
     "requires_security_analysis",
     "requires_security_review",
+    "task_profile_for_role",
 ]

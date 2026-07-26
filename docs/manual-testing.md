@@ -35,6 +35,7 @@ command described by the test before answering `y`. Paths beneath
 - [ ] Lightweight symbol listing
 - [ ] Read-only CI configuration summary
 - [ ] Efficient context-tool selection and role boundaries
+- [ ] Task-profile tool-schema filtering
 - [ ] Line tools
 - [ ] Static HTML starter
 - [ ] Python Tkinter starter
@@ -1294,7 +1295,7 @@ This test requires a configured model.
 $SessionProject = Join-Path $ManualRoot "session-project"
 New-Item -ItemType Directory -Force -Path $SessionProject | Out-Null
 "The launch color is silver." | Set-Content -LiteralPath (Join-Path $SessionProject "note.txt") -Encoding utf8
-lunar-forge --show-usage --project $SessionProject "Read note.txt and summarize it. Do not edit files or run commands."
+lunar-forge --show-usage --project $SessionProject "Run read_file on note.txt and summarize it. Do not edit files or run commands."
 $SessionFile = Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $SessionId = $SessionFile.BaseName
 ```
@@ -1306,6 +1307,8 @@ lunar-forge sessions --project $SessionProject
 lunar-forge resume $SessionId --project $SessionProject --summary-only --show-usage
 $UsageEvents = Get-Content -LiteralPath $SessionFile.FullName | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq "model_usage"
 $UsageEvents.data | Select-Object phase, role, model, provider, input_tokens, output_tokens, total_tokens, exact, estimated, messages_count, tool_schema_count
+$ProfileEvents = Get-Content -LiteralPath $SessionFile.FullName | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq "tool_schema_selection"
+$ProfileEvents.data | Select-Object task_profile, exposed_tool_count, exposed_tool_names, exposed_tool_names_truncated
 $BeforeResume = (Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions")).Count
 lunar-forge resume $SessionId --project $SessionProject --prompt "What launch color did the previous session find? Do not call tools."
 $AfterResume = (Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions")).Count
@@ -1319,9 +1322,10 @@ bounded, redacted history without requiring the model. Usage output reports at
 least one call and labels each event as exact/provider-reported or estimated.
 Each event includes message and tool-schema counts plus numeric context component
 estimates, without raw prompts, instructions, tool schemas, or environment
-values. The continued run answers `silver`, does not replay the old read tool
-call, creates one new session file, and records a reference to the resumed
-session.
+values. The tool-schema event reports `explicit_readonly`, an exposed count of
+`1`, and only the provider-safe `read_file` name. The continued run answers
+`silver`, does not replay the old read tool call, creates one new session file,
+and records a reference to the resumed session.
 
 **Cleanup**
 

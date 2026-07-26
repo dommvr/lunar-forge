@@ -16,6 +16,7 @@ from lunar_forge.subagents.orchestrator import (
     build_phase_plan,
     requires_security_analysis,
     requires_security_review,
+    task_profile_for_role,
 )
 from lunar_forge.subagents.planner import PLANNER_ROLE
 from lunar_forge.subagents.reviewer import REVIEWER_ROLE
@@ -67,4 +68,5 @@ __all__ = [
     "get_subagent_role",
     "requires_security_analysis",
     "requires_security_review",
+    "task_profile_for_role",
 ]
