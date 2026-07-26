@@ -98,6 +98,22 @@ def test_read_yaml_rejects_python_specific_tags(tmp_path):
     assert "data" not in result
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    (".agent/config.yaml", ".agent/mcp.yaml"),
+)
+def test_read_yaml_allows_project_agent_configuration(tmp_path, relative_path):
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("enabled: false\n", encoding="utf-8")
+
+    result = read_yaml(tmp_path, relative_path)
+
+    assert result["ok"] is True
+    assert result["path"] == relative_path
+    assert result["data"] == {"enabled": False}
+
+
 def test_structured_readers_block_path_traversal(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside.json"
     outside.write_text('{"canary": "must-not-leak"}', encoding="utf-8")

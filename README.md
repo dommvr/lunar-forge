@@ -327,6 +327,35 @@ call with the selected profile, exposed count, and a bounded provider-safe name
 list. The matching `model_usage` event records the same profile and exact schema
 count so context-size changes can be compared without logging raw schemas.
 
+### Explicit read-only fast path
+
+Unambiguous imperative requests for `project_health`, `dependency_summary`,
+`git_status`, `git_diff`, `list_changed_files`, `read_json`, `read_yaml`,
+`read_many_files`, `list_symbols`, or `ci_summary` take a shorter route. For
+example:
+
+```bash
+lunar-forge --project ../my-app \
+  "Run read_json on package.json and summarize scripts."
+lunar-forge --project ../my-app \
+  "Run git_status and tell me whether the repo is clean."
+```
+
+LunarForge parses the tool and arguments, executes that one read-only registry
+handler directly, and makes one compact tool-free model call to summarize the
+bounded result. It does not start subagents, expose tool schemas to the summary
+call, run validation or browser checks, create checkpoints, edit files, or
+offer a commit. The normal project-root, blocked-path, permission, result-size,
+and session-redaction rules still apply.
+
+Only conservative `Run`, `Use`, or `Call` forms qualify. Missing paths,
+multiple named tools, or edit, validation, browser, or commit intent fall back
+to the normal workflow. A pathname such as
+`examples/projects/browser-demo/package.json` is treated as a file path, not as
+browser intent. Session logs mark the route with `readonly_fast_path`, record
+the deterministic tool call/result, and report zero exposed schemas for the
+single summary call.
+
 ### Bounded file inspection and precise edits
 
 The model-facing file tools include three line-oriented operations in addition
@@ -365,9 +394,11 @@ running project code:
 | `read_many_files(paths, max_bytes_per_file=None, max_total_bytes=None)` | At most 20 known project-relative paths and optional byte caps | Independent text content, line count, truncation, or error for every file; one failure does not discard successful reads. |
 
 All requested and resolved paths pass through project-root confinement.
-`.env`, `.agent`, `.git`, dependency, virtual-environment, cache, build,
-distribution, coverage, key, certificate, PEM, and other credential-looking
-paths are rejected before opening. Common credential directories such as
+`.env`, `.git`, dependency, virtual-environment, cache, build, distribution,
+coverage, key, certificate, PEM, and other credential-looking paths are
+rejected before opening. `.agent` runtime files remain blocked; only the
+documented project `.agent/config.yaml` and `.agent/mcp.yaml` configuration
+files are readable. Common credential directories such as
 `.ssh`, `.aws`, `secrets`, and `credentials` are blocked by the same shared
 guard used by `list_symbols`. Batched reads skip binary and non-UTF-8 files and
 never expand globs or traverse directories. Hard byte, file-count,

@@ -600,6 +600,101 @@ Remove-Item -Recurse -Force -LiteralPath $CiProject
 Remove-Item -Recurse -Force -LiteralPath $NoCiProject
 ```
 
+## Explicit read-only fast path
+
+**Purpose**
+
+Confirm that an unambiguous named read-only tool request executes one registry
+handler, uses one compact summary call with no tool schemas, skips configured
+subagents, and does not infer browser intent from a `browser-demo` pathname.
+
+**Setup and command**
+
+```powershell
+$FastPathProject = Join-Path $ManualRoot "readonly-fast-path"
+New-Item -ItemType Directory -Force -Path (Join-Path $FastPathProject "examples/projects/browser-demo") | Out-Null
+@'
+{"name": "fast-path-demo", "scripts": {"test": "pytest -q"}}
+'@ | Set-Content -LiteralPath (Join-Path $FastPathProject "examples/projects/browser-demo/package.json") -Encoding utf8
+
+$env:FAST_PATH_PROJECT = $FastPathProject
+@'
+import json
+import os
+from pathlib import Path
+
+from lunar_forge.agent import CodeAgent
+from lunar_forge.config import AppConfig, SubagentConfig
+from lunar_forge.model_clients import ModelResponse
+
+class FakeModel:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, tools=None):
+        self.calls.append((messages, list(tools or [])))
+        return ModelResponse(text="The test script is `pytest -q`.")
+
+root = Path(os.environ["FAST_PATH_PROJECT"])
+model = FakeModel()
+output = CodeAgent(
+    AppConfig(subagents=SubagentConfig(enabled=True)),
+    model_client=model,
+).run(
+    "Run read_json on examples/projects/browser-demo/package.json and summarize scripts.",
+    root,
+)
+session = max((root / ".agent/sessions").glob("*.jsonl"))
+events = [
+    json.loads(line)
+    for line in session.read_text(encoding="utf-8").splitlines()
+]
+print(output)
+print("model calls:", len(model.calls))
+print("summary schemas:", len(model.calls[0][1]))
+print("direct tools:", [
+    event["data"]["name"]
+    for event in events
+    if event["event"] == "tool_call"
+])
+print("subagent events:", [
+    event["event"]
+    for event in events
+    if event["event"].startswith("subagent_")
+])
+print("browser events:", [
+    event["event"]
+    for event in events
+    if event["event"] == "browser_intent_detected"
+])
+print("usage:", next(
+    event["data"]
+    for event in events
+    if event["event"] == "model_usage"
+))
+'@ | python -
+```
+
+**Expected result**
+
+The result summarizes `pytest -q`. `model calls` is `1`, `summary schemas` is
+`0`, and `direct tools` is `['read_json']`. Both the subagent and browser event
+lists are empty even though subagents were enabled and the path contains
+`browser-demo`. The usage event has `phase: readonly_fast_path`,
+`task_profile: explicit_readonly`, `messages_count: 2`, and
+`tool_schema_count: 0`. No validation command, checkpoint, file mutation,
+browser server, or commit runs.
+
+Requests that add `then run validation`, `open it in the browser`, a second
+tool name, or an edit instruction should instead use the normal workflow.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\FAST_PATH_PROJECT -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force -LiteralPath $FastPathProject
+```
+
 ## Efficient context-tool selection and role boundaries
 
 **Purpose**

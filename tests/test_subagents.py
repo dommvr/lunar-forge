@@ -697,7 +697,7 @@ def test_single_agent_mode_remains_the_default(tmp_path):
     assert output.startswith("Single-agent response.")
 
 
-def test_model_call_logs_selected_profile_and_provider_safe_schema_names(
+def test_readonly_fast_path_logs_profile_without_model_tool_schemas(
     tmp_path,
 ):
     model = SequenceModel((ModelResponse(text="JSON summary."),))
@@ -707,7 +707,7 @@ def test_model_call_logs_selected_profile_and_provider_safe_schema_names(
         tmp_path,
     )
 
-    assert model.calls[0]["tools"] == {"read_json"}
+    assert model.calls[0]["tools"] == set()
     session_file = next((tmp_path / ".agent" / "sessions").glob("*.jsonl"))
     events = [
         json.loads(line)
@@ -719,11 +719,13 @@ def test_model_call_logs_selected_profile_and_provider_safe_schema_names(
     usage = next(event for event in events if event["event"] == "model_usage")
 
     assert selection["data"]["task_profile"] == "explicit_readonly"
-    assert selection["data"]["exposed_tool_count"] == 1
-    assert selection["data"]["exposed_tool_names"] == ["read_json"]
+    assert selection["data"]["phase"] == "readonly_fast_path"
+    assert selection["data"]["exposed_tool_count"] == 0
+    assert selection["data"]["exposed_tool_names"] == []
     assert selection["data"]["exposed_tool_names_truncated"] is False
     assert usage["data"]["task_profile"] == "explicit_readonly"
-    assert usage["data"]["tool_schema_count"] == 1
+    assert usage["data"]["phase"] == "readonly_fast_path"
+    assert usage["data"]["tool_schema_count"] == 0
 
 
 def test_single_agent_browser_intent_exposes_and_runs_managed_tool(tmp_path):

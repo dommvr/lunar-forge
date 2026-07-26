@@ -33,6 +33,7 @@ from lunar_forge.plugins.registry import (
 from lunar_forge.project_detection import detect_project
 from lunar_forge.prompts import (
     BrowserIntent,
+    build_readonly_fast_path_messages,
     build_subagent_system_prompt,
     build_subagent_user_prompt,
     build_system_prompt,
@@ -60,9 +61,11 @@ from lunar_forge.subagents import (
     task_profile_for_role,
 )
 from lunar_forge.tools.registry import (
+    ExplicitReadOnlyToolRequest,
     TaskProfile,
     ToolRegistry,
     create_tool_registry,
+    parse_explicit_readonly_tool_request,
     select_task_profile,
 )
 
@@ -274,6 +277,46 @@ class CodeAgent:
                 mode=mode,
                 approval_callback=self.approval_callback,
             )
+            browser_intent = detect_browser_intent(request, project_info)
+            if browser_intent.detected:
+                _log_session(
+                    session,
+                    "browser_intent_detected",
+                    signals=browser_intent.signals,
+                    start_server=browser_intent.start_server,
+                    full_page=browser_intent.full_page,
+                    dev_command=browser_intent.dev_command,
+                    url=browser_intent.url,
+                )
+            explicit_readonly_request = (
+                parse_explicit_readonly_tool_request(request)
+            )
+            if (
+                explicit_readonly_request is not None
+                and not browser_intent.detected
+                and use_subagents is not True
+            ):
+                if registry is None:
+                    readonly_tools = create_tool_registry(
+                        root,
+                        mode=mode,
+                        approval_callback=self.approval_callback,
+                        runtime_mode=self.config.runtime.mode,
+                        allow_network=self.config.runtime.allow_network,
+                    )
+                else:
+                    readonly_tools = registry
+                    readonly_tools.set_permission_manager(permission_manager)
+                model_client = self.model_client or self._create_model_client()
+                return self._run_explicit_readonly_fast_path(
+                    request=request,
+                    parsed_request=explicit_readonly_request,
+                    model_client=model_client,
+                    registry=readonly_tools,
+                    session=session,
+                    mode=normalized_mode,
+                    show_usage=show_usage,
+                )
             mcp_client = (
                 MCPClient(
                     load_mcp_config(root),
@@ -335,17 +378,6 @@ class CodeAgent:
                         for name in tools.names()
                         if name in configured_plugin_tools
                     ],
-                )
-            browser_intent = detect_browser_intent(request, project_info)
-            if browser_intent.detected:
-                _log_session(
-                    session,
-                    "browser_intent_detected",
-                    signals=browser_intent.signals,
-                    start_server=browser_intent.start_server,
-                    full_page=browser_intent.full_page,
-                    dev_command=browser_intent.dev_command,
-                    url=browser_intent.url,
                 )
             task_selection = select_task_profile(
                 request,
@@ -600,6 +632,119 @@ class CodeAgent:
         finally:
             if mcp_client is not None:
                 mcp_client.close()
+
+    def _run_explicit_readonly_fast_path(
+        self,
+        *,
+        request: str,
+        parsed_request: ExplicitReadOnlyToolRequest,
+        model_client: ModelClient,
+        registry: ToolRegistry,
+        session: SessionLogger | None,
+        mode: str,
+        show_usage: bool,
+    ) -> str:
+        """Execute one parsed read-only tool, then summarize without tool schemas."""
+        tool_name = parsed_request.tool_name
+        arguments = dict(parsed_request.arguments)
+        call_id = f"readonly-fast-path-{tool_name}"
+        _log_session(
+            session,
+            "readonly_fast_path",
+            task_profile=TaskProfile.EXPLICIT_READONLY.value,
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        _log_session(
+            session,
+            "tool_call",
+            step=0,
+            id=call_id,
+            name=tool_name,
+            model_tool_name=None,
+            internal_tool_name=tool_name,
+            arguments=arguments,
+            deterministic=True,
+        )
+        result = registry.execute(tool_name, arguments)
+        _log_session(
+            session,
+            "tool_result",
+            step=0,
+            id=call_id,
+            name=tool_name,
+            model_tool_name=None,
+            internal_tool_name=tool_name,
+            result=result,
+            deterministic=True,
+        )
+        if result.get("permission_denied") is True:
+            _log_session(
+                session,
+                "permission_denial",
+                step=0,
+                id=call_id,
+                name=tool_name,
+                internal_tool_name=tool_name,
+                reason=result.get("error", "Permission denied."),
+            )
+        elif result.get("ok") is False:
+            _log_session(
+                session,
+                "error",
+                source="tool",
+                step=0,
+                name=tool_name,
+                internal_tool_name=tool_name,
+                message=result.get("error", "Tool execution failed."),
+            )
+        serialized_result = _serialize_tool_result(result)
+        messages = build_readonly_fast_path_messages(
+            request,
+            tool_name,
+            arguments,
+            serialized_result,
+        )
+        tool_schemas: list[dict[str, Any]] = []
+        _log_tool_schema_selection(
+            session,
+            tool_schemas,
+            step=0,
+            task_profile=TaskProfile.EXPLICIT_READONLY,
+            phase="readonly_fast_path",
+            role="agent",
+        )
+        response = model_client.complete(messages, tool_schemas)
+        _log_model_usage(
+            session,
+            response,
+            messages=messages,
+            tool_schemas=tool_schemas,
+            step=0,
+            phase="readonly_fast_path",
+            role="agent",
+            task_profile=TaskProfile.EXPLICIT_READONLY,
+        )
+        _log_session(
+            session,
+            "assistant_message",
+            step=0,
+            text=response.text,
+            model=response.model,
+            tool_call_count=len(response.tool_calls),
+        )
+        if response.tool_calls:
+            raise AgentError(
+                "Read-only fast-path summary returned an unexpected tool call."
+            )
+        if not response.text.strip():
+            raise AgentError("Model returned neither text nor tool calls.")
+        return _append_session_note(
+            _truncate_final_output(response.text.strip()),
+            session,
+            mode,
+            show_usage=show_usage,
+        )
 
     def _finalize_git_commit_offer(
         self,

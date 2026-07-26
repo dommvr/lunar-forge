@@ -1,6 +1,7 @@
 import pytest
 
 from lunar_forge.prompts import (
+    build_readonly_fast_path_messages,
     build_subagent_system_prompt,
     build_subagent_user_prompt,
     build_system_prompt,
@@ -93,6 +94,26 @@ def test_system_and_subagent_prompts_name_active_task_profiles():
     assert "Active task profile: review_only" in base_prompt
     assert "Only the profile-relevant provider-safe tool schemas" in base_prompt
     assert "Active model-call task profile: review_only" in subagent_prompt
+
+
+def test_readonly_fast_path_prompt_is_compact_and_action_free():
+    messages = build_readonly_fast_path_messages(
+        "Run git_status and report whether the repo is clean.",
+        "git_status",
+        {},
+        '{"ok": true, "clean": true}',
+    )
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "read-only result summarizer" in messages[0]["content"]
+    assert "Do not claim edits, validation, browser actions, commits" in (
+        messages[0]["content"]
+    )
+    assert "Do not add workflow status sections or a subagent list" in (
+        messages[0]["content"]
+    )
+    assert "Read-only tool: git_status" in messages[1]["content"]
+    assert '"clean": true' in messages[1]["content"]
 
 
 def test_system_prompt_requires_validation_and_bounded_fix_attempt():

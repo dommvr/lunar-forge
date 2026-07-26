@@ -100,6 +100,14 @@ _SECRET_SUFFIXES = frozenset(
         ".pfx",
     }
 )
+_ALLOWED_AGENT_CONFIGURATION_PATHS = frozenset(
+    {
+        (".agent", "config.yaml"),
+        (".agent", "config.yml"),
+        (".agent", "mcp.yaml"),
+        (".agent", "mcp.yml"),
+    }
+)
 
 
 def read_json(
@@ -342,12 +350,19 @@ def resolve_safe_readable_file(
 
 def _assert_path_allowed(relative_path: Path) -> None:
     parts = tuple(part.casefold() for part in relative_path.parts)
+    allowed_agent_configuration = parts in _ALLOWED_AGENT_CONFIGURATION_PATHS
     if any(directory in _SECRET_DIRECTORIES for directory in parts[:-1]):
         raise PermissionError(
             "Path is inside a blocked secret or credential directory."
         )
     for directory in parts:
-        if directory in _BLOCKED_DIRECTORIES:
+        if (
+            directory in _BLOCKED_DIRECTORIES
+            and not (
+                directory == ".agent"
+                and allowed_agent_configuration
+            )
+        ):
             raise PermissionError(
                 "Path is inside a blocked runtime or generated directory."
             )

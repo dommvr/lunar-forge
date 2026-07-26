@@ -148,6 +148,55 @@ _REVIEW_INTENT_PATTERN = re.compile(
     r"\bcommit\s+readiness\b|"
     r"\b(?:git\s+)?diff\b"
 )
+_VALIDATION_EXECUTION_INTENT_PATTERN = re.compile(
+    r"(?i)\b(?:run|execute|perform)\s+(?:the\s+)?"
+    r"(?:build|checks?|lint|tests?|validation)\b|"
+    r"\bvalidate\s+(?:it|the|this|project|repository|repo|changes?)\b"
+)
+_EXPLICIT_READONLY_FAST_PATH_TOOL_NAMES = frozenset(
+    {
+        "project_health",
+        "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
+        "ci_summary",
+    }
+)
+_EXPLICIT_READONLY_PATH_TOOLS = frozenset(
+    {"read_json", "read_yaml", "list_symbols"}
+)
+_EXPLICIT_READONLY_START_PATTERN = re.compile(
+    r"(?i)^\s*(?:please\s+)?(?:run|use|call)\s+(?:the\s+)?"
+    r"(?P<tool>"
+    + "|".join(
+        re.escape(name)
+        for name in sorted(
+            _EXPLICIT_READONLY_FAST_PATH_TOOL_NAMES,
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\b"
+)
+_EXPLICIT_READONLY_PATH_PATTERN = re.compile(
+    r'"(?P<double>[^"\r\n]+)"|'
+    r"'(?P<single>[^'\r\n]+)'|"
+    r"(?P<plain>"
+    r"(?:(?:\.{1,2}|[A-Za-z0-9_@+.-]+)[\\/])*"
+    r"[A-Za-z0-9_@+.-]+\.[A-Za-z0-9_-]+"
+    r")"
+)
+_COMMIT_INTENT_PATTERN = re.compile(r"(?i)\bcommit(?:ted|ting|s)?\b")
+_BROWSER_EXECUTION_INTENT_PATTERN = re.compile(
+    r"(?i)\b(?:browser|playwright|screenshots?)\b|"
+    r"https?://(?:localhost|127\.0\.0\.1|\[::1\])"
+)
+MAX_EXPLICIT_READONLY_REQUEST_CHARACTERS = 4_000
 
 
 class TaskProfile(str, Enum):
@@ -168,6 +217,103 @@ class TaskProfileSelection:
 
     profile: TaskProfile
     requested_tools: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExplicitReadOnlyToolRequest:
+    """One unambiguous built-in read-only tool invocation."""
+
+    tool_name: str
+    arguments: Mapping[str, Any]
+
+
+def parse_explicit_readonly_tool_request(
+    request: str,
+) -> ExplicitReadOnlyToolRequest | None:
+    """Parse only conservative ``Run <tool> [on <path>]`` request forms."""
+    if not isinstance(request, str):
+        return None
+    text = request.strip()
+    if not text or len(text) > MAX_EXPLICIT_READONLY_REQUEST_CHARACTERS:
+        return None
+    match = _EXPLICIT_READONLY_START_PATTERN.match(text)
+    if match is None:
+        return None
+
+    tool_name = match.group("tool").casefold()
+    intent_text = _EXPLICIT_READONLY_PATH_PATTERN.sub("", text)
+    mentioned_tools = _mentioned_names(
+        text,
+        _EXPLICIT_READONLY_FAST_PATH_TOOL_NAMES,
+    )
+    if mentioned_tools != (tool_name,):
+        return None
+    if (
+        _MUTATION_INTENT_PATTERN.search(text) is not None
+        or _VALIDATION_EXECUTION_INTENT_PATTERN.search(text) is not None
+        or _COMMIT_INTENT_PATTERN.search(text) is not None
+        or _BROWSER_EXECUTION_INTENT_PATTERN.search(intent_text) is not None
+    ):
+        return None
+
+    remainder = text[match.end() :]
+    path_clause = re.search(r"(?i)\bon\b(?P<paths>.*)", remainder)
+    path_text = path_clause.group("paths") if path_clause is not None else ""
+    paths = _explicit_readonly_paths(path_text)
+
+    if tool_name in _EXPLICIT_READONLY_PATH_TOOLS:
+        if path_clause is None or len(paths) != 1:
+            return None
+        return ExplicitReadOnlyToolRequest(tool_name, {"path": paths[0]})
+
+    if tool_name == "read_many_files":
+        if path_clause is None or not paths:
+            return None
+        return ExplicitReadOnlyToolRequest(tool_name, {"paths": list(paths)})
+
+    if tool_name == "git_diff":
+        if len(paths) > 1:
+            return None
+        arguments: dict[str, Any] = {}
+        if paths:
+            arguments["path"] = paths[0]
+        if re.search(r"(?i)\bstaged\b", remainder):
+            arguments["staged"] = True
+        return ExplicitReadOnlyToolRequest(tool_name, arguments)
+
+    if path_clause is not None or paths:
+        return None
+    if tool_name == "list_changed_files":
+        source_match = re.search(
+            r"(?i)\bfrom\s+(?P<source>session|git|both)\b",
+            remainder,
+        )
+        if source_match is not None:
+            return ExplicitReadOnlyToolRequest(
+                tool_name,
+                {"source": source_match.group("source").casefold()},
+            )
+    return ExplicitReadOnlyToolRequest(tool_name, {})
+
+
+def _explicit_readonly_paths(text: str) -> tuple[str, ...]:
+    paths: list[str] = []
+    for match in _EXPLICIT_READONLY_PATH_PATTERN.finditer(text):
+        path = next(
+            (
+                value
+                for value in (
+                    match.group("double"),
+                    match.group("single"),
+                    match.group("plain"),
+                )
+                if value is not None
+            ),
+            "",
+        ).strip()
+        if path and path not in paths:
+            paths.append(path)
+    return tuple(paths)
 
 
 def select_task_profile(
@@ -194,13 +340,21 @@ def select_task_profile(
         _MUTATION_INTENT_PATTERN.search(text) is not None
         and _NO_MUTATION_PATTERN.search(text) is None
     )
-    if requested_read_tools and not mutation_intent:
+    validation_execution_intent = (
+        _VALIDATION_EXECUTION_INTENT_PATTERN.search(text) is not None
+    )
+    if browser_intent:
+        return TaskProfileSelection(TaskProfile.BROWSER_TASK)
+    if validation_execution_intent:
+        return TaskProfileSelection(TaskProfile.EDIT_TASK)
+    if (
+        requested_read_tools
+        and not mutation_intent
+    ):
         return TaskProfileSelection(
             TaskProfile.EXPLICIT_READONLY,
             requested_read_tools,
         )
-    if browser_intent:
-        return TaskProfileSelection(TaskProfile.BROWSER_TASK)
     if _REVIEW_INTENT_PATTERN.search(text) is not None and not mutation_intent:
         return TaskProfileSelection(TaskProfile.REVIEW_ONLY)
     return TaskProfileSelection(TaskProfile.EDIT_TASK)
