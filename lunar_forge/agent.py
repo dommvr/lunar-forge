@@ -22,7 +22,11 @@ from lunar_forge.model_clients import (
     ToolCall,
     create_model_client,
 )
-from lunar_forge.permissions import ApprovalCallback, PermissionManager
+from lunar_forge.permissions import (
+    ApprovalCallback,
+    PermissionLevel,
+    PermissionManager,
+)
 from lunar_forge.planning import Plan
 from lunar_forge.plugins.loader import load_enabled_plugins
 from lunar_forge.plugins.registry import (
@@ -32,6 +36,7 @@ from lunar_forge.plugins.registry import (
 )
 from lunar_forge.project_detection import detect_project
 from lunar_forge.prompts import (
+    MAX_READONLY_FAST_PATH_RESULT_CHARACTERS,
     BrowserIntent,
     build_readonly_fast_path_messages,
     build_subagent_system_prompt,
@@ -653,6 +658,17 @@ class CodeAgent:
         """Execute one parsed read-only tool, then summarize without tool schemas."""
         tool_name = parsed_request.tool_name
         arguments = dict(parsed_request.arguments)
+        try:
+            fast_path_tool = registry.get(tool_name)
+        except KeyError as exc:
+            raise AgentError(
+                f"Read-only fast-path tool is unavailable: {tool_name}"
+            ) from exc
+        if fast_path_tool.permission is not PermissionLevel.READ:
+            raise AgentError(
+                "Read-only fast-path tool is not registered with read permission: "
+                f"{tool_name}"
+            )
         call_id = f"readonly-fast-path-{tool_name}"
         _log_session(
             session,
@@ -705,11 +721,14 @@ class CodeAgent:
                 message=result.get("error", "Tool execution failed."),
             )
         serialized_result = _serialize_tool_result(result)
+        bounded_serialized_result = serialized_result[
+            :MAX_READONLY_FAST_PATH_RESULT_CHARACTERS
+        ]
         messages = build_readonly_fast_path_messages(
             request,
             tool_name,
             arguments,
-            serialized_result,
+            bounded_serialized_result,
         )
         tool_schemas: list[dict[str, Any]] = []
         _log_tool_schema_selection(
@@ -730,6 +749,7 @@ class CodeAgent:
             phase="readonly_fast_path",
             role="agent",
             task_profile=TaskProfile.EXPLICIT_READONLY,
+            embedded_tool_result=bounded_serialized_result,
         )
         _log_session(
             session,
@@ -1809,6 +1829,7 @@ def _log_model_usage(
     role: str,
     task_profile: TaskProfile | str,
     parallel_group_id: str | None = None,
+    embedded_tool_result: str | None = None,
 ) -> None:
     if session is None:
         return
@@ -1817,6 +1838,7 @@ def _log_model_usage(
         messages,
         tool_schemas,
         response,
+        embedded_tool_result=embedded_tool_result,
     )
     usage = response.usage or ModelUsage(
         input_tokens=(
@@ -1866,6 +1888,8 @@ def _context_component_estimates(
     messages: Sequence[Mapping[str, Any]],
     tool_schemas: Sequence[Mapping[str, Any]],
     response: ModelResponse,
+    *,
+    embedded_tool_result: str | None = None,
 ) -> dict[str, int]:
     messages_characters = _serialized_character_count(messages)
     system_characters = sum(
@@ -1878,6 +1902,8 @@ def _context_component_estimates(
         for message in messages
         if message.get("role") == "tool"
     )
+    if embedded_tool_result is not None:
+        tool_result_characters += len(embedded_tool_result)
     tool_schema_characters = _serialized_character_count(tool_schemas)
     response_characters = _response_character_count(response)
     return {

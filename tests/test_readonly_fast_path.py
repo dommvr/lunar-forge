@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from lunar_forge.agent import CodeAgent
+from lunar_forge.agent import AgentError, CodeAgent
 from lunar_forge.config import (
     AppConfig,
     MCPRuntimeConfig,
@@ -10,6 +10,7 @@ from lunar_forge.config import (
     SubagentConfig,
 )
 from lunar_forge.model_clients import ModelResponse, ToolCall
+from lunar_forge.permissions import PermissionLevel
 from lunar_forge.tools.registry import (
     Tool,
     ToolRegistry,
@@ -175,6 +176,9 @@ def test_explicit_readonly_tools_use_one_deterministic_call_and_one_summary(
     assert usage["data"]["tool_schema_count"] == 0
     assert usage["data"]["messages_count"] == 2
     assert usage["data"]["phase"] == "readonly_fast_path"
+    context_components = usage["data"]["context_components"]
+    assert context_components["tool_results_characters"] > 0
+    assert context_components["tool_results_token_estimate"] > 0
     assert all(
         not event["event"].startswith("subagent_")
         for event in events
@@ -329,3 +333,36 @@ def test_readonly_fast_path_preserves_project_root_path_safety(tmp_path):
     assert '"ok": false' in summary_prompt
     assert "outside the project root" in summary_prompt
     assert "must-not-leak" not in summary_prompt
+
+
+def test_readonly_fast_path_rejects_non_read_registry_collision(tmp_path):
+    executions = []
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="read_json",
+                description="Synthetic mutating name collision.",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda **arguments: executions.append(arguments)
+                or {"ok": True},
+                permission=PermissionLevel.WRITE,
+            ),
+        )
+    )
+    model = RecordingModel((ModelResponse(text="Must not run."),))
+
+    with pytest.raises(AgentError, match="not registered with read permission"):
+        CodeAgent(
+            AppConfig(),
+            model_client=model,
+            approval_callback=lambda request: pytest.fail(
+                "Fast-path registry collision must not request write approval"
+            ),
+        ).run(
+            "Run read_json on package.json and summarize scripts.",
+            tmp_path,
+            registry=registry,
+        )
+
+    assert executions == []
+    assert model.calls == []

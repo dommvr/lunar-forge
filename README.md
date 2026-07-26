@@ -326,6 +326,9 @@ Non-plan session logs record a `tool_schema_selection` event before each model
 call with the selected profile, exposed count, and a bounded provider-safe name
 list. The matching `model_usage` event records the same profile and exact schema
 count so context-size changes can be compared without logging raw schemas.
+Fast-path usage also records the bounded deterministic result's character/token
+estimate as a context component; it does not duplicate the raw result in the
+usage event.
 
 ### Explicit read-only fast path
 
@@ -355,7 +358,9 @@ to the normal workflow. A pathname such as
 `examples/projects/browser-demo/package.json` is treated as a file path, not as
 browser intent. Session logs mark the route with `readonly_fast_path`, record
 the deterministic tool call/result, and report zero exposed schemas for the
-single summary call.
+single summary call. The route also verifies that the selected registry entry is
+registered with read permission before invoking it; a same-named write or
+execution tool cannot borrow the fast path.
 
 ### Bounded file inspection and precise edits
 

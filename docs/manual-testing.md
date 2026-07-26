@@ -613,10 +613,31 @@ subagents, and does not infer browser intent from a `browser-demo` pathname.
 ```powershell
 $FastPathProject = Join-Path $ManualRoot "readonly-fast-path"
 New-Item -ItemType Directory -Force -Path (Join-Path $FastPathProject "examples/projects/browser-demo") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $FastPathProject ".github/workflows") | Out-Null
 @'
 {"name": "fast-path-demo", "scripts": {"test": "pytest -q"}}
 '@ | Set-Content -LiteralPath (Join-Path $FastPathProject "examples/projects/browser-demo/package.json") -Encoding utf8
 "export default function App() { return null; }" | Set-Content -LiteralPath (Join-Path $FastPathProject "examples/projects/browser-demo/App.jsx") -Encoding utf8
+@'
+{"name": "fast-path-root", "scripts": {"test": "python -m pytest -q"}}
+'@ | Set-Content -LiteralPath (Join-Path $FastPathProject "package.json") -Encoding utf8
+@'
+export default function App() {
+  return <main>Fast path fixture</main>;
+}
+'@ | Set-Content -LiteralPath (Join-Path $FastPathProject "App.jsx") -Encoding utf8
+@'
+name: checks
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -m pytest -q
+'@ | Set-Content -LiteralPath (Join-Path $FastPathProject ".github/workflows/checks.yml") -Encoding utf8
+Push-Location $FastPathProject
+git init
+Pop-Location
 
 $env:FAST_PATH_PROJECT = $FastPathProject
 @'
@@ -734,6 +755,165 @@ lunar-forge --subagents --project $FastPathProject "Review uncommitted changes f
 The first command omits `Subagents run` because the deterministic fast path ran
 no role. The second lists only `reviewer`; it must not list Planner, Coder,
 Tester, or Security unless the request is expanded to require them.
+
+### Read-only token and call-count benchmark
+
+This deterministic benchmark covers `read_json`, `list_symbols`, `ci_summary`,
+and `git_status`. It uses a fake summary model, so it needs no API key and does
+not report provider billing. The `before` value reconstructs the input shape of
+a model-mediated tool loop: one call to request the tool and another to
+summarize its result, both carrying the profile schemas. The `after` value is
+read from the real fast-path `model_usage` event. Both token values use
+LunarForge's clearly labeled character-count estimate.
+
+```powershell
+@'
+import json
+import math
+import os
+from pathlib import Path
+
+from lunar_forge.agent import CodeAgent
+from lunar_forge.config import AppConfig
+from lunar_forge.instructions import load_project_instructions
+from lunar_forge.model_clients import ModelResponse
+from lunar_forge.project_detection import detect_project
+from lunar_forge.prompts import build_system_prompt, build_user_prompt
+from lunar_forge.tools.registry import (
+    TaskProfile,
+    create_tool_registry,
+    parse_explicit_readonly_tool_request,
+)
+
+CASES = (
+    ("read_json", "Run read_json on package.json and summarize scripts."),
+    ("list_symbols", "Run list_symbols on App.jsx and summarize components."),
+    ("ci_summary", "Run ci_summary and report CI commands."),
+    ("git_status", "Run git_status and tell me whether the repo is clean."),
+)
+
+class FakeModel:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, tools=None):
+        self.calls.append((list(messages), list(tools or [])))
+        return ModelResponse(text="Concise read-only summary.")
+
+def serialized_characters(value):
+    return len(json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        default=str,
+    ))
+
+def estimated_input_tokens(messages, schemas):
+    return (
+        math.ceil(serialized_characters(messages) / 4)
+        + math.ceil(serialized_characters(schemas) / 4)
+    )
+
+root = Path(os.environ["FAST_PATH_PROJECT"])
+for label, prompt in CASES:
+    sessions_dir = root / ".agent/sessions"
+    before_sessions = (
+        set(sessions_dir.glob("*.jsonl"))
+        if sessions_dir.exists()
+        else set()
+    )
+    model = FakeModel()
+    registry = create_tool_registry(root, mode="default")
+    CodeAgent(AppConfig(), model_client=model).run(
+        prompt,
+        root,
+        registry=registry,
+    )
+    session = (set(sessions_dir.glob("*.jsonl")) - before_sessions).pop()
+    events = [
+        json.loads(line)
+        for line in session.read_text(encoding="utf-8").splitlines()
+    ]
+    usage = next(
+        event["data"]
+        for event in events
+        if event["event"] == "model_usage"
+    )
+    tool_result = next(
+        event["data"]["result"]
+        for event in events
+        if event["event"] == "tool_result"
+    )
+    parsed = parse_explicit_readonly_tool_request(prompt)
+    assert parsed is not None
+    schemas = registry.schemas(
+        profile=TaskProfile.EXPLICIT_READONLY,
+        requested_tools=(parsed.tool_name,),
+    )
+    model_tool_name = registry.model_name_for(parsed.tool_name)
+    base_messages = [
+        {
+            "role": "system",
+            "content": build_system_prompt(
+                detect_project(root),
+                load_project_instructions(root),
+                "default",
+                task_profile=TaskProfile.EXPLICIT_READONLY.value,
+            ),
+        },
+        {"role": "user", "content": build_user_prompt(prompt)},
+    ]
+    assistant_tool_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "legacy-call",
+            "type": "function",
+            "function": {
+                "name": model_tool_name,
+                "arguments": json.dumps(
+                    dict(parsed.arguments),
+                    sort_keys=True,
+                ),
+            },
+        }],
+    }
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": "legacy-call",
+        "name": model_tool_name,
+        "content": json.dumps(tool_result, sort_keys=True),
+    }
+    before_tokens = (
+        estimated_input_tokens(base_messages, schemas)
+        + estimated_input_tokens(
+            [*base_messages, assistant_tool_call, tool_message],
+            schemas,
+        )
+    )
+    after_tokens = usage["input_tokens"]
+    assert len(model.calls) == 1
+    assert model.calls[0][1] == []
+    assert before_tokens > after_tokens
+    print(
+        f"{label}: calls 2 -> {len(model.calls)}; "
+        f"schema exposures {len(schemas) * 2} -> "
+        f"{usage['tool_schema_count']}; "
+        f"estimated input tokens {before_tokens} -> {after_tokens}; "
+        f"tool-result estimate "
+        f"{usage['context_components']['tool_results_token_estimate']}"
+    )
+'@ | python -
+```
+
+Every line should show calls `2 -> 1`, schema exposures ending in `0`, and a
+smaller estimated input-token count after routing. `list_symbols` can have a
+larger reconstructed schema count because its normal profile also exposes the
+minimal numbered-reader support tool. The fast-path usage event must label the
+call `estimated: true`, report `messages_count: 2`, and include a non-zero
+`tool_results_token_estimate`. No subagent, validation, browser, checkpoint,
+write, or commit event should appear.
 
 **Cleanup**
 
