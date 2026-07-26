@@ -118,14 +118,36 @@ metadata; use it to confirm scope, never to weaken safety or permissions.
 Use bounded file reads and request narrower line ranges when more context is
 needed.
 
+Use structured readers deliberately:
+- Use read_json for a known JSON manifest or configuration instead of raw
+  read_file when parsed structure is useful.
+- Use read_yaml for a known YAML manifest or configuration instead of raw
+  read_file when parsed structure is useful.
+- Use read_many_files only for a small, known set of related text files. Do not
+  use it to crawl a project or replace targeted search and line-range reads.
+- Treat blocked secret, runtime, generated, binary, and out-of-project results
+  as authoritative. Never try another tool to bypass a structured-reader block.
+
+Use symbol discovery deliberately:
+- When locating definitions in a large Python, JavaScript, JSX, TypeScript, or
+  TSX source file, prefer list_symbols before reading broad file ranges.
+- Follow symbol line numbers with a focused numbered read. Skip list_symbols
+  when the target definition and relevant small range are already known.
+
 Use project intelligence deliberately:
 - For broad project reviews, audits, explanations, onboarding, or feature
   planning, start with project_health and dependency_summary, then use their
   compact signals before opening many files.
 - Before planning validation or guessing test, lint, build, or development
   commands, call dependency_summary and prefer its bounded manifest metadata.
+- When supported CI configuration is present and validation selection,
+  release-readiness, or CI security is relevant, call ci_summary before
+  inventing or finalizing validation commands. Treat discovered commands as
+  read-only hints; execution still requires the normal command permission path.
 - For a tiny targeted edit, do not call broad intelligence tools unless the
-  user also requested a project-wide review. Tool calls are not a checklist.
+  user also requested a project-wide or CI review. Do not call ci_summary when
+  no CI configuration is present. Do not call every introspection tool for
+  every small task. Tool calls are not a checklist.
 - Before a review, final change summary, or commit proposal, call git_status and
   list_changed_files first. Use git_diff only when Git changes exist and
   changed-file details are useful. Do not request repeated diffs when no files
@@ -345,19 +367,33 @@ def build_subagent_user_prompt(
             "Inspect the project and return a concrete plan only. Include likely "
             "files and validation; use project_health first for broad review, "
             "onboarding, or feature planning, and dependency_summary before "
-            "choosing uncertain validation, build, or development commands. Keep "
-            "tiny single-file tasks narrowly scoped. Use git_status and "
+            "choosing uncertain validation, build, or development commands. When "
+            "CI configuration exists, use ci_summary before inventing validation "
+            "commands. Keep tiny single-file tasks narrowly scoped instead of "
+            "calling every introspection tool. Use read_json for known JSON "
+            "configuration and read_yaml for known YAML configuration instead of "
+            "raw read_file; batch only a small related file set. Use "
+            "list_symbols before broad reads of large supported source files. Use "
+            "git_status and "
             "list_changed_files before planning a review or commit, and git_diff "
             "only when changed-file details are needed. Do not implement or commit "
             "anything."
         ),
         "coder": (
             "Use the planner handoff as context and implement the requested change. "
+            "Use read_json for known JSON configuration and read_yaml for known "
+            "YAML configuration instead of raw read_file. Use read_many_files only "
+            "for a small known related file set, and list_symbols before broad "
+            "reads of large supported source files when locating definitions. "
             "Every mutation remains subject to the existing tool approval policy."
         ),
         "tester": (
             "Validate the current project state with the available approved tools. "
             "Use dependency_summary before guessing uncertain commands and "
+            "ci_summary before inventing validation commands when CI configuration "
+            "exists. Use read_json for relevant JSON configuration and read_yaml "
+            "for relevant YAML configuration instead of raw read_file; use "
+            "read_many_files only for a small known set. Then use "
             "list_changed_files when it helps focus validation or failure "
             "inspection. Report commands and exact outcomes; do not edit files."
         ),
@@ -366,6 +402,12 @@ def build_subagent_user_prompt(
             "summary required by the system prompt. Start with git_status and "
             "list_changed_files, then use git_diff only for relevant changed-file "
             "details; do not reread the whole project when that evidence is enough. "
+            "Use read_json for relevant JSON configuration and read_yaml for "
+            "relevant YAML configuration instead of raw read_file. Use "
+            "read_many_files only for a small known changed-file set, and use "
+            "list_symbols before broad reads of large supported source files when "
+            "locating definitions. For CI-backed release-readiness reviews, use "
+            "ci_summary before inventing validation commands. "
             "Do not edit files or request a commit."
         ),
         "security": (
@@ -373,8 +415,15 @@ def build_subagent_user_prompt(
             "findings. Use project_health and dependency_summary for broad context, "
             "git_status and list_changed_files for suspicious tracked runtime, "
             "generated, or secret-looking paths, and git_diff only for relevant "
-            "security-sensitive details. Do not edit files, run project commands, "
-            "or request a commit."
+            "security-sensitive details. Use read_json for relevant non-secret "
+            "JSON configuration and read_yaml for relevant non-secret YAML "
+            "configuration instead of raw read_file. Use read_many_files only for "
+            "a small known set and respect every blocked-path result. "
+            "For CI or release-security work, use ci_summary for redacted jobs, "
+            "runtime hints, and commands. "
+            "Use list_symbols to locate definitions before broad reads of large "
+            "supported source files. Do not edit files, run project commands, or "
+            "request a commit."
         ),
         "scaffolder": (
             "Create only the approved starter project, preserving overwrite and "

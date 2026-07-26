@@ -31,6 +31,10 @@ command described by the test before answering `y`. Paths beneath
 - [ ] Plan mode
 - [ ] Basic project inspection
 - [ ] Built-in project intelligence
+- [ ] Safe structured file readers
+- [ ] Lightweight symbol listing
+- [ ] Read-only CI configuration summary
+- [ ] Efficient context-tool selection and role boundaries
 - [ ] Line tools
 - [ ] Static HTML starter
 - [ ] Python Tkinter starter
@@ -292,6 +296,408 @@ Git-backed tool here would return a clear non-repository error without mutation.
 Remove-Item Env:\INTEL_PROJECT -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force -LiteralPath $IntelProject
 ```
+
+## Safe structured file readers
+
+**Purpose**
+
+Confirm that plan mode exposes `read_json`, `read_yaml`, and
+`read_many_files`; valid data is structured and bounded, malformed files report
+locations, partial batch failures remain isolated, and secret/runtime/generated
+or out-of-project files are never read.
+
+**Setup**
+
+```powershell
+$StructuredProject = Join-Path $ManualRoot "structured-project"
+New-Item -ItemType Directory -Force -Path $StructuredProject | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $StructuredProject "dist") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $StructuredProject "secrets") | Out-Null
+@'
+{"name": "manual-demo", "scripts": {"test": "pytest"}}
+'@ | Set-Content -LiteralPath (Join-Path $StructuredProject "package.json") -Encoding utf8
+@'
+name: manual-demo
+checks:
+  - test
+  - lint
+'@ | Set-Content -LiteralPath (Join-Path $StructuredProject "config.yaml") -Encoding utf8
+'{"name": ]' | Set-Content -LiteralPath (Join-Path $StructuredProject "broken.json") -Encoding utf8
+"checks: [test," | Set-Content -LiteralPath (Join-Path $StructuredProject "broken.yaml") -Encoding utf8
+"first`nsecond" | Set-Content -LiteralPath (Join-Path $StructuredProject "notes.txt") -Encoding utf8
+"generated-canary" | Set-Content -LiteralPath (Join-Path $StructuredProject "dist\generated.txt") -Encoding utf8
+"TOKEN=secret-canary" | Set-Content -LiteralPath (Join-Path $StructuredProject ".env") -Encoding utf8
+"directory-secret-canary" | Set-Content -LiteralPath (Join-Path $StructuredProject "secrets\private.txt") -Encoding utf8
+[IO.File]::WriteAllBytes(
+    (Join-Path $StructuredProject "binary.bin"),
+    [byte[]](0, 1, 2, 3)
+)
+'{"outside": "outside-canary"}' | Set-Content -LiteralPath (Join-Path $ManualRoot "structured-outside.json") -Encoding utf8
+```
+
+**Command**
+
+```powershell
+$env:STRUCTURED_PROJECT = $StructuredProject
+@'
+import json
+import os
+from lunar_forge.tools.registry import create_tool_registry
+
+registry = create_tool_registry(os.environ["STRUCTURED_PROJECT"], mode="plan")
+tools = {"read_json", "read_yaml", "read_many_files"}
+print("available:", sorted(tools & set(registry.names())))
+for name, arguments in (
+    ("read_json", {"path": "package.json"}),
+    ("read_yaml", {"path": "config.yaml"}),
+    ("read_json", {"path": "broken.json"}),
+    ("read_yaml", {"path": "broken.yaml"}),
+    ("read_json", {"path": "package.json", "max_bytes": 16}),
+    ("read_json", {"path": "../structured-outside.json"}),
+    (
+        "read_many_files",
+        {
+            "paths": [
+                "notes.txt",
+                "binary.bin",
+                "missing.txt",
+                ".env",
+                "dist/generated.txt",
+                "secrets/private.txt",
+                ".",
+                "**/*",
+            ],
+            "max_bytes_per_file": 32,
+            "max_total_bytes": 64,
+        },
+    ),
+):
+    print(name, json.dumps(registry.execute(name, arguments), indent=2))
+'@ | python -
+```
+
+**Expected result**
+
+`available` lists all three exact provider-safe names. Valid JSON and YAML
+return `ok: true`, structured `data`, top-level keys, and `truncated: false`.
+Malformed results return `ok: false` with line and column and no content
+preview. The low-byte JSON request returns a bounded preview rather than partial
+parsed data. Traversal is rejected. The batch returns `notes.txt` successfully
+and independent errors for the binary, missing, `.env`, `dist`, `secrets`,
+directory, and literal glob paths while the top-level result remains `ok: true`;
+globs are never expanded. None of `secret-canary`, `directory-secret-canary`,
+`generated-canary`, or `outside-canary` appears. No approval prompt, file
+mutation, project import, or subprocess occurs.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\STRUCTURED_PROJECT -ErrorAction SilentlyContinue
+Remove-Item -Force -LiteralPath (Join-Path $ManualRoot "structured-outside.json")
+Remove-Item -Recurse -Force -LiteralPath $StructuredProject
+```
+
+## Lightweight symbol listing
+
+**Purpose**
+
+Confirm that `list_symbols` is available in plan mode, uses Python AST parsing
+without executing code, conservatively locates JS/TS exports and React
+components, reports syntax and unsupported-file errors, caps results, and
+inherits traversal and secret/runtime/generated path blocking.
+
+**Setup**
+
+```powershell
+$SymbolProject = Join-Path $ManualRoot "symbol-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $SymbolProject "src") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $SymbolProject "dist") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $SymbolProject "secrets") | Out-Null
+@'
+from pathlib import Path
+
+Path("executed.txt").write_text("must-not-run")
+
+async def load_data():
+    return None
+
+class Service:
+    def run(self):
+        return True
+'@ | Set-Content -LiteralPath (Join-Path $SymbolProject "src\service.py") -Encoding utf8
+@'
+export async function loadData() {}
+export default function App() {}
+export class Service {}
+export const API_URL = "/api";
+const Card = () => null;
+class Legacy extends React.Component {}
+'@ | Set-Content -LiteralPath (Join-Path $SymbolProject "src\App.tsx") -Encoding utf8
+"def broken(:" | Set-Content -LiteralPath (Join-Path $SymbolProject "src\broken.py") -Encoding utf8
+"plain text" | Set-Content -LiteralPath (Join-Path $SymbolProject "notes.txt") -Encoding utf8
+"SECRET=must-not-leak" | Set-Content -LiteralPath (Join-Path $SymbolProject ".env.py") -Encoding utf8
+"function Generated() {}" | Set-Content -LiteralPath (Join-Path $SymbolProject "dist\generated.js") -Encoding utf8
+"def hidden(): pass" | Set-Content -LiteralPath (Join-Path $SymbolProject "secrets\hidden.py") -Encoding utf8
+"CANARY = 'outside-canary'" | Set-Content -LiteralPath (Join-Path $ManualRoot "symbol-outside.py") -Encoding utf8
+1..205 | ForEach-Object { "def symbol_$($_)():`n    pass" } |
+    Set-Content -LiteralPath (Join-Path $SymbolProject "src\many.py") -Encoding utf8
+```
+
+**Command**
+
+```powershell
+$env:SYMBOL_PROJECT = $SymbolProject
+@'
+import json
+import os
+from lunar_forge.tools.registry import create_tool_registry
+
+registry = create_tool_registry(os.environ["SYMBOL_PROJECT"], mode="plan")
+print("available:", "list_symbols" in registry.names())
+for path in (
+    "src/service.py",
+    "src/App.tsx",
+    "src/broken.py",
+    "src/many.py",
+    "notes.txt",
+    ".env.py",
+    "dist/generated.js",
+    "secrets/hidden.py",
+    "../symbol-outside.py",
+):
+    result = registry.execute("list_symbols", {"path": path})
+    print(path, json.dumps(result, indent=2))
+'@ | python -
+Test-Path -LiteralPath (Join-Path $SymbolProject "executed.txt")
+```
+
+**Expected result**
+
+`available` is `True`. Python output includes `load_data`, `Service`, and its
+`run` method with line/container metadata. TSX output includes the functions,
+class, exported constant, and React-component hints. The broken Python and text
+files return clear syntax and unsupported-type errors. `src/many.py` returns at
+most 200 symbols with `truncated: true`. The `.env.py`, `dist`, `secrets`, and
+traversal requests are blocked without returning either canary. `Test-Path` is
+`False`, proving the Python module was parsed but never executed. No approval or
+command tool is requested.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\SYMBOL_PROJECT -ErrorAction SilentlyContinue
+Remove-Item -Force -LiteralPath (Join-Path $ManualRoot "symbol-outside.py")
+Remove-Item -Recurse -Force -LiteralPath $SymbolProject
+```
+
+## Read-only CI configuration summary
+
+**Purpose**
+
+Confirm that `ci_summary` detects supported providers without running CI,
+extracts bounded jobs/runtime/package-manager/command hints, suggests clear
+validation commands, redacts environment and secret values, reports malformed
+YAML safely, and remains available without command tools in plan mode.
+
+**Setup**
+
+```powershell
+$CiProject = Join-Path $ManualRoot "ci-project"
+$NoCiProject = Join-Path $ManualRoot "no-ci-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $CiProject ".github\workflows") | Out-Null
+New-Item -ItemType Directory -Force -Path $NoCiProject | Out-Null
+@'
+name: Quality
+env:
+  PRIVATE_TOKEN: &private_token env-canary-must-not-leak
+jobs:
+  test:
+    name: *private_token
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: |
+          python -m pip install -e .
+          python -m pytest -q
+          npm test
+          API_TOKEN=command-canary-must-not-leak npm run build
+      - run: echo "$(RELEASE_CREDENTIAL)"
+      - run: python -c "from pathlib import Path; Path('executed.txt').write_text('ran')"
+'@ | Set-Content -LiteralPath (Join-Path $CiProject ".github\workflows\quality.yml") -Encoding utf8
+@'
+variables:
+  ACCESS_TOKEN: azure-canary-must-not-leak
+jobs:
+  - job: test
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: "3.12"
+      - script: python -m pytest
+'@ | Set-Content -LiteralPath (Join-Path $CiProject "azure-pipelines.yml") -Encoding utf8
+```
+
+**Command**
+
+```powershell
+$env:CI_PROJECT = $CiProject
+$env:NO_CI_PROJECT = $NoCiProject
+@'
+import json
+import os
+from pathlib import Path
+from lunar_forge.tools.registry import create_tool_registry
+
+empty_registry = create_tool_registry(os.environ["NO_CI_PROJECT"], mode="plan")
+print("empty:", json.dumps(empty_registry.execute("ci_summary", {}), indent=2))
+
+registry = create_tool_registry(os.environ["CI_PROJECT"], mode="plan")
+print("available:", "ci_summary" in registry.names())
+print("command-tools:", sorted(
+    name for name in registry.names()
+    if name in {"run_command", "run_validation"}
+))
+print("valid:", json.dumps(registry.execute("ci_summary", {}), indent=2))
+print("executed:", (Path(os.environ["CI_PROJECT"]) / "executed.txt").exists())
+
+circle = Path(os.environ["CI_PROJECT"]) / ".circleci"
+circle.mkdir()
+(circle / "config.yml").write_text("jobs:\n  build: [\n", encoding="utf-8")
+print("malformed:", json.dumps(registry.execute("ci_summary", {}), indent=2))
+'@ | python -
+```
+
+**Expected result**
+
+The empty result has `ok: true`, `ci_files: []`, and a no-CI message.
+`available` is `True`, while `command-tools` is empty. The valid summary detects
+GitHub Actions and Azure Pipelines, reports their jobs, Python/Node/runner
+hints, pip/npm hints, discovered commands, and safe validation suggestions.
+None of the three canary values appears; the command assignment, YAML-aliased
+environment value, and credential variable reference are redacted. `executed`
+is `False`, proving discovered commands were reported but never run. After
+adding malformed CircleCI YAML, the result has `ok: false`, retains valid
+provider metadata, and includes a bounded CircleCI parse error with line and
+column. No CI command, project command, approval prompt, or session file is
+created.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\CI_PROJECT -ErrorAction SilentlyContinue
+Remove-Item Env:\NO_CI_PROJECT -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force -LiteralPath $CiProject
+Remove-Item -Recurse -Force -LiteralPath $NoCiProject
+```
+
+## Efficient context-tool selection and role boundaries
+
+**Purpose**
+
+Confirm that prompts select the narrowest useful context tool, each subagent
+receives its intended restricted view, and plan mode exposes the read-only
+context suite without mutation or command tools.
+
+**Command**
+
+```powershell
+@'
+from lunar_forge.prompts import build_system_prompt
+from lunar_forge.subagents import (
+    CODER_ROLE,
+    PLANNER_ROLE,
+    REVIEWER_ROLE,
+    SECURITY_ROLE,
+    TESTER_ROLE,
+)
+from lunar_forge.tools.registry import create_tool_registry
+
+project_info = {
+    "languages": ["python"],
+    "frameworks": [],
+    "package_manager": None,
+    "routing": None,
+    "test_command": "pytest",
+    "build_command": None,
+    "is_empty": False,
+}
+prompt = build_system_prompt(project_info, "No extra instructions.", "plan")
+guidance = (
+    "Use read_json for a known JSON",
+    "Use read_yaml for a known YAML",
+    "Use read_many_files only for a small",
+    "prefer list_symbols before reading broad file ranges",
+    "ci_summary before",
+    "Do not call every introspection tool",
+)
+print("guidance:", {text: text in prompt for text in guidance})
+
+context = {
+    "project_health", "dependency_summary", "git_status", "git_diff",
+    "list_changed_files", "read_json", "read_yaml", "read_many_files",
+    "list_symbols", "ci_summary",
+}
+for role in (PLANNER_ROLE, REVIEWER_ROLE, SECURITY_ROLE):
+    print(role.name, "context:", sorted(context & role.allowed_tools))
+    print(role.name, "forbidden:", sorted(
+        {"write_file", "edit_file", "run_command", "run_validation", "git_commit"}
+        & role.allowed_tools
+    ))
+print("tester helpers:", sorted(
+    {
+        "dependency_summary", "ci_summary", "git_status",
+        "list_changed_files", "read_json", "read_yaml", "read_many_files",
+    } & TESTER_ROLE.allowed_tools
+))
+print("coder read helpers:", sorted(
+    {"read_json", "read_yaml", "read_many_files", "list_symbols"}
+    & CODER_ROLE.allowed_tools
+))
+print("coder forbidden:", sorted(
+    {"run_command", "run_validation", "git_commit"} & CODER_ROLE.allowed_tools
+))
+
+registry = create_tool_registry(".", mode="plan")
+print("plan context:", sorted(context & set(registry.names())))
+second_batch = {
+    "read_json", "read_yaml", "read_many_files", "list_symbols", "ci_summary",
+}
+print("second-batch schemas:", [
+    (
+        name,
+        registry.model_name_for(name),
+        registry.get(name).permission.value,
+        registry.get(name).parameters.get("additionalProperties"),
+    )
+    for name in sorted(second_batch)
+])
+print("plan forbidden:", sorted(
+    {
+        "write_file", "edit_file", "replace_lines", "insert_lines",
+        "run_command", "run_validation", "git_commit",
+    } & set(registry.names())
+))
+'@ | python -
+```
+
+**Expected result**
+
+Every guidance check is `True`. Planner, Reviewer, and Security list all ten
+context tools and no forbidden tools. Tester lists the seven validation-context
+helpers; Coder lists the four read helpers and no command, validation, or commit
+tool. `plan context` lists all ten read-only tools. Every second-batch schema
+tuple repeats the exact tool name, reports `read`, and ends in `False`;
+`plan forbidden` is empty. The check does not contact a model, execute Git or
+project commands, write project files, or request approval.
 
 ## 5. Line tools
 

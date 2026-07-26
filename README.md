@@ -328,7 +328,69 @@ fail before a write, every successful change to an existing file creates a
 checkpoint, newline style is preserved when practical, and edit results include
 a bounded unified diff. The mutation tools are not registered in plan mode.
 Coder subagents can use all three tools through their own restricted registry;
-read-only roles receive only the numbered reader.
+read-only roles receive only the numbered line reader.
+
+### Safe structured file readers
+
+Three read-only tools provide compact structured or batched context without
+running project code:
+
+| Tool | Inputs | Result |
+| --- | --- | --- |
+| `read_json(path, max_bytes=None)` | Project-relative path and optional byte cap | Parsed JSON plus bounded top-level keys, or a bounded preview when the cap is reached. Parse failures include line and column. |
+| `read_yaml(path, max_bytes=None)` | Project-relative path and optional byte cap | JSON-serializable data parsed only with `yaml.safe_load`, with the same key, preview, truncation, and parse-location metadata. |
+| `read_many_files(paths, max_bytes_per_file=None, max_total_bytes=None)` | At most 20 known project-relative paths and optional byte caps | Independent text content, line count, truncation, or error for every file; one failure does not discard successful reads. |
+
+All requested and resolved paths pass through project-root confinement.
+`.env`, `.agent`, `.git`, dependency, virtual-environment, cache, build,
+distribution, coverage, key, certificate, PEM, and other credential-looking
+paths are rejected before opening. Common credential directories such as
+`.ssh`, `.aws`, `secrets`, and `credentials` are blocked by the same shared
+guard used by `list_symbols`. Batched reads skip binary and non-UTF-8 files and
+never expand globs or traverse directories. Hard byte, file-count,
+structure-depth, node-count, request-path, and error caps keep direct and
+registry results bounded and JSON-serializable.
+
+The prompt uses `read_json` for known JSON configuration and `read_yaml` for
+known YAML configuration instead of a raw `read_file` dump. It uses
+`read_many_files` only for a small, known related set and never as a repository
+crawler. Planner, Reviewer, and Security receive these tools as read-only
+helpers. Tester receives them for bounded validation-config inspection. Coder
+can also inspect structured inputs, but its existing mutation allowlist is
+unchanged. All three readers are available in plan and no-command modes because
+they neither write nor launch subprocesses.
+
+### Lightweight symbol listing
+
+`list_symbols(path)` locates definitions without importing or executing project
+code. It returns the project-relative path, detected language, a bounded symbol
+list, and a truncation flag:
+
+```text
+list_symbols({"path": "src/service.py"})
+list_symbols({"path": "src/App.tsx"})
+```
+
+Python files are parsed with `ast.parse`. Results distinguish functions, async
+functions, classes, methods, and async methods, and include one-based line
+numbers plus parent containers and qualified names where useful. JavaScript,
+JSX, TypeScript, and TSX use intentionally conservative text matching for named
+function and class declarations, exports, exported constants, and likely React
+components. The JavaScript/TypeScript reader is a locator, not a complete
+language parser.
+
+Source reads are byte-capped and results are limited to 200 symbols. Incomplete
+large Python files are not passed to the AST parser; bounded JS/TS prefixes may
+produce a partial result marked `truncated`. Unsupported extensions and parse
+failures return clear errors with an empty symbol list. The shared structured
+reader safety boundary blocks traversal, secret-looking files, and
+runtime/generated directories before a source file is opened.
+
+Planner, Reviewer, Security, and Coder can use `list_symbols` as a read helper.
+Prompts recommend it before broad reads of large supported source files, followed
+by a focused numbered read around the relevant definition. Known small files and
+already-located definitions do not need an extra symbol call. The tool is
+available in plan and no-command modes and adds no write or command permission.
 
 ### Read-only project intelligence
 
@@ -361,13 +423,85 @@ The agent prompt uses `project_health` plus `dependency_summary` for broad
 review, audit, explanation, onboarding, and feature-planning work, and uses
 dependency metadata before guessing validation commands. Small targeted edits
 continue to inspect only the relevant files. Planner, Reviewer, and Security can
-use all five read-only intelligence tools; Tester receives only the dependency
-and changed-file metadata useful for validation. All remain read-only through
-the central permission registry and are available in plan mode. Provider-facing
+use all five read-only intelligence tools; Tester receives the dependency
+summary, CI summary, Git status, and changed-file metadata useful for validation.
+All remain read-only through the central permission registry and are available
+in plan mode. Provider-facing
 names are normalized and collision-checked by the central registry; these five
 names already satisfy the provider-safe pattern unchanged. The tools return
 provider-neutral dictionaries and contain no LiteLLM, OpenAI, or Anthropic
 translation code—provider adapters remain under `lunar_forge/model_clients/`.
+
+### Read-only CI configuration summary
+
+`ci_summary()` statically inspects these supported CI locations:
+
+```text
+.github/workflows/*.yml
+.github/workflows/*.yaml
+.gitlab-ci.yml
+azure-pipelines.yml
+bitbucket-pipelines.yml
+.circleci/config.yml
+```
+
+The result lists detected files and providers, bounded workflows and jobs,
+runtime/setup hints, package-manager hints, commands found in `run` or `script`
+fields, and clear validation commands when they can be suggested safely. An
+empty project returns `ok: true`, `ci_files: []`, and a no-CI message.
+Malformed or oversized YAML produces bounded per-file parse errors while
+preserving metadata from valid sibling files.
+
+CI files are parsed only with `yaml.safe_load`; no workflow, task, script, or
+project code is executed. `env`, `variables`, secrets, arbitrary task inputs,
+and raw YAML are never returned. Environment literals are collected only for
+redaction so YAML aliases cannot surface their values through job names,
+commands, or other reported hints. Extracted command metadata reuses the
+dependency summary's credential sanitizer and adds CI expression, shell/Azure
+environment reference, authorization-header, and embedded-credential
+redaction. File, byte, workflow, job, command, hint, sensitive-value, error,
+label, and traversal limits keep results compact and JSON-serializable.
+
+Planner and Tester prefer `ci_summary` when supported CI configuration exists
+and before inventing validation commands that should align with CI. Reviewer
+and Security use it only for relevant release-readiness or CI-security work. It
+complements `dependency_summary` rather than duplicating manifest parsing. The
+tool remains available in plan and no-command modes, and every discovered
+command is only a read-only hint until the normal command approval path
+authorizes execution.
+
+The central registry exposes the exact provider-safe names `read_json`,
+`read_yaml`, `read_many_files`, `list_symbols`, and `ci_summary`. Their schemas
+reject additional properties, bound path lengths and batch sizes, describe
+defaults and numeric limits, and register every tool with read permission.
+Provider translation remains isolated under `lunar_forge/model_clients/`.
+
+### Efficient context-tool selection
+
+The context tools are a menu, not a checklist:
+
+- Use `read_json` for JSON configuration and `read_yaml` for YAML configuration
+  instead of raw whole-file reads.
+- Use `read_many_files` only after identifying a small, known set of related
+  files.
+- Use `list_symbols` before reading a large supported source file when the
+  definition location is unknown, then read a focused numbered range.
+- Use `dependency_summary` for uncertain validation selection and `ci_summary`
+  before inventing commands when supported CI configuration exists.
+- Keep tiny, already-located edits narrow; do not call every introspection tool.
+
+For example, validation planning in a project with
+`.github/workflows/checks.yml` should use `dependency_summary()` and
+`ci_summary()` to discover the declared checks, then inspect only the relevant
+config with `read_yaml`; it should not begin by dumping every manifest and
+source file.
+
+Planner, Reviewer, and Security receive the complete read-only context suite.
+Tester receives dependency, CI, Git-status, changed-file, and structured-config
+helpers alongside its existing permission-gated validation tools. Coder
+receives the structured readers and `list_symbols` alongside its existing edit
+tools, but no Git commit, shell-command, or validation permission. Plan mode
+exposes the safe context suite while omitting every mutation and command tool.
 
 ### Optional subagent mode
 

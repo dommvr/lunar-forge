@@ -729,6 +729,11 @@ def _sanitize(value: str) -> str:
     return _API_KEY.sub("[REDACTED]", sanitized)
 
 
+def sanitize_command_metadata(value: str) -> str:
+    """Redact common credential shapes from bounded command metadata."""
+    return _sanitize(value)
+
+
 def _bounded_mapping(
     values: Mapping[str, str],
     limit: int,
@@ -818,4 +823,4 @@ def _stable_unique(values: Iterable[str]) -> list[str]:
     return result
 
 
-__all__ = ["dependency_summary"]
+__all__ = ["dependency_summary", "sanitize_command_metadata"]

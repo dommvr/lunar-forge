@@ -82,7 +82,7 @@ Completed docs/examples/Git feature wave:
 39. Add opt-in Git commit support with safe status/diff checks and approval.
 40. Run a hardening and documentation pass for docs, examples, and Git commit support.
 
-Next feature wave, in order:
+Completed project intelligence feature wave:
 
 41. Add built-in project intelligence tools:
     * `project_health`
@@ -93,6 +93,22 @@ Next feature wave, in order:
 42. Teach the agent and subagents to use these tools efficiently instead of dumping unnecessary context.
 43. Improve final summaries, review flows, and commit proposals using project-health, dependency, Git status, diff, and changed-file data.
 44. Run a hardening and documentation pass for the new tools.
+
+Next feature wave, in order:
+
+45. Add second-batch read-only context tools:
+    * `read_json`
+    * `read_yaml`
+    * `read_many_files`
+    * `list_symbols`
+    * `ci_summary`
+46. Teach the agent and subagents to use these tools efficiently:
+    * prefer `read_json` and `read_yaml` over raw config dumps,
+    * prefer `read_many_files` for several small targeted files,
+    * prefer `list_symbols` before reading large source files,
+    * prefer `ci_summary` when choosing validation commands.
+47. Integrate `ci_summary` and structured readers into planning, testing, review, security checks, and final summaries where useful.
+48. Run a hardening and documentation pass for the second-batch tools.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -177,6 +193,9 @@ lunar-forge/
       project_health.py
       git.py
       dependencies.py
+      structured_readers.py
+      symbols.py
+      ci.py
 
     runtime/
       __init__.py
@@ -402,6 +421,11 @@ dependency_summary
 git_status
 git_diff
 list_changed_files
+read_json
+read_yaml
+read_many_files
+list_symbols
+ci_summary
 run_validation
 run_browser_validation
 ```
@@ -913,6 +937,156 @@ The agent should use these tools deliberately:
 
 ---
 
+## Structured reading, symbol, and CI tools
+
+Add read-only built-in tools that reduce raw context dumps and improve code navigation.
+
+Second-batch tools:
+
+```text
+read_json(path, max_bytes?)
+read_yaml(path, max_bytes?)
+read_many_files(paths, max_bytes_per_file?, max_total_bytes?)
+list_symbols(path)
+ci_summary()
+```
+
+### `read_json`
+
+Purpose:
+
+* safely read and parse JSON files inside the project root,
+* return structured data, top-level keys, and parse errors without dumping huge raw files.
+
+Rules:
+
+* Read-only.
+* Use `safe_path`.
+* Refuse paths outside the project root.
+* Do not read obvious secret files or runtime folders.
+* Bound file size and returned data.
+* For huge arrays or objects, return a preview, counts, and truncation metadata.
+* Return clear parse errors with line/column details when available.
+
+Use when:
+
+* inspecting `package.json`, `tsconfig.json`, config JSON, or project metadata,
+* choosing scripts, dependencies, or validation commands,
+* avoiding raw JSON dumps in model context.
+
+### `read_yaml`
+
+Purpose:
+
+* safely read and parse YAML files inside the project root,
+* return structured data, top-level keys, and parse errors without dumping huge raw files.
+
+Rules:
+
+* Read-only.
+* Use `safe_path`.
+* Use `yaml.safe_load`; never execute custom YAML constructors.
+* Do not read obvious secret files or runtime folders.
+* Bound file size and returned data.
+* Return clear parse errors with line/column details when available.
+
+Use when:
+
+* inspecting `.agent/config.yaml`, `.agent/mcp.yaml`, plugin manifests, CI YAML, Docker Compose, or GitHub Actions workflows,
+* validating config shape before editing,
+* avoiding raw YAML dumps in model context.
+
+### `read_many_files`
+
+Purpose:
+
+* batch-read several small, targeted files in one tool call,
+* reduce round trips when the agent already knows exactly which files matter.
+
+Rules:
+
+* Read-only.
+* Use `safe_path` for every path.
+* Cap file count, bytes per file, and total returned bytes.
+* Skip binary files and return a per-file error instead of failing the whole request.
+* Preserve per-file metadata: path, line count, truncated flag, and error when present.
+* Do not use this tool to dump entire projects.
+
+Use when:
+
+* reading a small set such as `README.md`, `pyproject.toml`, and `AGENTS.md`,
+* reviewing a known changed-file set,
+* gathering context after `list_changed_files` or `git_diff` identifies relevant paths.
+
+### `list_symbols`
+
+Purpose:
+
+* provide lightweight code navigation without a full language server,
+* list functions, classes, exports, and likely React components with line numbers.
+
+Rules:
+
+* Read-only.
+* Do not execute project code.
+* For Python, prefer `ast` parsing.
+* For JavaScript/TypeScript/JSX/TSX, use conservative text parsing first.
+* Return symbols with kind, name, start line, end line when practical, and parent/container when known.
+* Fail gracefully for unsupported file types.
+
+Use when:
+
+* locating functions/classes/components before editing,
+* reviewing large files,
+* deciding which line ranges to read with `read_file_with_line_numbers`,
+* avoiding unnecessary full-file reads.
+
+### `ci_summary`
+
+Purpose:
+
+* summarize CI configuration and extract likely validation/build/test commands.
+
+Inspect:
+
+```text
+.github/workflows/*.yml
+.github/workflows/*.yaml
+.gitlab-ci.yml
+azure-pipelines.yml
+bitbucket-pipelines.yml
+.circleci/config.yml
+```
+
+Rules:
+
+* Read-only.
+* Parse YAML safely when possible and fall back to bounded text snippets if parsing fails.
+* Do not run CI commands.
+* Return workflow names, jobs, runtimes, package-manager hints, and commands.
+* If no CI exists, return `ok: true` with an empty summary and clear message.
+
+Use when:
+
+* choosing validation commands,
+* reviewing release readiness,
+* planning changes in projects with CI,
+* checking whether local validation should mirror CI.
+
+### Efficient use of structured readers and navigation tools
+
+The agent should use these tools deliberately:
+
+* Prefer `read_json` for JSON config over `read_file`.
+* Prefer `read_yaml` for YAML config over `read_file`.
+* Prefer `read_many_files` only when a small known set of files is needed.
+* Prefer `list_symbols` before reading large source files or searching for definitions.
+* Prefer `ci_summary` before inventing validation commands in projects with CI.
+* Do not call all tools on every prompt. Small targeted edits should stay small.
+* Do not let structured readers bypass secret, runtime, or project-root restrictions.
+
+---
+
 ## Plan mode
 
 `--plan` mode must inspect but not modify.
@@ -1150,12 +1324,19 @@ Allowed tools:
 list_dir
 read_file
 read_file_with_line_numbers
+read_json
+read_yaml
+read_many_files
+list_symbols
 grep
 glob
 detect_project
 project_health
 dependency_summary
+ci_summary
 git_status
+git_diff
+list_changed_files
 ```
 
 Blocked tools:
@@ -1182,11 +1363,18 @@ Allowed tools:
 ```text
 list_dir
 read_file
+read_file_with_line_numbers
+read_json
+read_yaml
+read_many_files
+list_symbols
 grep
 glob
 create_dir
 write_file
 edit_file
+replace_lines
+insert_lines
 ```
 
 Commands should generally remain delegated to the tester.
@@ -1205,10 +1393,15 @@ Allowed tools:
 ```text
 read_file
 read_file_with_line_numbers
+read_json
+read_yaml
+read_many_files
+list_symbols
 grep
 glob
 project_health
 dependency_summary
+ci_summary
 git_status
 git_diff
 list_changed_files
@@ -1231,8 +1424,12 @@ run_command
 run_validation
 read_file
 read_file_with_line_numbers
+read_json
+read_yaml
+read_many_files
 grep
 dependency_summary
+ci_summary
 git_status
 list_changed_files
 ```
@@ -1248,9 +1445,15 @@ Allowed tools:
 ```text
 read_file
 read_file_with_line_numbers
+read_json
+read_yaml
+read_many_files
+list_symbols
 grep
 glob
 project_health
+dependency_summary
+ci_summary
 git_status
 git_diff
 list_changed_files
@@ -1269,6 +1472,13 @@ Purpose:
 Allowed tools:
 
 ```text
+list_dir
+read_file
+read_json
+read_yaml
+read_many_files
+dependency_summary
+ci_summary
 create_dir
 write_file
 run_command
@@ -1574,6 +1784,7 @@ Manual testing docs should include:
 * parallel subagents,
 * Git commit support,
 * project intelligence tools: `project_health`, `dependency_summary`, `git_status`, `git_diff`, and `list_changed_files`.
+* structured context tools: `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, and `ci_summary`.
 
 Each manual test should include:
 
@@ -1640,6 +1851,11 @@ Test expectations:
 * project detection recognizes Vite/React projects.
 * dangerous commands are blocked.
 * plan mode blocks writes.
+* `read_json` and `read_yaml` parse valid config and report bounded parse errors.
+* `read_many_files` reads only safe, bounded, non-binary project files.
+* `list_symbols` reports Python functions/classes and JavaScript/TypeScript symbols without executing code.
+* `ci_summary` extracts CI jobs and commands without running them.
+* Structured readers and symbol tools cannot escape the project root or read obvious secret/runtime files.
 
 Run tests with:
 

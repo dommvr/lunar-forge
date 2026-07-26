@@ -127,9 +127,14 @@ def test_plan_and_no_command_modes_block_command_execution(tmp_path):
     read_only_intelligence_tools = {
         "project_health",
         "dependency_summary",
+        "ci_summary",
         "git_status",
         "git_diff",
         "list_changed_files",
+        "list_symbols",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
     }
     assert read_only_intelligence_tools.issubset(plan_registry.names())
     assert read_only_intelligence_tools.issubset(

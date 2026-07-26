@@ -11,8 +11,12 @@ _ALLOWED_TOOLS = frozenset(
         "run_managed_browser_validation",
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
         "grep",
         "dependency_summary",
+        "ci_summary",
         "git_status",
         "list_changed_files",
     }
@@ -27,9 +31,14 @@ TESTER_ROLE = SubagentRole(
     system_prompt_fragment=(
         "Act as the tester. Use the existing permission-gated command tools for "
         "focused validation. Use dependency_summary before selecting commands when "
-        "the validation route is unclear, and use list_changed_files when it helps "
-        "focus validation or failure inspection. Git status metadata should only "
-        "narrow the work. For application-detected browser "
+        "the validation route is unclear. When CI configuration exists, prefer "
+        "ci_summary before inventing or choosing commands so local checks align "
+        "with CI. Use read_json for relevant JSON configuration and read_yaml for "
+        "relevant YAML configuration instead of raw read_file. Use read_many_files "
+        "only for a small known set of related validation files. Use "
+        "list_changed_files when it helps focus validation or failure inspection. "
+        "Git status metadata should only narrow the work. For application-detected "
+        "browser "
         "intent, use available "
         "Playwright MCP tools or the built-in browser validation tool requested by "
         "the routing context instead of ordinary run_validation. Report whether "

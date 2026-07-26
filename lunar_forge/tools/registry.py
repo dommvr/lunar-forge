@@ -15,6 +15,7 @@ from lunar_forge.permissions import (
     PermissionLevel,
     PermissionManager,
 )
+from lunar_forge.tools.ci import ci_summary
 from lunar_forge.tools.dependencies import dependency_summary
 from lunar_forge.tools.files import (
     create_dir,
@@ -34,6 +35,20 @@ from lunar_forge.tools.git import (
 from lunar_forge.tools.project_health import project_health
 from lunar_forge.tools.search import glob_files, grep
 from lunar_forge.tools.shell import run_command
+from lunar_forge.tools.symbols import list_symbols
+from lunar_forge.tools.structured_readers import (
+    DEFAULT_MANY_BYTES_PER_FILE,
+    DEFAULT_MANY_TOTAL_BYTES,
+    DEFAULT_STRUCTURED_MAX_BYTES,
+    MAX_MANY_BYTES_PER_FILE,
+    MAX_MANY_FILES,
+    MAX_MANY_TOTAL_BYTES,
+    MAX_REQUEST_PATH_CHARACTERS,
+    MAX_STRUCTURED_MAX_BYTES,
+    read_json,
+    read_many_files,
+    read_yaml,
+)
 
 
 if TYPE_CHECKING:
@@ -387,6 +402,127 @@ def create_read_only_registry(
                 handler=partial(read_file_with_line_numbers, project_root),
             ),
             Tool(
+                name="read_json",
+                description=(
+                    "Safely parse one bounded project JSON file. Secret-looking, "
+                    "runtime, and generated paths are blocked."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REQUEST_PATH_CHARACTERS,
+                            "description": "Project-relative JSON file path.",
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_STRUCTURED_MAX_BYTES,
+                            "description": "Maximum file bytes to read.",
+                            "default": DEFAULT_STRUCTURED_MAX_BYTES,
+                        },
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=partial(read_json, project_root),
+            ),
+            Tool(
+                name="read_yaml",
+                description=(
+                    "Safely parse one bounded project YAML file with safe_load. "
+                    "Secret-looking, runtime, and generated paths are blocked."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REQUEST_PATH_CHARACTERS,
+                            "description": "Project-relative YAML file path.",
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_STRUCTURED_MAX_BYTES,
+                            "description": "Maximum file bytes to read.",
+                            "default": DEFAULT_STRUCTURED_MAX_BYTES,
+                        },
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=partial(read_yaml, project_root),
+            ),
+            Tool(
+                name="read_many_files",
+                description=(
+                    "Read a small bounded set of related UTF-8 project files. "
+                    "Returns independent per-file results and skips binary, "
+                    "secret-looking, runtime, and generated paths."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_REQUEST_PATH_CHARACTERS,
+                            },
+                            "minItems": 1,
+                            "maxItems": MAX_MANY_FILES,
+                            "description": (
+                                "Small list of project-relative text file paths."
+                            ),
+                        },
+                        "max_bytes_per_file": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_MANY_BYTES_PER_FILE,
+                            "description": "Maximum bytes returned per file.",
+                            "default": DEFAULT_MANY_BYTES_PER_FILE,
+                        },
+                        "max_total_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_MANY_TOTAL_BYTES,
+                            "description": "Maximum bytes returned across files.",
+                            "default": DEFAULT_MANY_TOTAL_BYTES,
+                        },
+                    },
+                    "required": ["paths"],
+                    "additionalProperties": False,
+                },
+                handler=partial(read_many_files, project_root),
+            ),
+            Tool(
+                name="list_symbols",
+                description=(
+                    "List bounded definitions and line numbers from one Python, "
+                    "JavaScript, JSX, TypeScript, or TSX source file without "
+                    "executing project code."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_REQUEST_PATH_CHARACTERS,
+                            "description": "Project-relative source file path.",
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=partial(list_symbols, project_root),
+            ),
+            Tool(
                 name="grep",
                 description="Search project files with a regular expression.",
                 parameters={
@@ -440,6 +576,20 @@ def create_read_only_registry(
                     project_root,
                     allow_git=allow_git_inspection,
                 ),
+            ),
+            Tool(
+                name="ci_summary",
+                description=(
+                    "Return a bounded, redacted summary of supported CI YAML "
+                    "providers, jobs, runtime hints, package managers, and "
+                    "validation commands without executing CI."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                handler=partial(ci_summary, project_root),
             ),
             Tool(
                 name="dependency_summary",

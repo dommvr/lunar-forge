@@ -39,10 +39,15 @@ EXPECTED_ALLOWED_TOOLS = {
         "list_dir",
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
         "grep",
         "glob",
         "detect_project",
         "project_health",
+        "ci_summary",
         "dependency_summary",
         "git_status",
         "git_diff",
@@ -52,6 +57,10 @@ EXPECTED_ALLOWED_TOOLS = {
         "list_dir",
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
         "grep",
         "glob",
         "create_dir",
@@ -63,9 +72,14 @@ EXPECTED_ALLOWED_TOOLS = {
     "reviewer": {
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
         "grep",
         "glob",
         "project_health",
+        "ci_summary",
         "dependency_summary",
         "git_status",
         "git_diff",
@@ -78,17 +92,26 @@ EXPECTED_ALLOWED_TOOLS = {
         "run_managed_browser_validation",
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
         "grep",
         "dependency_summary",
+        "ci_summary",
         "git_status",
         "list_changed_files",
     },
     "security": {
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
         "grep",
         "glob",
         "project_health",
+        "ci_summary",
         "dependency_summary",
         "git_status",
         "git_diff",
@@ -116,6 +139,7 @@ def test_role_definitions_have_explicit_deny_by_default_tool_sets():
 
 def test_role_prompts_use_project_intelligence_deliberately():
     planner = PLANNER_ROLE.system_prompt_fragment
+    coder = CODER_ROLE.system_prompt_fragment
     reviewer = REVIEWER_ROLE.system_prompt_fragment
     tester = TESTER_ROLE.system_prompt_fragment
     security = SECURITY_ROLE.system_prompt_fragment
@@ -125,19 +149,43 @@ def test_role_prompts_use_project_intelligence_deliberately():
     assert "tiny single-file edit" in planner
     assert "git_status and list_changed_files" in planner
     assert "git_diff only when changed-file details are needed" in planner
+    assert "read_json for known JSON configuration" in planner
+    assert "read_yaml for known YAML configuration instead of raw read_file" in planner
+    assert "read_many_files only for a small, known set" in planner
+    assert "list_symbols before reading a large source file" in planner
+    assert "prefer ci_summary before finalizing validation" in planner
+    assert "every introspection tool for a tiny single-file edit" in planner
+    assert "read_json for known JSON configuration" in coder
+    assert "read_yaml for known YAML configuration instead of raw read_file" in coder
+    assert "read_many_files only for a small known set" in coder
+    assert "list_symbols before reading a large source file" in coder
     assert (
         "git_status and list_changed_files before opening review files"
         in reviewer
     )
     assert "git_diff only" in reviewer
     assert "Do not reread the whole project" in reviewer
+    assert "read_json for relevant JSON configuration" in reviewer
+    assert "read_yaml for relevant YAML configuration instead of raw read_file" in reviewer
+    assert "read_many_files only for a small known set" in reviewer
+    assert "list_symbols before a large source read" in reviewer
+    assert "release-readiness reviews with CI configuration" in reviewer
     assert "dependency_summary before selecting commands" in tester
+    assert "prefer ci_summary before inventing or choosing commands" in tester
+    assert "read_json for relevant JSON configuration" in tester
+    assert "read_yaml for relevant YAML configuration instead of raw read_file" in tester
+    assert "read_many_files only for a small known set" in tester
     assert "list_changed_files when it helps" in tester
     assert "focus validation or failure inspection" in tester
     assert "project_health and dependency_summary" in security
     assert "git_status and list_changed_files" in security
     assert "suspicious tracked runtime" in security
     assert "git_diff only" in security
+    assert "read_json for relevant non-secret JSON" in security
+    assert "read_yaml for relevant non-secret YAML configuration" in security
+    assert "read_many_files only for a small known set" in security
+    assert "list_symbols to locate relevant definitions" in security
+    assert "CI or release-security reviews" in security
 
 
 def test_restricted_registry_exposes_only_role_allowlisted_tools():
@@ -175,6 +223,89 @@ def test_planner_can_use_git_diff_and_list_changed_files():
     (PLANNER_ROLE, REVIEWER_ROLE, SECURITY_ROLE),
     ids=lambda role: role.name,
 )
+def test_read_only_roles_can_use_structured_readers(role):
+    registry, calls = _registry_with_all_known_tools()
+    restricted = role.restrict(registry)
+
+    for tool_name, arguments in (
+        ("read_json", {"path": "package.json"}),
+        ("read_yaml", {"path": "config.yaml"}),
+        ("read_many_files", {"paths": ["README.md"]}),
+        ("list_symbols", {"path": "app.py"}),
+        ("ci_summary", {}),
+    ):
+        assert restricted.execute(tool_name, arguments)["ok"] is True
+
+    assert calls == [
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
+        "ci_summary",
+    ]
+    assert {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+    }.isdisjoint(restricted.names())
+
+
+def test_tester_has_ci_and_bounded_structured_validation_helpers():
+    assert {
+        "dependency_summary",
+        "ci_summary",
+        "git_status",
+        "list_changed_files",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+    }.issubset(TESTER_ROLE.allowed_tools)
+    assert {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+        "git_commit",
+    }.isdisjoint(TESTER_ROLE.allowed_tools)
+
+
+def test_coder_gains_only_structured_and_symbol_read_helpers():
+    assert {
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
+    }.issubset(
+        CODER_ROLE.allowed_tools
+    )
+    assert CODER_ROLE.allowed_tools & {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+    } == {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+    }
+    assert {
+        "run_command",
+        "run_validation",
+        "git_commit",
+    }.isdisjoint(CODER_ROLE.allowed_tools)
+
+
+@pytest.mark.parametrize(
+    "role",
+    (PLANNER_ROLE, REVIEWER_ROLE, SECURITY_ROLE),
+    ids=lambda role: role.name,
+)
 def test_read_only_roles_cannot_mutate_files_or_commit(role):
     calls = []
 
@@ -201,6 +332,20 @@ def test_read_only_roles_cannot_mutate_files_or_commit(role):
                 handler=handler("git_commit"),
                 permission=PermissionLevel.EXECUTE,
             ),
+            Tool(
+                name="run_command",
+                description="Run a command.",
+                parameters={"type": "object"},
+                handler=handler("run_command"),
+                permission=PermissionLevel.EXECUTE,
+            ),
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=handler("run_validation"),
+                permission=PermissionLevel.EXECUTE,
+            ),
         )
     )
     restricted = role.restrict(registry)
@@ -213,11 +358,20 @@ def test_read_only_roles_cannot_mutate_files_or_commit(role):
         "git_commit",
         {"message": "Blocked"},
     )
+    command_result = restricted.execute(
+        "run_command",
+        {"command": "pytest"},
+    )
+    validation_result = restricted.execute("run_validation", {})
 
     assert write_result["ok"] is False
     assert write_result["blocked_by_subagent"] is True
     assert commit_result["ok"] is False
     assert commit_result["blocked_by_subagent"] is True
+    assert command_result["ok"] is False
+    assert command_result["blocked_by_subagent"] is True
+    assert validation_result["ok"] is False
+    assert validation_result["blocked_by_subagent"] is True
     assert calls == []
 
 
@@ -1451,6 +1605,11 @@ def test_subagent_plan_mode_runs_only_planner_without_writing(tmp_path):
         "git_status",
         "git_diff",
         "list_changed_files",
+        "ci_summary",
+        "list_symbols",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
     }.issubset(model.calls[0]["tools"])
     assert {
         "create_dir",

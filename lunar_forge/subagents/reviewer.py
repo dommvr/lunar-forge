@@ -7,9 +7,14 @@ _ALLOWED_TOOLS = frozenset(
     {
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
         "grep",
         "glob",
         "project_health",
+        "ci_summary",
         "dependency_summary",
         "git_status",
         "git_diff",
@@ -31,7 +36,14 @@ REVIEWER_ROLE = SubagentRole(
         "when relevant changed-file details are needed. Do not reread the whole "
         "project when changed-file data is enough. Use project_health and "
         "dependency_summary early when the review needs a broad repository "
-        "overview. Validation "
+        "overview. Use read_json for relevant JSON configuration and read_yaml for "
+        "relevant YAML configuration instead of raw read_file. Use read_many_files "
+        "only for a small known set of related changed text files. "
+        "For release-readiness reviews with CI configuration, use ci_summary to "
+        "check declared jobs before inventing validation commands. "
+        "Use list_symbols before a large source read when definitions must be "
+        "located, then inspect only relevant ranges. "
+        "Validation "
         "status belongs to tester and tool results. In parallel mode the tester may "
         "still be running. Do not make global browser-validation status claims or "
         "claims about whether screenshots, console errors, failed requests, page "

@@ -6,7 +6,13 @@ from lunar_forge.prompts import (
     build_system_prompt,
     detect_browser_intent,
 )
-from lunar_forge.subagents import CODER_ROLE, PLANNER_ROLE, TESTER_ROLE
+from lunar_forge.subagents import (
+    CODER_ROLE,
+    PLANNER_ROLE,
+    REVIEWER_ROLE,
+    SECURITY_ROLE,
+    TESTER_ROLE,
+)
 from lunar_forge.tools.registry import create_tool_registry
 
 
@@ -43,6 +49,17 @@ def test_system_prompt_requires_inspection_and_planning_before_edits():
     assert "start with project_health and dependency_summary" in prompt
     assert "call dependency_summary" in prompt
     assert "tiny targeted edit" in prompt
+    assert "Use read_json for a known JSON" in prompt
+    assert "Use read_yaml for a known YAML" in prompt
+    assert "instead of raw\n  read_file" in prompt
+    assert "Use read_many_files only for a small" in prompt
+    assert "Never try another tool to bypass" in prompt
+    assert "prefer list_symbols before reading broad file ranges" in prompt
+    assert "Skip list_symbols" in prompt
+    assert "call ci_summary before" in prompt
+    assert "inventing or finalizing validation commands" in prompt
+    assert "Do not call ci_summary when" in prompt
+    assert "Do not call every introspection tool for\n  every small task" in prompt
 
 
 def test_system_prompt_scales_project_intelligence_to_the_task():
@@ -196,21 +213,39 @@ def test_plan_prompt_and_registry_remain_read_only(tmp_path):
     assert "Do not call mutation, command, or validation tools" in prompt
     assert schema_names == {
         "dependency_summary",
+        "ci_summary",
         "git_diff",
         "git_status",
         "glob",
         "grep",
         "list_dir",
         "list_changed_files",
+        "list_symbols",
         "project_health",
         "read_file",
         "read_file_with_line_numbers",
+        "read_json",
+        "read_many_files",
+        "read_yaml",
     }
     assert "write_file" not in registry.names()
     assert "replace_lines" not in registry.names()
     assert "insert_lines" not in registry.names()
     assert "run_command" not in registry.names()
     assert "run_validation" not in registry.names()
+
+    write_result = registry.execute(
+        "write_file",
+        {"path": "should-not-exist.txt", "content": "blocked"},
+    )
+    command_result = registry.execute(
+        "run_command",
+        {"command": "python -c \"print('must not run')\""},
+    )
+
+    assert write_result["ok"] is False
+    assert command_result["ok"] is False
+    assert not (tmp_path / "should-not-exist.txt").exists()
 
 
 def test_existing_read_and_execution_tools_remain_available(tmp_path):
@@ -279,12 +314,32 @@ def test_subagent_handoff_is_bounded_and_cannot_expand_permissions():
 
 def test_subagent_handoffs_include_role_specific_intelligence_guidance():
     planner = build_subagent_user_prompt("Plan a feature", PLANNER_ROLE)
+    coder = build_subagent_user_prompt("Implement a feature", CODER_ROLE)
     tester = build_subagent_user_prompt("Validate a feature", TESTER_ROLE)
+    reviewer = build_subagent_user_prompt("Review a feature", REVIEWER_ROLE)
+    security = build_subagent_user_prompt("Audit a feature", SECURITY_ROLE)
 
     assert "broad review, onboarding, or feature planning" in planner
     assert "dependency_summary before" in planner
     assert "tiny single-file tasks narrowly scoped" in planner
+    assert "instead of calling every introspection tool" in planner
     assert "git_status and list_changed_files" in planner
     assert "git_diff only when changed-file details are needed" in planner
+    assert "Use read_json for known JSON configuration" in planner
+    assert "read_yaml for known YAML configuration instead of raw read_file" in planner
+    assert "batch only a small related file set" in planner
+    assert "list_symbols before broad reads" in planner
+    assert "CI configuration exists, use ci_summary before inventing" in planner
+    assert "Use read_json for known JSON configuration" in coder
+    assert "read_many_files only for a small known related file set" in coder
+    assert "list_symbols before broad reads" in coder
     assert "dependency_summary before guessing uncertain commands" in tester
+    assert "ci_summary before inventing validation commands" in tester
+    assert "Use read_json for relevant JSON configuration" in tester
+    assert "read_many_files only for a small known set" in tester
     assert "list_changed_files when it helps focus validation" in tester
+    assert "Use read_json for relevant JSON configuration" in reviewer
+    assert "read_many_files only for a small known changed-file set" in reviewer
+    assert "list_symbols before broad reads" in reviewer
+    assert "Use read_json for relevant non-secret JSON configuration" in security
+    assert "read_many_files only for a small known set" in security
