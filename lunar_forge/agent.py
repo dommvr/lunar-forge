@@ -18,6 +18,7 @@ from lunar_forge.mcp.registry import register_mcp_tools
 from lunar_forge.model_clients import (
     ModelClient,
     ModelResponse,
+    ModelUsage,
     ToolCall,
     create_model_client,
 )
@@ -43,7 +44,11 @@ from lunar_forge.runtime.git import (
     derive_commit_message,
     format_git_commit_result,
 )
-from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
+from lunar_forge.runtime.sessions import (
+    SessionLogger,
+    create_session_logger,
+    format_model_usage_totals,
+)
 from lunar_forge.subagents import (
     RestrictedToolRegistry,
     SubagentOrchestrator,
@@ -65,6 +70,7 @@ MAX_COMMAND_EXECUTION_RECORDS = 50
 MAX_RECORDED_COMMAND_CHARACTERS = 500
 MAX_FINAL_CHANGED_FILES = 100
 MAX_FINAL_CHANGED_PATH_CHARACTERS = 500
+TOKEN_ESTIMATE_CHARACTERS_PER_TOKEN = 4
 FINAL_SUMMARY_SECTION_NAMES = frozenset(
     {
         "changed files",
@@ -236,6 +242,7 @@ class CodeAgent:
         use_subagents: bool | None = None,
         offer_commit: bool = False,
         commit_message: str | None = None,
+        show_usage: bool = False,
     ) -> str:
         """Run the permission-gated model/tool loop until final text."""
         root = Path(project_root).expanduser().resolve()
@@ -383,6 +390,7 @@ class CodeAgent:
                     final_output,
                     session,
                     normalized_mode,
+                    show_usage=show_usage,
                 )
 
             messages: list[dict[str, Any]] = [
@@ -421,6 +429,15 @@ class CodeAgent:
 
             for step in range(self.max_steps):
                 response = model_client.complete(messages, tool_schemas)
+                _log_model_usage(
+                    session,
+                    response,
+                    messages=messages,
+                    tool_schemas=tool_schemas,
+                    step=step,
+                    phase="agent",
+                    role="agent",
+                )
                 _log_session(
                     session,
                     "assistant_message",
@@ -529,7 +546,12 @@ class CodeAgent:
                         offer_commit=offer_commit,
                         commit_message=commit_message,
                     )
-                    return _append_session_note(final_text, session, normalized_mode)
+                    return _append_session_note(
+                        final_text,
+                        session,
+                        normalized_mode,
+                        show_usage=show_usage,
+                    )
                 raise AgentError("Model returned neither text nor tool calls.")
 
             raise AgentError(f"Agent reached the maximum of {self.max_steps} steps.")
@@ -1152,6 +1174,16 @@ def _run_subagent_model_loop(
     validation_evidence = ValidationEvidence()
     for step in range(max_steps):
         response = model_client.complete(messages, tool_schemas)
+        _log_model_usage(
+            session,
+            response,
+            messages=messages,
+            tool_schemas=tool_schemas,
+            step=step,
+            phase=phase,
+            role=role.name,
+            parallel_group_id=parallel_group_id,
+        )
         _log_session(
             session,
             "assistant_message",
@@ -1300,6 +1332,7 @@ def run_agent(
     plugin_resolver: EntrypointResolver | None = None,
     offer_commit: bool = False,
     commit_message: str | None = None,
+    show_usage: bool = False,
 ) -> str:
     """Convenience entry point used by the CLI."""
     root = Path(project_root).expanduser().resolve()
@@ -1321,6 +1354,7 @@ def run_agent(
         use_subagents=use_subagents,
         offer_commit=offer_commit,
         commit_message=commit_message,
+        show_usage=show_usage,
     )
 
 
@@ -1346,6 +1380,151 @@ def _log_session(
     except Exception:
         # Session telemetry must never interrupt the coding-agent workflow.
         return
+
+
+def _log_model_usage(
+    session: SessionLogger | None,
+    response: ModelResponse,
+    *,
+    messages: Sequence[Mapping[str, Any]],
+    tool_schemas: Sequence[Mapping[str, Any]],
+    step: int,
+    phase: str,
+    role: str,
+    parallel_group_id: str | None = None,
+) -> None:
+    if session is None:
+        return
+
+    context_components = _context_component_estimates(
+        messages,
+        tool_schemas,
+        response,
+    )
+    usage = response.usage or ModelUsage(
+        input_tokens=(
+            context_components["messages_token_estimate"]
+            + context_components["tool_schemas_token_estimate"]
+        ),
+        output_tokens=context_components["response_token_estimate"],
+        total_tokens=(
+            context_components["messages_token_estimate"]
+            + context_components["tool_schemas_token_estimate"]
+            + context_components["response_token_estimate"]
+        ),
+        model=response.model,
+        provider=_provider_from_model(response.model),
+        phase=phase,
+        role=role,
+        exact=False,
+    )
+    _log_session(
+        session,
+        "model_usage",
+        step=step,
+        phase=phase or usage.phase,
+        role=role or usage.role,
+        parallel_group_id=parallel_group_id,
+        model=usage.model or response.model,
+        provider=usage.provider or _provider_from_model(response.model),
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        exact=usage.exact,
+        estimated=not usage.exact,
+        usage_source="provider" if usage.exact else "estimate",
+        messages_count=len(messages),
+        tool_schema_count=len(tool_schemas),
+        context_estimate_method="characters_divided_by_4_rounded_up",
+        context_components=context_components,
+    )
+
+
+def _context_component_estimates(
+    messages: Sequence[Mapping[str, Any]],
+    tool_schemas: Sequence[Mapping[str, Any]],
+    response: ModelResponse,
+) -> dict[str, int]:
+    messages_characters = _serialized_character_count(messages)
+    system_characters = sum(
+        _content_character_count(message.get("content"))
+        for message in messages
+        if message.get("role") == "system"
+    )
+    tool_result_characters = sum(
+        _content_character_count(message.get("content"))
+        for message in messages
+        if message.get("role") == "tool"
+    )
+    tool_schema_characters = _serialized_character_count(tool_schemas)
+    response_characters = _response_character_count(response)
+    return {
+        "messages_characters": messages_characters,
+        "messages_token_estimate": _estimate_tokens(messages_characters),
+        "system_project_instructions_characters": system_characters,
+        "system_project_instructions_token_estimate": _estimate_tokens(
+            system_characters
+        ),
+        "tool_schemas_characters": tool_schema_characters,
+        "tool_schemas_token_estimate": _estimate_tokens(tool_schema_characters),
+        "tool_results_characters": tool_result_characters,
+        "tool_results_token_estimate": _estimate_tokens(tool_result_characters),
+        "response_characters": response_characters,
+        "response_token_estimate": _estimate_tokens(response_characters),
+    }
+
+
+def _response_character_count(response: ModelResponse) -> int:
+    tool_calls = [
+        {
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }
+        for call in response.tool_calls
+    ]
+    tool_call_characters = (
+        _serialized_character_count(tool_calls) if tool_calls else 0
+    )
+    return len(response.text) + tool_call_characters
+
+
+def _serialized_character_count(value: Any) -> int:
+    try:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _content_character_count(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    return _serialized_character_count(content)
+
+
+def _estimate_tokens(characters: int) -> int:
+    if characters <= 0:
+        return 0
+    return (
+        characters + TOKEN_ESTIMATE_CHARACTERS_PER_TOKEN - 1
+    ) // TOKEN_ESTIMATE_CHARACTERS_PER_TOKEN
+
+
+def _provider_from_model(model: str | None) -> str | None:
+    if not model or "/" not in model:
+        return None
+    provider = model.split("/", 1)[0].strip()
+    return provider or None
 
 
 def _log_git_commit_result(
@@ -1419,7 +1598,14 @@ def _append_session_note(
     text: str,
     session: SessionLogger | None,
     mode: str,
+    *,
+    show_usage: bool = False,
 ) -> str:
+    if show_usage:
+        if session is not None:
+            text = f"{text}\n\n{format_model_usage_totals(session.usage_totals)}"
+        else:
+            text = f"{text}\n\nModel usage: unavailable in plan mode."
     if session is not None:
         note = session.relative_path
     elif mode == "plan":

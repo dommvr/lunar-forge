@@ -1,7 +1,12 @@
 """Model client adapters."""
 
 from lunar_forge.config import ModelConfig
-from lunar_forge.model_clients.base import ModelClient, ModelResponse, ToolCall
+from lunar_forge.model_clients.base import (
+    ModelClient,
+    ModelResponse,
+    ModelUsage,
+    ToolCall,
+)
 from lunar_forge.model_clients.litellm_client import LiteLLMClient
 from lunar_forge.model_clients.litellm_responses_client import LiteLLMResponsesClient
 
@@ -50,6 +55,7 @@ __all__ = [
     "LiteLLMResponsesClient",
     "ModelClient",
     "ModelResponse",
+    "ModelUsage",
     "ToolCall",
     "create_model_client",
     "create_litellm_client",

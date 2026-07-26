@@ -237,6 +237,33 @@ def test_commit_flags_are_available_and_forwarded(monkeypatch, tmp_path):
     assert captured["commit_message"] == "Document feature"
 
 
+def test_show_usage_flag_is_available_and_forwarded(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(cli_module, "load_config", lambda *args, **kwargs: AppConfig())
+
+    def fake_run_agent(prompt, project_root, **kwargs):
+        captured.update(prompt=prompt, project_root=project_root, **kwargs)
+        return "Done."
+
+    monkeypatch.setattr(cli_module, "run_agent", fake_run_agent)
+
+    help_result = CliRunner().invoke(app, ["run", "--help"])
+    result = CliRunner().invoke(
+        app,
+        [
+            "--show-usage",
+            "Inspect telemetry",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert help_result.exit_code == 0
+    assert "--show-usage" in help_result.stdout
+    assert result.exit_code == 0
+    assert captured["show_usage"] is True
+
+
 def test_git_status_and_commit_commands_format_results(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "load_config", lambda *args, **kwargs: AppConfig())
     monkeypatch.setattr(

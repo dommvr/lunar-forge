@@ -67,11 +67,22 @@ class SessionLogger:
     _environment_names: frozenset[str] = field(repr=False)
     _environment_values: tuple[str, ...] = field(repr=False)
     _write_lock: Any = field(default_factory=Lock, repr=False, compare=False)
+    _usage_totals: dict[str, int] = field(
+        default_factory=lambda: _empty_usage_totals(),
+        repr=False,
+        compare=False,
+    )
     last_error: str | None = field(default=None, init=False)
 
     @property
     def relative_path(self) -> str:
         return self.path.relative_to(self.project_root).as_posix()
+
+    @property
+    def usage_totals(self) -> dict[str, int]:
+        """Return a thread-safe snapshot of model usage accumulated this run."""
+        with self._write_lock:
+            return dict(self._usage_totals)
 
     def log(self, event: str, **data: Any) -> bool:
         """Append one redacted event, returning false instead of raising on failure."""
@@ -113,6 +124,11 @@ class SessionLogger:
             with self._write_lock:
                 with safe_log_path.open("a", encoding="utf-8", newline="") as handle:
                     handle.write(f"{serialized}\n")
+                if event.strip() == "model_usage" and isinstance(
+                    record["data"],
+                    Mapping,
+                ):
+                    _accumulate_usage(self._usage_totals, record["data"])
         except Exception:
             self.last_error = SESSION_ERROR
             return False
@@ -332,6 +348,7 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
         "permission_denials": 0,
         "errors": 0,
     }
+    usage_totals = _empty_usage_totals()
     last_user_prompt: str | None = None
     last_assistant_message: str | None = None
     for event in session.events:
@@ -353,6 +370,8 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
             counts["permission_denials"] += 1
         elif event_name == "error":
             counts["errors"] += 1
+        elif event_name == "model_usage":
+            _accumulate_usage(usage_totals, data)
 
     return {
         "session": session.safe_display_path,
@@ -360,13 +379,18 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
         "first_timestamp": session.events[0]["timestamp"],
         "last_timestamp": session.events[-1]["timestamp"],
         **counts,
+        "model_usage": usage_totals,
         "historical_context_messages": len(session.messages),
         "last_user_prompt": last_user_prompt,
         "last_assistant_message": last_assistant_message,
     }
 
 
-def format_session_summary(session: LoadedSession) -> str:
+def format_session_summary(
+    session: LoadedSession,
+    *,
+    include_usage: bool = False,
+) -> str:
     """Format a safe summary without invoking config, models, or tools."""
     summary = summarize_session(session)
     lines = [
@@ -386,8 +410,57 @@ def format_session_summary(session: LoadedSession) -> str:
         lines.append(
             f"Last assistant message: {summary['last_assistant_message']}"
         )
+    if include_usage:
+        lines.extend(("", format_model_usage_totals(summary["model_usage"])))
     lines.append("Historical tool results are context only and are never replayed.")
     return "\n".join(lines)
+
+
+def format_model_usage_totals(usage: Mapping[str, Any]) -> str:
+    """Format compact aggregate counts for explicit usage output."""
+    return "\n".join(
+        (
+            "Model usage:",
+            (
+                f"- Calls: {_nonnegative_integer(usage.get('model_calls'))} "
+                f"({_nonnegative_integer(usage.get('exact_calls'))} exact, "
+                f"{_nonnegative_integer(usage.get('estimated_calls'))} estimated)"
+            ),
+            f"- Input tokens: {_nonnegative_integer(usage.get('input_tokens'))}",
+            f"- Output tokens: {_nonnegative_integer(usage.get('output_tokens'))}",
+            f"- Total tokens: {_nonnegative_integer(usage.get('total_tokens'))}",
+        )
+    )
+
+
+def _empty_usage_totals() -> dict[str, int]:
+    return {
+        "model_calls": 0,
+        "exact_calls": 0,
+        "estimated_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def _accumulate_usage(
+    totals: dict[str, int],
+    usage: Mapping[str, Any],
+) -> None:
+    totals["model_calls"] += 1
+    if usage.get("exact") is True:
+        totals["exact_calls"] += 1
+    else:
+        totals["estimated_calls"] += 1
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        totals[key] += _nonnegative_integer(usage.get(key))
+
+
+def _nonnegative_integer(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _validate_session_file(
@@ -663,6 +736,7 @@ __all__ = [
     "SessionLogger",
     "create_session",
     "create_session_logger",
+    "format_model_usage_totals",
     "format_session_summary",
     "load_session",
     "list_session_files",

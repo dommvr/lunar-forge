@@ -113,6 +113,44 @@ def test_session_logger_redacts_api_keys_and_environment_values(tmp_path):
     json.loads(raw_log)
 
 
+def test_session_usage_totals_combine_exact_and_estimated_calls(tmp_path):
+    logger = create_session_logger(tmp_path, environ={})
+    logger.log(
+        "model_usage",
+        input_tokens=100,
+        output_tokens=20,
+        total_tokens=120,
+        exact=True,
+        estimated=False,
+    )
+    logger.log(
+        "model_usage",
+        input_tokens=40,
+        output_tokens=10,
+        total_tokens=50,
+        exact=False,
+        estimated=True,
+    )
+
+    expected = {
+        "model_calls": 2,
+        "exact_calls": 1,
+        "estimated_calls": 1,
+        "input_tokens": 140,
+        "output_tokens": 30,
+        "total_tokens": 170,
+    }
+    assert logger.usage_totals == expected
+
+    loaded = load_session(tmp_path, logger.path.name, environ={})
+    assert summarize_session(loaded)["model_usage"] == expected
+    assert "Model usage:" not in format_session_summary(loaded)
+    formatted = format_session_summary(loaded, include_usage=True)
+    assert "Model usage:" in formatted
+    assert "- Calls: 2 (1 exact, 1 estimated)" in formatted
+    assert "- Total tokens: 170" in formatted
+
+
 def test_parallel_session_events_remain_atomic_and_redacted(tmp_path):
     secret = "parallel-session-secret-123"
     logger = create_session_logger(tmp_path, environ={"PARALLEL_SECRET": secret})

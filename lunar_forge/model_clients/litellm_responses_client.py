@@ -14,6 +14,7 @@ from lunar_forge.model_clients.litellm_client import (
     _normalize_arguments,
     _normalize_content,
     _normalize_response,
+    _normalize_usage,
     _value,
 )
 
@@ -184,6 +185,11 @@ def _normalize_responses_response(
         text=text,
         model=str(model),
         tool_calls=tuple(tool_calls),
+        usage=_normalize_usage(
+            response,
+            model=str(model),
+            fallback_model=fallback_model,
+        ),
     )
 
 

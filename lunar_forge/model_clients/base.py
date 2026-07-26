@@ -17,12 +17,27 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class ModelUsage:
+    """Provider-neutral token usage for one model call."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    model: str | None = None
+    provider: str | None = None
+    phase: str | None = None
+    role: str | None = None
+    exact: bool = True
+
+
+@dataclass(frozen=True)
 class ModelResponse:
     """Normalized model output returned to the agent loop."""
 
     text: str
     model: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
+    usage: ModelUsage | None = None
 
     @property
     def content(self) -> str:

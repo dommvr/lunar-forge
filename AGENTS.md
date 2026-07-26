@@ -94,7 +94,7 @@ Completed project intelligence feature wave:
 43. Improve final summaries, review flows, and commit proposals using project-health, dependency, Git status, diff, and changed-file data.
 44. Run a hardening and documentation pass for the new tools.
 
-Next feature wave, in order:
+Completed structured context feature wave:
 
 45. Add second-batch read-only context tools:
     * `read_json`
@@ -109,6 +109,14 @@ Next feature wave, in order:
     * prefer `ci_summary` when choosing validation commands.
 47. Integrate `ci_summary` and structured readers into planning, testing, review, security checks, and final summaries where useful.
 48. Run a hardening and documentation pass for the second-batch tools.
+
+Next feature wave, in order:
+
+49. Add token telemetry for model calls and session totals.
+50. Add task-profile based tool-schema filtering so each model call receives only relevant tools.
+51. Add an explicit read-only fast path for direct inspection/tool requests.
+52. Skip coder/tester/reviewer subagents for read-only tasks unless their roles are explicitly needed.
+53. Run a hardening and documentation pass for cost controls and read-only routing.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -387,6 +395,164 @@ model:
 ```
 
 Local models may not reliably support tool calling. When local or unknown models are used, keep warnings clear and prefer plan/read-only mode for weak models.
+
+---
+
+## Token telemetry and cost controls
+
+LunarForge should make token usage visible and measurable.
+
+Goals:
+
+* Record token usage per model call when provider usage metadata is available.
+* Record approximate context component sizes even when the provider does not return detailed usage.
+* Aggregate token usage per run and per session.
+* Make usage visible in debug/session logs without cluttering normal final answers.
+* Use usage data to guide future context-budget and routing improvements.
+
+Model usage records should include:
+
+```json
+{
+  "event": "model_usage",
+  "phase": "planner",
+  "role": "planner",
+  "model": "openai/gpt-5.5",
+  "input_tokens": 18420,
+  "output_tokens": 610,
+  "total_tokens": 19030,
+  "tool_schema_count": 9,
+  "messages_count": 7,
+  "context_components": {
+    "system_prompt_estimate": 2500,
+    "agents_md_estimate": 12000,
+    "tool_schemas_estimate": 3500,
+    "tool_results_estimate": 400
+  }
+}
+```
+
+Token telemetry rules:
+
+* Do not treat token usage as a secret.
+* Do not log API keys, raw credentials, or secret-looking environment values.
+* Prefer provider-reported token counts over estimates.
+* If only estimates are available, label them as estimates.
+* Session summaries may include aggregate usage when a debug/usage flag is enabled.
+* Tests should use fake model clients and deterministic usage metadata.
+
+Add CLI/config options only if needed, for example:
+
+```bash
+lunar-forge --show-usage "Explain this project"
+lunar-forge sessions --usage
+```
+
+Keep normal output concise. Users need cost visibility, not another invoice-shaped wall of text.
+
+---
+
+## Task profiles and tool-schema filtering
+
+LunarForge should not expose every tool to every model call.
+
+Introduce task profiles such as:
+
+```text
+explicit_readonly
+plan_only
+review_only
+edit_task
+browser_task
+commit_task
+new_project
+```
+
+Tool-schema filtering rules:
+
+* `explicit_readonly` should expose only the requested read-only tools and minimal supporting read-only tools.
+* `plan_only` should expose planning and inspection tools only.
+* `review_only` should expose Git/diff/project inspection tools, but no mutation tools.
+* `edit_task` may expose read and write tools, but commands should remain permission-gated.
+* `browser_task` should expose browser validation tools only when browser intent is explicit.
+* `commit_task` should expose Git commit helpers only when commit support is requested.
+* Plan mode must never expose write tools, command execution tools, browser server startup, plugin tools, or commit tools.
+* No-command mode must not expose shell execution or Git commit execution tools.
+* MCP and plugin tools should be omitted unless explicitly enabled and relevant.
+
+For each model call, log the selected task profile and exposed tool names in session logs. This helps debug token bloat and weird routing without making users decode the machine's grocery receipt.
+
+---
+
+## Explicit read-only fast path
+
+Many user requests are direct inspection requests and should not trigger the full subagent workflow.
+
+Examples:
+
+```text
+Run read_json on package.json and summarize scripts.
+Run read_yaml on .agent/mcp.yaml.
+Run list_symbols on lunar_forge/cli.py.
+Use read_many_files to summarize README.md and pyproject.toml.
+Run ci_summary and tell me the validation commands.
+Run git_status and report whether the repo is clean.
+```
+
+For explicit read-only requests:
+
+* Use a lightweight read-only execution path.
+* Do not run coder, tester, reviewer, or security by default.
+* Do not run validation unless the user explicitly asks.
+* Do not create checkpoints.
+* Do not write session logs in plan mode; otherwise keep session logs compact.
+* Expose only the requested read-only tool or a small read-only tool set.
+* Keep final output focused on the requested result.
+
+Read-only fast path must still enforce:
+
+* project-root path safety,
+* command/no-command restrictions,
+* plan-mode no-write behavior,
+* bounded outputs,
+* safe JSON/YAML parsing,
+* no secret access outside the project root.
+
+If the prompt is ambiguous or could require edits, fall back to the normal agent workflow. Fast paths are for obvious cases, not for pretending language is less messy than it is.
+
+---
+
+## Subagent skip rules
+
+Subagents are useful for real work, but not every inspection needs a committee.
+
+Skip coder/tester/reviewer by default when:
+
+* the user explicitly says not to edit files,
+* the task is a direct read-only tool request,
+* the task is plan mode,
+* no file mutation, command execution, browser validation, or commit is requested.
+
+Use planner-only or direct read-only execution for simple inspection tasks.
+
+Run reviewer only when:
+
+* reviewing changed files or diffs,
+* commit readiness is requested,
+* genuine quality/security/maintainability judgment is needed.
+
+Run tester only when:
+
+* validation is requested,
+* edits were made,
+* commit readiness requires validation and the user approves commands.
+
+Run security only when:
+
+* MCP, plugins, Docker, permissions, secrets, CI, or external integrations are involved,
+* or the user explicitly asks for security review.
+
+Final summaries must accurately report which subagents actually ran. Do not list skipped subagents for decoration. The output is not a trophy case.
 
 ---
 
@@ -1865,6 +2031,25 @@ pytest
 
 ---
 
+## Token and routing tests
+
+Cost-control features need tests because otherwise they become inspirational comments.
+
+Required tests:
+
+* token telemetry records provider-reported usage when present,
+* token telemetry labels estimates when exact usage is unavailable,
+* session logs include aggregate token usage,
+* task profiles expose only expected tools,
+* plan mode never exposes write or execution tools,
+* explicit read-only fast path skips coder/tester/reviewer,
+* explicit `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, `ci_summary`, `git_status`, `git_diff`, and `list_changed_files` prompts use compact read-only routing,
+* browser paths such as `browser-demo/package.json` do not trigger browser routing by themselves,
+* explicit browser/screenshot/console/UI prompts still trigger browser routing,
+* final summaries report actual subagents run and do not invent skipped roles.
+
+---
+
 ## Coding style
 
 Use:
@@ -1951,6 +2136,24 @@ What remains:
 ```
 
 Do not pretend validation passed if it did not. Lying is already well-covered by humans.
+
+---
+
+## Optional usage output
+
+When usage reporting is enabled, append a compact section:
+
+```text
+Usage:
+- Model calls: 2
+- Input tokens: 12,430
+- Output tokens: 710
+- Total tokens: 13,140
+- Task profile: explicit_readonly
+- Tool schemas exposed: 3
+```
+
+Do not show usage by default unless configured or requested. Normal users want answers; builders debugging the agent want receipts.
 
 ---
 

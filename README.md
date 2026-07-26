@@ -284,6 +284,7 @@ Run against the current directory:
 ```bash
 lunar-forge "Explain this repository"
 lunar-forge "Add a small feature and run validation"
+lunar-forge --show-usage "Explain this repository"
 ```
 
 Select another project or request a read-only plan:
@@ -863,6 +864,7 @@ lunar-forge checkpoints --project ../my-app
 lunar-forge rollback src/example.py --project ../my-app
 lunar-forge sessions --project ../my-app
 lunar-forge resume <session-id> --project ../my-app --summary-only
+lunar-forge resume <session-id> --project ../my-app --summary-only --show-usage
 lunar-forge resume <session-id> --project ../my-app --prompt "Continue the fix"
 ```
 
@@ -872,15 +874,21 @@ path checks prevent restoring outside the project.
 
 Non-plan agent runs write redacted JSONL events to
 `.agent/sessions/<timestamp>.jsonl`. Events include prompts, assistant messages,
-tool calls and results, denials, and errors. API-key-like values and environment
-values are redacted, event sizes are bounded, and the `sessions` command lists
-only filenames and sizes; it does not print log contents.
+model usage, tool calls and results, denials, and errors. Provider-reported token
+counts are recorded as exact when available. Otherwise, LunarForge records a
+clearly labeled estimate based on character counts. Usage events include message
+and exposed-tool counts plus numeric context-size estimates; they do not include
+raw environment values. API-key-like values and environment values are redacted,
+event sizes are bounded, and the `sessions` command lists only filenames and
+sizes; it does not print log contents.
 
 Resume validates that the session is project-local, loads a bounded redacted
 history, and starts a new session that references the old one. Historical tool
 calls are inert records and are never replayed automatically. Use
 `--summary-only` for model-free inspection or `--plan` to continue without
-writes.
+writes. Add `--show-usage` to a run or resumed run for a compact aggregate in
+the final output, or combine it with `resume --summary-only` to inspect the
+stored session total. Normal final output remains unchanged without the flag.
 
 ## Development
 

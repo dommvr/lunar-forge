@@ -1282,8 +1282,9 @@ Remove-Item -Recurse -Force -LiteralPath $PluginProject
 
 **Purpose**
 
-Confirm session listing, model-free redacted summaries, safe history loading,
-and continuation into a new session without replaying historical tool calls.
+Confirm session listing, model-free redacted summaries, token telemetry, safe
+history loading, and continuation into a new session without replaying
+historical tool calls.
 
 **Setup**
 
@@ -1293,7 +1294,7 @@ This test requires a configured model.
 $SessionProject = Join-Path $ManualRoot "session-project"
 New-Item -ItemType Directory -Force -Path $SessionProject | Out-Null
 "The launch color is silver." | Set-Content -LiteralPath (Join-Path $SessionProject "note.txt") -Encoding utf8
-lunar-forge --project $SessionProject "Read note.txt and summarize it. Do not edit files or run commands."
+lunar-forge --show-usage --project $SessionProject "Read note.txt and summarize it. Do not edit files or run commands."
 $SessionFile = Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $SessionId = $SessionFile.BaseName
 ```
@@ -1302,7 +1303,9 @@ $SessionId = $SessionFile.BaseName
 
 ```powershell
 lunar-forge sessions --project $SessionProject
-lunar-forge resume $SessionId --project $SessionProject --summary-only
+lunar-forge resume $SessionId --project $SessionProject --summary-only --show-usage
+$UsageEvents = Get-Content -LiteralPath $SessionFile.FullName | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object event -eq "model_usage"
+$UsageEvents.data | Select-Object phase, role, model, provider, input_tokens, output_tokens, total_tokens, exact, estimated, messages_count, tool_schema_count
 $BeforeResume = (Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions")).Count
 lunar-forge resume $SessionId --project $SessionProject --prompt "What launch color did the previous session find? Do not call tools."
 $AfterResume = (Get-ChildItem -File -LiteralPath (Join-Path $SessionProject ".agent\sessions")).Count
@@ -1312,9 +1315,13 @@ Write-Host "Session files before resume: $BeforeResume; after resume: $AfterResu
 **Expected result**
 
 `sessions` lists the original JSONL filename and size. `--summary-only` prints a
-bounded, redacted history without requiring the model. The continued run answers
-`silver`, does not replay the old read tool call, creates one new session file,
-and records a reference to the resumed session.
+bounded, redacted history without requiring the model. Usage output reports at
+least one call and labels each event as exact/provider-reported or estimated.
+Each event includes message and tool-schema counts plus numeric context component
+estimates, without raw prompts, instructions, tool schemas, or environment
+values. The continued run answers `silver`, does not replay the old read tool
+call, creates one new session file, and records a reference to the resumed
+session.
 
 **Cleanup**
 

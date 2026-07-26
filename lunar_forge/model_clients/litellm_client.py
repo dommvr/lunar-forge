@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from lunar_forge.model_clients.base import ModelResponse, ToolCall
+from lunar_forge.model_clients.base import ModelResponse, ModelUsage, ToolCall
 
 
 class LiteLLMClient:
@@ -76,7 +76,96 @@ def _normalize_response(response: Any, fallback_model: str) -> ModelResponse:
     tool_calls = tuple(_normalize_tool_call(call) for call in raw_tool_calls)
     model = _value(response, "model", fallback_model) or fallback_model
 
-    return ModelResponse(text=text, model=str(model), tool_calls=tool_calls)
+    return ModelResponse(
+        text=text,
+        model=str(model),
+        tool_calls=tool_calls,
+        usage=_normalize_usage(
+            response,
+            model=str(model),
+            fallback_model=fallback_model,
+        ),
+    )
+
+
+def _normalize_usage(
+    response: Any,
+    *,
+    model: str,
+    fallback_model: str,
+) -> ModelUsage | None:
+    """Normalize LiteLLM usage metadata without retaining provider responses."""
+    usage = _value(response, "usage")
+    if usage is None:
+        return None
+
+    input_tokens = _usage_integer(usage, "prompt_tokens", "input_tokens")
+    output_tokens = _usage_integer(
+        usage,
+        "completion_tokens",
+        "output_tokens",
+    )
+    total_tokens = _usage_integer(usage, "total_tokens")
+    if (
+        total_tokens is None
+        and input_tokens is not None
+        and output_tokens is not None
+    ):
+        total_tokens = input_tokens + output_tokens
+    elif (
+        input_tokens is None
+        and total_tokens is not None
+        and output_tokens is not None
+    ):
+        input_tokens = max(0, total_tokens - output_tokens)
+    elif (
+        output_tokens is None
+        and total_tokens is not None
+        and input_tokens is not None
+    ):
+        output_tokens = max(0, total_tokens - input_tokens)
+
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+
+    return ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        model=model,
+        provider=_usage_provider(response, fallback_model),
+        exact=True,
+    )
+
+
+def _usage_integer(usage: Any, *keys: str) -> int | None:
+    for key in keys:
+        raw_value = _value(usage, key)
+        if isinstance(raw_value, bool):
+            continue
+        if isinstance(raw_value, int) and raw_value >= 0:
+            return raw_value
+        if isinstance(raw_value, str) and raw_value.isdigit():
+            return int(raw_value)
+    return None
+
+
+def _usage_provider(response: Any, fallback_model: str) -> str:
+    hidden = _value(response, "_hidden_params", {}) or {}
+    for source, keys in (
+        (response, ("provider", "custom_llm_provider")),
+        (hidden, ("custom_llm_provider", "provider")),
+    ):
+        for key in keys:
+            candidate = _value(source, key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+
+    if "/" in fallback_model:
+        provider = fallback_model.split("/", 1)[0].strip()
+        if provider:
+            return provider
+    return "litellm"
 
 
 def _normalize_tool_call(raw_tool_call: Any) -> ToolCall:

@@ -142,6 +142,13 @@ def run(
             help="Commit message used with --commit; otherwise derived from the task.",
         ),
     ] = None,
+    show_usage: Annotated[
+        bool,
+        typer.Option(
+            "--show-usage",
+            help="Append aggregate model token usage to the final output.",
+        ),
+    ] = False,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
@@ -165,6 +172,7 @@ def run(
             mode=config.permissions.mode,
             offer_commit=commit,
             commit_message=commit_message,
+            show_usage=show_usage,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -627,6 +635,13 @@ def resume_command(
             help="Print a redacted summary without loading config or a model.",
         ),
     ] = False,
+    show_usage: Annotated[
+        bool,
+        typer.Option(
+            "--show-usage",
+            help="Include aggregate token usage in the summary or continued run.",
+        ),
+    ] = False,
     plan: Annotated[
         bool,
         typer.Option("--plan", help="Continue in read-only plan mode."),
@@ -662,7 +677,12 @@ def resume_command(
     try:
         previous_session = load_session(project_root, session_id_or_file)
         if summary_only:
-            typer.echo(format_session_summary(previous_session))
+            typer.echo(
+                format_session_summary(
+                    previous_session,
+                    include_usage=show_usage,
+                )
+            )
             return
 
         cli_overrides = _runtime_overrides(
@@ -681,6 +701,7 @@ def resume_command(
             mode=config.permissions.mode,
             resume_messages=previous_session.messages,
             resumed_from=previous_session.relative_path,
+            show_usage=show_usage,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
