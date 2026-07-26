@@ -240,6 +240,30 @@ def test_readonly_fast_path_does_not_initialize_mcp_or_plugins(tmp_path):
     )
 
 
+def test_explicit_subagent_override_still_skips_roles_for_read_json(tmp_path):
+    executions = []
+    model = RecordingModel((ModelResponse(text="Scripts summarized."),))
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+    ).run(
+        "Run read_json on package.json and summarize scripts.",
+        tmp_path,
+        registry=_recording_registry(executions),
+        use_subagents=True,
+    )
+
+    assert executions == [("read_json", {"path": "package.json"})]
+    assert len(model.calls) == 1
+    assert model.calls[0]["tools"] == []
+    assert "Subagents run:" not in output
+    assert not any(
+        event["event"].startswith("subagent_")
+        for event in _events(tmp_path)
+    )
+
+
 def test_explicit_validation_intent_falls_back_and_can_run_validation(tmp_path):
     executions = []
     model = RecordingModel(

@@ -257,7 +257,11 @@ def parse_explicit_readonly_tool_request(
         return None
 
     remainder = text[match.end() :]
-    path_clause = re.search(r"(?i)\bon\b(?P<paths>.*)", remainder)
+    path_clause = re.search(
+        r"(?i)(?:\bon\b|\bto\s+(?:inspect|read|summarize)\b)"
+        r"(?P<paths>.*)",
+        remainder,
+    )
     path_text = path_clause.group("paths") if path_clause is not None else ""
     paths = _explicit_readonly_paths(path_text)
 

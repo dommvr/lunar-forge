@@ -54,6 +54,7 @@ from lunar_forge.subagents import (
     RestrictedToolRegistry,
     SubagentOrchestrator,
     SubagentPhase,
+    SubagentPhasePlan,
     SubagentRole,
     WorkflowKind,
     requires_security_analysis,
@@ -101,6 +102,11 @@ APPLICATION_OWNED_SUMMARY_SECTIONS = frozenset(
         "session log",
     }
 )
+ROUTING_SUMMARY_SECTION_NAMES = {
+    "subagents run",
+    "parallel subagent groups",
+    "session log",
+}
 REVIEWER_ADVISORY_HEADING_MARKERS = frozenset(
     {
         "concern",
@@ -294,7 +300,6 @@ class CodeAgent:
             if (
                 explicit_readonly_request is not None
                 and not browser_intent.detected
-                and use_subagents is not True
             ):
                 if registry is None:
                     readonly_tools = create_tool_registry(
@@ -410,6 +415,7 @@ class CodeAgent:
             if subagents_enabled:
                 subagent_result = self._run_subagent_workflow(
                     request=request,
+                    task_profile=task_selection.profile,
                     model_client=model_client,
                     registry=tools,
                     system_prompt=system_prompt,
@@ -809,6 +815,7 @@ class CodeAgent:
         self,
         *,
         request: str,
+        task_profile: TaskProfile,
         model_client: ModelClient,
         registry: ToolRegistry,
         system_prompt: str,
@@ -817,7 +824,18 @@ class CodeAgent:
         mode: str,
         browser_intent: BrowserIntent,
     ) -> AgentWorkflowResult:
-        if self.config.subagents.parallel:
+        orchestrator = SubagentOrchestrator()
+        include_security = requires_security_analysis(request)
+        phase_plan = orchestrator.build_task_phase_plan(
+            WorkflowKind.EXISTING_PROJECT,
+            request=request,
+            task_profile=task_profile,
+            mode=mode,
+            browser_intent=browser_intent.detected,
+            include_security=include_security,
+            parallel=self.config.subagents.parallel,
+        )
+        if self.config.subagents.parallel and "coder" in phase_plan.role_names:
             return self._run_parallel_subagent_workflow(
                 request=request,
                 model_client=model_client,
@@ -828,14 +846,22 @@ class CodeAgent:
                 mode=mode,
                 browser_intent=browser_intent,
             )
+        if self.config.subagents.parallel and phase_plan.parallel_groups:
+            return self._run_selected_parallel_subagent_workflow(
+                phase_plan=phase_plan,
+                request=request,
+                model_client=model_client,
+                registry=registry,
+                system_prompt=system_prompt,
+                historical_messages=historical_messages,
+                session=session,
+                mode=mode,
+                browser_intent=browser_intent,
+            )
 
-        orchestrator = SubagentOrchestrator()
-        phase_plan = orchestrator.build_phase_plan(WorkflowKind.EXISTING_PROJECT)
         phases = tuple(
             phase for phase in phase_plan.phases if phase.role is not None
         )
-        if mode == "plan":
-            phases = phases[:1]
 
         outputs: dict[str, str] = {}
         changed_files: list[str] = []
@@ -865,8 +891,11 @@ class CodeAgent:
                 if path not in changed_files:
                     changed_files.append(path)
 
-        security_output: str | None = None
-        if mode != "plan" and requires_security_review(changed_files):
+        if (
+            mode != "plan"
+            and "security" not in outputs
+            and requires_security_review(changed_files)
+        ):
             security_role = orchestrator.roles["security"]
             phase_result = self._run_subagent_phase(
                 request=request,
@@ -885,10 +914,19 @@ class CodeAgent:
             roles_run.append(security_role.name)
             outputs[security_role.name] = phase_result.text
             validation_evidence.merge(phase_result)
-            security_output = phase_result.text
 
-        final_role = "planner" if mode == "plan" else "reviewer"
+        final_role = next(
+            (
+                role_name
+                for role_name in ("reviewer", "tester", "planner", "coder")
+                if role_name in outputs
+            ),
+            None,
+        )
+        if final_role is None:
+            raise AgentError("Subagent routing produced no final response role.")
         final_text = outputs[final_role]
+        security_output = outputs.get("security")
         if security_output:
             final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
         final_text = _finalize_validation_summary(
@@ -900,6 +938,118 @@ class CodeAgent:
         )
         return AgentWorkflowResult(
             text=_append_subagent_report(final_text, roles_run),
+            changed_files=tuple(changed_files),
+            validation_evidence=validation_evidence,
+        )
+
+    def _run_selected_parallel_subagent_workflow(
+        self,
+        *,
+        phase_plan: SubagentPhasePlan,
+        request: str,
+        model_client: ModelClient,
+        registry: ToolRegistry,
+        system_prompt: str,
+        historical_messages: Sequence[Mapping[str, Any]],
+        session: SessionLogger | None,
+        mode: str,
+        browser_intent: BrowserIntent,
+    ) -> AgentWorkflowResult:
+        """Run a task-selected read-only phase group without edit phases."""
+        role_phases = tuple(
+            phase for phase in phase_plan.phases if phase.role is not None
+        )
+        outputs: dict[str, str] = {}
+        changed_files: list[str] = []
+        roles_run: list[str] = []
+        failures: list[SubagentPhaseFailure] = []
+        parallel_groups: list[tuple[str, tuple[str, ...]]] = []
+        validation_evidence = ValidationEvidence()
+        handled_groups: set[str] = set()
+
+        for phase in role_phases:
+            group_id = phase.parallel_group_id
+            if group_id is None:
+                outcomes = (
+                    self._run_subagent_phase_outcome(
+                        phase=phase,
+                        request=request,
+                        model_client=model_client,
+                        registry=registry,
+                        system_prompt=system_prompt,
+                        historical_messages=historical_messages,
+                        prior_outputs=outputs,
+                        changed_files=changed_files,
+                        session=session,
+                        mode=mode,
+                    ),
+                )
+            else:
+                if group_id in handled_groups:
+                    continue
+                grouped_phases = tuple(
+                    candidate
+                    for candidate in role_phases
+                    if candidate.parallel_group_id == group_id
+                )
+                outcomes = self._run_parallel_phase_group(
+                    phases=grouped_phases,
+                    request=request,
+                    model_client=model_client,
+                    registry=registry,
+                    system_prompt=system_prompt,
+                    historical_messages=historical_messages,
+                    prior_outputs=outputs,
+                    changed_files=changed_files,
+                    session=session,
+                    mode=mode,
+                )
+                handled_groups.add(group_id)
+                parallel_groups.append(
+                    (
+                        group_id,
+                        tuple(item.role_name or "" for item in grouped_phases),
+                    )
+                )
+            _merge_subagent_outcomes(
+                outcomes,
+                outputs,
+                changed_files,
+                roles_run,
+                failures,
+                validation_evidence,
+            )
+
+        final_role = next(
+            (
+                role_name
+                for role_name in ("reviewer", "tester", "planner", "coder")
+                if role_name in outputs
+            ),
+            None,
+        )
+        final_text = (
+            outputs[final_role]
+            if final_role is not None
+            else "Selected subagent phases did not produce a final response."
+        )
+        security_output = outputs.get("security")
+        if security_output:
+            final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
+        final_text = _finalize_validation_summary(
+            final_text,
+            browser_intent,
+            validation_evidence,
+            mode=mode,
+            reviewer_advisory=final_role == "reviewer",
+        )
+        return AgentWorkflowResult(
+            text=_append_subagent_report(
+                final_text,
+                roles_run,
+                parallel_groups=parallel_groups,
+                failures=failures,
+            ),
             changed_files=tuple(changed_files),
             validation_evidence=validation_evidence,
         )
@@ -1297,6 +1447,7 @@ class CodeAgent:
                     system_prompt,
                     role,
                     task_profile=task_profile.value,
+                    phase=phase,
                 ),
             }
         ]
@@ -1309,6 +1460,7 @@ class CodeAgent:
                     role,
                     prior_outputs,
                     changed_files,
+                    phase=phase,
                 ),
             }
         )
@@ -1892,8 +2044,15 @@ def _append_subagent_report(
     parallel_groups: Sequence[tuple[str, Sequence[str]]] = (),
     failures: Sequence[SubagentPhaseFailure] = (),
 ) -> str:
-    lines = [text.rstrip(), "", "Subagents run:"]
-    lines.extend(f"- {role_name}" for role_name in roles_run)
+    authoritative_text = _remove_summary_sections(
+        text,
+        ROUTING_SUMMARY_SECTION_NAMES,
+    )
+    lines = [authoritative_text.rstrip(), "", "Subagents run:"]
+    if roles_run:
+        lines.extend(f"- {role_name}" for role_name in roles_run)
+    else:
+        lines.append("- None")
     lines.extend(("", "Parallel subagent groups:"))
     if parallel_groups:
         lines.extend(

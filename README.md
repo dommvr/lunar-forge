@@ -345,8 +345,9 @@ LunarForge parses the tool and arguments, executes that one read-only registry
 handler directly, and makes one compact tool-free model call to summarize the
 bounded result. It does not start subagents, expose tool schemas to the summary
 call, run validation or browser checks, create checkpoints, edit files, or
-offer a commit. The normal project-root, blocked-path, permission, result-size,
-and session-redaction rules still apply.
+offer a commit, even when optional subagent mode is enabled. The normal
+project-root, blocked-path, permission, result-size, and session-redaction rules
+still apply.
 
 Only conservative `Run`, `Use`, or `Call` forms qualify. Missing paths,
 multiple named tools, or edit, validation, browser, or commit intent fall back
@@ -576,11 +577,22 @@ lunar-forge new "Build a Vite site" --project ../new-app --parallel-subagents
 ```
 
 Existing-project work keeps Coder serialized. Planner and the read-only Security
-role run together when the request names permissions, shell execution, Docker,
-MCP, plugins, or configuration. After edits, Tester and Reviewer may run
-together. New-project work keeps Scaffolder serialized, then may run Tester and
-Reviewer together. Tester can use only its existing permission-gated validation
-tools; no parallel role receives file mutation tools.
+role run together when an edit request names a sensitive permissions, command,
+Docker, MCP, plugin, credential, secret, authentication, or CI-security boundary.
+After edits, Tester and Reviewer may run together. New-project work keeps
+Scaffolder serialized, then may run Tester and Reviewer together. Tester can use
+only its existing permission-gated validation tools; no parallel role receives
+file mutation tools.
+
+Phase selection is task-aware. Explicit named read-only tool requests use the
+fast path and run no subagents. Other read-only explanations use only Planner in
+an inspection phase; actual review, uncommitted-diff, diff-quality, and
+commit-readiness requests use only Reviewer unless validation or security is
+also explicit. Validation-only requests use Tester without Coder or Reviewer.
+Mutation requests retain Planner → Coder → Tester → Reviewer. The application,
+not the model, appends `Subagents run` from runtime routing state, so skipped
+roles are never listed. Genuine validation+review pairs can still run in
+parallel, as can the existing post-edit Tester+Reviewer group.
 
 Each role receives an explicit tool allowlist and cannot obtain tools outside
 it. Every concurrent role receives a newly created restricted registry view and

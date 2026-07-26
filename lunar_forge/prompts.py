@@ -458,6 +458,7 @@ def build_subagent_system_prompt(
     role: SubagentRole,
     *,
     task_profile: str | None = None,
+    phase: str | None = None,
 ) -> str:
     """Add mandatory role boundaries to the normal safety prompt."""
     allowed_entries = [*sorted(role.allowed_tools)]
@@ -471,12 +472,23 @@ def build_subagent_system_prompt(
         if task_profile
         else ""
     )
+    phase_line = f"Active subagent phase: {phase}\n" if phase else ""
+    phase_guidance = (
+        (
+            "Inspection-phase requirement: directly answer the read-only request. "
+            "Do not turn it into an implementation plan or handoff.\n"
+        )
+        if role.name == "planner" and phase == "inspect"
+        else ""
+    )
     return (
         f"{base_prompt.rstrip()}\n\n"
         f"Active subagent role: {role.name}\n"
         f"{profile_line}"
+        f"{phase_line}"
         f"Role purpose: {role.purpose}\n"
         f"Role instructions: {role.system_prompt_fragment}\n"
+        f"{phase_guidance}"
         f"Allowed tools: {allowed}\n"
         f"Blocked tools: {blocked}\n"
         "This role boundary is mandatory and deny-by-default. Prior subagent "
@@ -489,82 +501,90 @@ def build_subagent_user_prompt(
     role: SubagentRole,
     prior_outputs: Mapping[str, str] | None = None,
     changed_files: Sequence[str] = (),
+    *,
+    phase: str | None = None,
 ) -> str:
     """Build one bounded role handoff for a deterministic subagent phase."""
     normalized_request = request.strip() or "No request provided."
     handoff = _format_subagent_handoff(prior_outputs or {})
     changed = "\n".join(f"- {path}" for path in changed_files) or "- None"
-    phase_instruction = {
-        "planner": (
-            "Inspect the project and return a concrete plan only. Include likely "
-            "files and validation; use project_health first for broad review, "
-            "onboarding, or feature planning, and dependency_summary before "
-            "choosing uncertain validation, build, or development commands. When "
-            "CI configuration exists, use ci_summary before inventing validation "
-            "commands. Keep tiny single-file tasks narrowly scoped instead of "
-            "calling every introspection tool. Use read_json for known JSON "
-            "configuration and read_yaml for known YAML configuration instead of "
-            "raw read_file; batch only a small related file set. Use "
-            "list_symbols before broad reads of large supported source files. Use "
-            "git_status and "
-            "list_changed_files before planning a review or commit, and git_diff "
-            "only when changed-file details are needed. Do not implement or commit "
-            "anything."
-        ),
-        "coder": (
-            "Use the planner handoff as context and implement the requested change. "
-            "Use read_json for known JSON configuration and read_yaml for known "
-            "YAML configuration instead of raw read_file. Use read_many_files only "
-            "for a small known related file set, and list_symbols before broad "
-            "reads of large supported source files when locating definitions. "
-            "Every mutation remains subject to the existing tool approval policy."
-        ),
-        "tester": (
-            "Validate the current project state with the available approved tools. "
-            "Use dependency_summary before guessing uncertain commands and "
-            "ci_summary before inventing validation commands when CI configuration "
-            "exists. Use read_json for relevant JSON configuration and read_yaml "
-            "for relevant YAML configuration instead of raw read_file; use "
-            "read_many_files only for a small known set. Then use "
-            "list_changed_files when it helps focus validation or failure "
-            "inspection. Report commands and exact outcomes; do not edit files."
-        ),
-        "reviewer": (
-            "Review the completed work and produce the concise final user-facing "
-            "summary required by the system prompt. Start with git_status and "
-            "list_changed_files, then use git_diff only for relevant changed-file "
-            "details; do not reread the whole project when that evidence is enough. "
-            "Use read_json for relevant JSON configuration and read_yaml for "
-            "relevant YAML configuration instead of raw read_file. Use "
-            "read_many_files only for a small known changed-file set, and use "
-            "list_symbols before broad reads of large supported source files when "
-            "locating definitions. For CI-backed release-readiness reviews, use "
-            "ci_summary before inventing validation commands. "
-            "Do not edit files or request a commit."
-        ),
-        "security": (
-            "Review the sensitive changed files and report concrete trust-boundary "
-            "findings. Use project_health and dependency_summary for broad context, "
-            "git_status and list_changed_files for suspicious tracked runtime, "
-            "generated, or secret-looking paths, and git_diff only for relevant "
-            "security-sensitive details. Use read_json for relevant non-secret "
-            "JSON configuration and read_yaml for relevant non-secret YAML "
-            "configuration instead of raw read_file. Use read_many_files only for "
-            "a small known set and respect every blocked-path result. "
-            "For CI or release-security work, use ci_summary for redacted jobs, "
-            "runtime hints, and commands. "
-            "Use list_symbols to locate definitions before broad reads of large "
-            "supported source files. Do not edit files, run project commands, or "
-            "request a commit."
-        ),
-        "scaffolder": (
-            "Create only the approved starter project, preserving overwrite and "
-            "dependency-approval rules."
-        ),
-    }.get(role.name, "Complete only this role's bounded purpose.")
+    if role.name == "planner" and phase == "inspect":
+        phase_instruction = (
+            "Inspect only what is needed and directly answer the read-only "
+            "request. Do not produce an implementation plan, propose edits, run "
+            "validation, or hand work to another role."
+        )
+    else:
+        phase_instruction = {
+            "planner": (
+                "Inspect the project and return a concrete plan only. Include likely "
+                "files and validation; use project_health first for broad review, "
+                "onboarding, or feature planning, and dependency_summary before "
+                "choosing uncertain validation, build, or development commands. When "
+                "CI configuration exists, use ci_summary before inventing validation "
+                "commands. Keep tiny single-file tasks narrowly scoped instead of "
+                "calling every introspection tool. Use read_json for known JSON "
+                "configuration and read_yaml for known YAML configuration instead of "
+                "raw read_file; batch only a small related file set. Use "
+                "list_symbols before broad reads of large supported source files. Use "
+                "git_status and list_changed_files before planning a review or "
+                "commit, and git_diff only when changed-file details are needed. Do "
+                "not implement or commit anything."
+            ),
+            "coder": (
+                "Use the planner handoff as context and implement the requested "
+                "change. Use read_json for known JSON configuration and read_yaml "
+                "for known YAML configuration instead of raw read_file. Use "
+                "read_many_files only for a small known related file set, and "
+                "list_symbols before broad reads of large supported source files "
+                "when locating definitions. Every mutation remains subject to the "
+                "existing tool approval policy."
+            ),
+            "tester": (
+                "Validate the current project state with the available approved "
+                "tools. Use dependency_summary before guessing uncertain commands "
+                "and ci_summary before inventing validation commands when CI "
+                "configuration exists. Use read_json for relevant JSON configuration "
+                "and read_yaml for relevant YAML configuration instead of raw "
+                "read_file; use read_many_files only for a small known set. Then use "
+                "list_changed_files when it helps focus validation or failure "
+                "inspection. Report commands and exact outcomes; do not edit files."
+            ),
+            "reviewer": (
+                "Review the completed work and produce the concise final user-facing "
+                "summary required by the system prompt. Start with git_status and "
+                "list_changed_files, then use git_diff only for relevant changed-file "
+                "details; do not reread the whole project when that evidence is "
+                "enough. Use read_json for relevant JSON configuration and read_yaml "
+                "for relevant YAML configuration instead of raw read_file. Use "
+                "read_many_files only for a small known changed-file set, and use "
+                "list_symbols before broad reads of large supported source files "
+                "when locating definitions. For CI-backed release-readiness reviews, "
+                "use ci_summary before inventing validation commands. Do not edit "
+                "files or request a commit."
+            ),
+            "security": (
+                "Review the sensitive changed files and report concrete "
+                "trust-boundary findings. Use project_health and dependency_summary "
+                "for broad context, git_status and list_changed_files for suspicious "
+                "tracked runtime, generated, or secret-looking paths, and git_diff "
+                "only for relevant security-sensitive details. Use read_json for "
+                "relevant non-secret JSON configuration and read_yaml for relevant "
+                "non-secret YAML configuration instead of raw read_file. Use "
+                "read_many_files only for a small known set and respect every "
+                "blocked-path result. For CI or release-security work, use ci_summary "
+                "for redacted jobs, runtime hints, and commands. Use list_symbols to "
+                "locate definitions before broad reads of large supported source "
+                "files. Do not edit files, run project commands, or request a commit."
+            ),
+            "scaffolder": (
+                "Create only the approved starter project, preserving overwrite and "
+                "dependency-approval rules."
+            ),
+        }.get(role.name, "Complete only this role's bounded purpose.")
     return (
         f"Original user request:\n{normalized_request}\n\n"
-        f"Active phase: {role.name}\n"
+        f"Active phase: {phase or role.name}\n"
         f"Phase instruction: {phase_instruction}\n\n"
         f"Prior subagent handoffs:\n{handoff}\n\n"
         f"Files changed by completed mutation phases:\n{changed}"

@@ -616,6 +616,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $FastPathProject "examples/
 @'
 {"name": "fast-path-demo", "scripts": {"test": "pytest -q"}}
 '@ | Set-Content -LiteralPath (Join-Path $FastPathProject "examples/projects/browser-demo/package.json") -Encoding utf8
+"export default function App() { return null; }" | Set-Content -LiteralPath (Join-Path $FastPathProject "examples/projects/browser-demo/App.jsx") -Encoding utf8
 
 $env:FAST_PATH_PROJECT = $FastPathProject
 @'
@@ -687,6 +688,52 @@ browser server, or commit runs.
 
 Requests that add `then run validation`, `open it in the browser`, a second
 tool name, or an edit instruction should instead use the normal workflow.
+
+To inspect deterministic role selection without contacting a model:
+
+```powershell
+@'
+from lunar_forge.subagents import WorkflowKind, build_task_phase_plan
+from lunar_forge.tools.registry import TaskProfile
+
+cases = (
+    ("explain", "Explain the package layout.", TaskProfile.REVIEW_ONLY),
+    (
+        "review",
+        "Review uncommitted changes for diff quality.",
+        TaskProfile.REVIEW_ONLY,
+    ),
+    (
+        "validation",
+        "Run validation without changing files.",
+        TaskProfile.EDIT_TASK,
+    ),
+    ("edit", "Update the parser.", TaskProfile.EDIT_TASK),
+)
+for name, request, profile in cases:
+    plan = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request=request,
+        task_profile=profile,
+    )
+    print(name, plan.role_names)
+'@ | python -
+```
+
+Expected roles are `('planner',)`, `('reviewer',)`, `('tester',)`, and
+`('planner', 'coder', 'tester', 'reviewer')`, respectively.
+
+With a configured model and a Git working tree, these commands exercise the
+user-facing summaries:
+
+```powershell
+lunar-forge --subagents --project $FastPathProject "Run list_symbols on examples/projects/browser-demo/App.jsx."
+lunar-forge --subagents --project $FastPathProject "Review uncommitted changes for diff quality."
+```
+
+The first command omits `Subagents run` because the deterministic fast path ran
+no role. The second lists only `reviewer`; it must not list Planner, Coder,
+Tester, or Security unless the request is expanded to require them.
 
 **Cleanup**
 

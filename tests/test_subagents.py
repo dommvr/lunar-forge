@@ -24,7 +24,9 @@ from lunar_forge.subagents import (
     SubagentRole,
     WorkflowKind,
     build_phase_plan,
+    build_task_phase_plan,
     get_subagent_role,
+    requires_security_analysis,
     requires_security_review,
     task_profile_for_role,
 )
@@ -589,6 +591,64 @@ def test_parallel_phase_plans_group_only_non_writer_roles():
     )
 
 
+def test_task_phase_plans_skip_unneeded_roles():
+    readonly = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request="Explain the package layout.",
+        task_profile=TaskProfile.REVIEW_ONLY,
+    )
+    review = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request="Review uncommitted changes for diff quality.",
+        task_profile=TaskProfile.REVIEW_ONLY,
+    )
+    validation = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request="Run validation without changing files.",
+        task_profile=TaskProfile.EDIT_TASK,
+    )
+    edit = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request="Update the parser and run validation.",
+        task_profile=TaskProfile.EDIT_TASK,
+    )
+
+    assert readonly.role_names == ("planner",)
+    assert readonly.phases[0].name == "inspect"
+    assert review.role_names == ("reviewer",)
+    assert validation.role_names == ("tester",)
+    assert edit.role_names == ("planner", "coder", "tester", "reviewer")
+
+
+def test_task_phase_plan_parallelizes_explicit_validation_and_review():
+    plan = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request="Review the UI in a browser and report console errors.",
+        task_profile=TaskProfile.BROWSER_TASK,
+        browser_intent=True,
+        parallel=True,
+    )
+
+    assert plan.role_names == ("tester", "reviewer")
+    assert [
+        (group_id, tuple(phase.role_name for phase in phases))
+        for group_id, phases in plan.parallel_groups
+    ] == [("post-edit", ("tester", "reviewer"))]
+
+
+def test_security_analysis_requires_a_sensitive_request():
+    for request in (
+        "Review MCP permissions.",
+        "Audit Docker isolation.",
+        "Check for leaked secrets.",
+        "Perform a CI security review.",
+    ):
+        assert requires_security_analysis(request) is True
+
+    assert requires_security_analysis("Explain config loading.") is False
+    assert requires_security_analysis("Review ordinary application code.") is False
+
+
 def test_parallel_phase_plan_rejects_writer_roles():
     with pytest.raises(ValueError, match="Writer subagent 'coder'"):
         SubagentPhasePlan(
@@ -916,6 +976,58 @@ def test_existing_project_subagents_run_in_deterministic_order(tmp_path):
         if event["event"] == "subagent_started"
     ]
     assert started == ["planner", "coder", "tester", "reviewer"]
+
+
+def test_review_uncommitted_changes_runs_only_reviewer(tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text=(
+                    "Findings:\n- No blocking diff-quality concerns.\n\n"
+                    "Changed files:\n- None."
+                )
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+    ).run("Review uncommitted changes for diff quality.", tmp_path)
+
+    assert [call["role"] for call in model.calls] == ["reviewer"]
+    assert "Subagents run:\n- reviewer" in output
+    assert "\n- planner" not in output
+    assert "\n- coder" not in output
+    assert "\n- tester" not in output
+    assert "\n- security" not in output
+
+
+def test_validation_only_request_runs_tester_without_coder_or_reviewer(tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text=(
+                    "Validation was requested.\n\n"
+                    "Subagents run:\n- coder\n- tester\n- reviewer"
+                )
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+    ).run(
+        "Run validation and report results without changing files.",
+        tmp_path,
+    )
+
+    assert [call["role"] for call in model.calls] == ["tester"]
+    assert "Subagents run:\n- tester" in output
+    assert output.count("Subagents run:") == 1
+    assert "\n- coder" not in output
+    assert "\n- reviewer" not in output
 
 
 def test_final_summary_uses_authoritative_session_changed_files(tmp_path):
@@ -1246,7 +1358,7 @@ def test_browser_success_is_authoritative_over_reviewer_text(
             return ModelResponse(text=f"{role.title()} completed.")
 
     request = (
-        "Start the dev server if needed, inspect the UI in a browser, capture a "
+        "Start the dev server if needed, review the UI in a browser, capture a "
         "full-page screenshot, and report console errors."
     )
     output = CodeAgent(
@@ -1329,49 +1441,14 @@ def test_structured_read_only_paths_do_not_add_browser_or_advisory_noise(
 
     class SuccessfulReadOnlyModel:
         def __init__(self):
-            self.reviewer_calls = 0
+            self.calls = 0
 
         def complete(self, messages, tools=None):
-            system_prompt = str(messages[0]["content"])
-            role_line = next(
-                line
-                for line in system_prompt.splitlines()
-                if line.startswith("Active subagent role:")
-            )
-            role = role_line.partition(":")[2].strip()
-            if role != "reviewer":
-                return ModelResponse(text=f"{role.title()} completed.")
-
-            self.reviewer_calls += 1
-            if self.reviewer_calls == 1:
-                schema_names = {
-                    schema["function"]["name"] for schema in (tools or [])
-                }
-                assert tool_name in schema_names
-                return ModelResponse(
-                    text="",
-                    tool_calls=(
-                        ToolCall(
-                            id="inspect",
-                            name=tool_name,
-                            arguments={"path": relative_path},
-                        ),
-                    ),
-                )
+            self.calls += 1
+            assert list(tools or []) == []
+            assert "read-only result summarizer" in str(messages[0]["content"])
             return ModelResponse(
-                text=(
-                    "Findings:\n"
-                    f"- Successfully inspected {relative_path} with {tool_name}."
-                    "\n\n"
-                    "Changed files:\n"
-                    "- None.\n\n"
-                    "Validation:\n"
-                    "- Not needed for this read-only inspection.\n\n"
-                    "Commands run:\n"
-                    "- None.\n\n"
-                    "Checkpoints:\n"
-                    "- None."
-                )
+                text=f"Successfully inspected {relative_path} with {tool_name}."
             )
 
     model = SuccessfulReadOnlyModel()
@@ -1383,8 +1460,9 @@ def test_structured_read_only_paths_do_not_add_browser_or_advisory_noise(
         tmp_path,
     )
 
-    assert model.reviewer_calls == 2
+    assert model.calls == 1
     assert f"Successfully inspected {relative_path} with {tool_name}." in output
+    assert "Subagents run:" not in output
     assert "Reviewer findings (advisory):" not in output
     assert "Browser validation:" not in output
     assert "Browser validation: Not run" not in output

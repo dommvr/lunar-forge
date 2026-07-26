@@ -96,6 +96,32 @@ def test_system_and_subagent_prompts_name_active_task_profiles():
     assert "Active model-call task profile: review_only" in subagent_prompt
 
 
+def test_planner_inspection_phase_directly_answers_readonly_request():
+    base_prompt = build_system_prompt(
+        PROJECT_INFO,
+        "No extra instructions.",
+        "default",
+        task_profile="review_only",
+    )
+    system_prompt = build_subagent_system_prompt(
+        base_prompt,
+        PLANNER_ROLE,
+        task_profile="review_only",
+        phase="inspect",
+    )
+    user_prompt = build_subagent_user_prompt(
+        "Explain the package layout.",
+        PLANNER_ROLE,
+        phase="inspect",
+    )
+
+    assert "Active subagent phase: inspect" in system_prompt
+    assert "directly answer the read-only request" in system_prompt
+    assert "Active phase: inspect" in user_prompt
+    assert "Do not produce an implementation plan" in user_prompt
+    assert "hand work to another role" in user_prompt
+
+
 def test_readonly_fast_path_prompt_is_compact_and_action_free():
     messages = build_readonly_fast_path_messages(
         "Run git_status and report whether the repo is clean.",
