@@ -232,22 +232,29 @@ def test_shell_dispatch_preserves_local_mode(monkeypatch, tmp_path):
     "command",
     ("python", "python.exe", "py", "py.exe"),
 )
+@pytest.mark.parametrize("runtime_mode", ("local", "docker"))
 def test_bare_python_interpreters_are_blocked_before_dispatch(
     monkeypatch,
     tmp_path,
     command,
+    runtime_mode,
 ):
     def unexpected_runner(*args, **kwargs):
         raise AssertionError("Bare interpreter must not reach a runner")
 
     monkeypatch.setattr(
-        "lunar_forge.tools.shell.run_local_command",
+        (
+            "lunar_forge.tools.shell.run_docker_command"
+            if runtime_mode == "docker"
+            else "lunar_forge.tools.shell.run_local_command"
+        ),
         unexpected_runner,
     )
 
-    result = run_command(tmp_path, command)
+    result = run_command(tmp_path, command, runtime_mode=runtime_mode)
 
     assert result["ok"] is False
+    assert result["runtime"] == runtime_mode
     assert result["exit_code"] is None
     assert "not meaningful checks" in result["error"]
 
@@ -258,6 +265,10 @@ def test_bare_python_interpreters_are_blocked_before_dispatch(
         "python -m pytest",
         "python -B -m compileall .",
         "python app.py",
+        'python -c "print(\'ok\')"',
+        "python --version",
+        "python -V",
+        "python --help",
     ),
 )
 def test_meaningful_python_commands_remain_dispatchable(

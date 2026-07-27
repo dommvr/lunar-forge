@@ -120,6 +120,7 @@ def run_browser_setup(
     permissions = PermissionManager(
         mode=effective_permission_mode,
         approval_callback=approval_callback,
+        runtime_mode="local",
     )
     command_runner = _command_runner or run_command
     results: list[dict[str, Any]] = []

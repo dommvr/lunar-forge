@@ -245,6 +245,35 @@ def test_commit_requires_approval_even_in_yes_mode(monkeypatch, tmp_path):
     assert not any(args[:1] in {("add",), ("commit",)} for _, args, _ in calls)
 
 
+def test_commit_approval_shows_validation_before_git_proposal(
+    monkeypatch,
+    tmp_path,
+):
+    _mock_git(monkeypatch, tmp_path, " M README.md\0")
+    approvals = []
+    validation_context = (
+        "Validation results before commit approval:\n"
+        "- python -B -m compileall .: passed "
+        "(authoritative tool result; exit code 0)"
+    )
+
+    result = create_git_commit(
+        tmp_path,
+        "Update README",
+        session_files=("README.md",),
+        approval_callback=lambda request: approvals.append(request) or False,
+        approval_context=validation_context,
+    )
+
+    assert result["result_code"] == "approval_denied"
+    assert len(approvals) == 1
+    description = approvals[0].description
+    assert description.startswith(validation_context)
+    assert description.index("Validation results before commit approval:") < (
+        description.index("Git status --short")
+    )
+
+
 @pytest.mark.parametrize(
     ("mode", "message"),
     (("plan", "Plan mode blocks Git commits"), ("no-command", "blocks Git")),
@@ -751,6 +780,81 @@ def test_failed_validation_prevents_auto_offered_commit(monkeypatch, tmp_path):
     assert results[0]["data"]["result_code"] == "validation_failed"
 
 
+def test_failed_run_command_validation_blocks_commit_without_approval(
+    monkeypatch,
+    tmp_path,
+):
+    evidence = agent_module.ValidationEvidence(validation_requested=True)
+    agent_module._record_validation_evidence(
+        evidence,
+        "run_command",
+        {"command": "pytest"},
+        {
+            "ok": False,
+            "command": "pytest",
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": "pytest: not found",
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: pytest.fail(
+            "Failed validation must suppress normal commit approval"
+        ),
+    )
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        "The change is ready to commit.",
+        request="Update README.md, validate, then offer to commit.",
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=("README.md",),
+        validation_evidence=evidence,
+        offer_commit=True,
+        commit_message="Update README",
+    )
+
+    assert evidence.validation_observed is True
+    assert evidence.validation_failed is True
+    assert "ready to commit" not in output.casefold()
+    assert output.endswith("Git:\n- Commit not created: validation failed")
+
+
+def test_requested_validation_that_did_not_run_blocks_commit(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        agent_module,
+        "create_git_commit",
+        lambda *args, **kwargs: pytest.fail(
+            "Commit approval must wait for requested validation"
+        ),
+    )
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        "Updated README.md.",
+        request="Update README.md, validate, then offer to commit.",
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=("README.md",),
+        validation_evidence=agent_module.ValidationEvidence(
+            validation_requested=True
+        ),
+        offer_commit=True,
+        commit_message="Update README",
+    )
+
+    assert output.endswith(
+        "Git:\n- Commit not created: requested validation did not run"
+    )
+
+
 def test_commit_mention_alone_does_not_override_failed_validation(
     monkeypatch,
     tmp_path,
@@ -820,6 +924,13 @@ def test_explicit_failed_validation_override_allows_commit_proposal(
     )
 
     assert captured["session_files"] == ("app.py",)
+    assert captured["approval_context"].startswith(
+        "Validation results before commit approval:\n"
+        "- Validation failed"
+    )
+    assert "explicitly requested a commit despite failed validation" in (
+        captured["approval_context"]
+    )
     assert "Proposed commit message: Commit despite failure" in output
     assert output.endswith("- Commit not created: approval denied")
 
@@ -1032,8 +1143,14 @@ def test_agent_commit_flow_preserves_executed_validation_summary(
             ),
         )
     )
+    captured_commit = {}
 
     def fake_commit(project_root, message, **kwargs):
+        captured_commit.update(
+            project_root=project_root,
+            message=message,
+            **kwargs,
+        )
         return {
             "ok": True,
             "repository_root": str(tmp_path),
@@ -1077,6 +1194,10 @@ def test_agent_commit_flow_preserves_executed_validation_summary(
     ) in output
     assert "Not run (review-only phase)" not in output
     assert "Commands run:\n- None" not in output
+    assert captured_commit["approval_context"].startswith(
+        "Validation results before commit approval:\n"
+        f"- {validation_command}: passed "
+    )
     assert "Proposed commit message: Update app" in output
     assert "- Commit created: abc123" in output
 

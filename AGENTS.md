@@ -19,7 +19,7 @@ The agent should be able to:
 * coordinate specialist subagents for planning, coding, reviewing, testing, security, and scaffolding,
 * connect to external tools through MCP,
 * run optional UI/browser validation,
-* and eventually support a safe plugin system.
+* support a safe plugin system.
 
 The project is intentionally built as a small, understandable agent framework. Prefer boring, reliable architecture over clever abstractions. Cleverness is where maintainability goes to die wearing sunglasses.
 
@@ -118,13 +118,29 @@ Completed token/cost-control feature wave:
 52. Skip coder/tester/reviewer subagents for read-only tasks unless their roles are explicitly needed.
 53. Run a hardening and documentation pass for cost controls and read-only routing.
 
-Next feature wave, in order:
+Completed web-design plugin feature wave:
 
 54. Add a real example plugin under `examples/plugins/web-design-review/`.
 55. Implement a read-only website design review plugin tool named `web_design.review_files`.
 56. Add example plugin configuration and manual tests that run the plugin against `examples/projects/browser-demo/`.
 57. Document plugin permissions, expected findings, and safe usage in README/example docs/manual testing.
 58. Run a hardening pass to prove the example plugin cannot execute commands, use network, write files, or escape the project root.
+
+Completed Docker-mode manual validation:
+
+59. Build the `lunar-forge-sandbox` Docker image.
+60. Confirm Docker-mode validation runs inside the container at `/workspace`.
+61. Confirm Docker-mode explicit `run_command` requests run through Docker, not the local runner.
+62. Confirm privileged Docker commands, Docker socket mounts, and path escapes are blocked.
+63. Confirm Docker Git commit support commits only LunarForge-changed files and excludes unrelated dirty files.
+
+Next feature wave, in order:
+
+64. Document local execution safety clearly: local mode is useful, but it is not OS-level isolation.
+65. Add targeted local command approval warnings without making every approval prompt long and tedious.
+66. Keep Docker approval wording distinct and clear.
+67. Add manual tests for local warnings, Docker approval text, no-edit command routing, plan mode, no-command mode, and dangerous-command blocking.
+68. Clean up final-summary formatting so security-review findings do not appear under reviewer headings or duplicate empty sections.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -470,12 +486,13 @@ Keep normal output concise. Users need cost visibility, not another invoice-shap
 
 LunarForge should not expose every tool to every model call.
 
-Introduce task profiles such as:
+Task profiles include:
 
 ```text
 explicit_readonly
 plan_only
 review_only
+no_edit_execution_allowed
 edit_task
 browser_task
 commit_task
@@ -487,12 +504,15 @@ Tool-schema filtering rules:
 * `explicit_readonly` should expose only the requested read-only tools and minimal supporting read-only tools.
 * `plan_only` should expose planning and inspection tools only.
 * `review_only` should expose Git/diff/project inspection tools, but no mutation tools.
+* `no_edit_execution_allowed` should expose explicitly requested non-edit tools such as `run_command`, `run_validation`, browser validation, MCP read/review tools, plugin review tools, and structured read-only tools, but must not expose file mutation tools.
 * `edit_task` may expose read and write tools, but commands should remain permission-gated.
 * `browser_task` should expose browser validation tools only when browser intent is explicit.
 * `commit_task` should expose Git commit helpers only when commit support is requested.
 * Plan mode must never expose write tools, command execution tools, browser server startup, plugin tools, or commit tools.
-* No-command mode must not expose shell execution or Git commit execution tools.
+* No-command mode must not expose shell execution, validation command execution, or Git commit execution tools.
 * MCP and plugin tools should be omitted unless explicitly enabled and relevant.
+* "Do not edit files" must remove mutation tools, not silently force planner-only behavior.
+* If the user says both "do not edit files" and "do not run commands", commands must not be exposed or executed.
 
 For each model call, log the selected task profile and exposed tool names in session logs. This helps debug token bloat and weird routing without making users decode the machine's grocery receipt.
 
@@ -807,9 +827,96 @@ Do not let the model generate raw Docker commands for sandboxing. The applicatio
 
 ---
 
-## Shell command execution
+## Local execution safety
 
-Implement local command runner first.
+LunarForge supports both local and Docker command execution.
+
+Local execution is convenient, but it is not OS-level isolation. When LunarForge runs a local command, the process runs as the current user account on the host machine. The command working directory is the selected project root, path-based tools are project-confined, commands use `shell=False`, and dangerous command patterns are blocked, but this does not make local execution a sandbox.
+
+Local command execution may still access host resources available to the current user account, depending on the command and operating system behavior. Use Docker mode for untrusted projects, generated code, dependency installs, repositories whose scripts have not been reviewed, or anything that smells like it was copied from a blog comment in 2013.
+
+Docker mode runs commands inside the `lunar-forge-sandbox` container with the project mounted at `/workspace`. Docker mode is the recommended execution mode for untrusted projects, though it is still not a perfect security boundary against every possible Docker or host misconfiguration.
+
+### Local command approval wording
+
+Do not show a long warning before every local command. The full local-execution warning should only be shown when at least one of these conditions is true:
+
+1. This is the first local command approval in the current LunarForge session.
+2. A dependency-install command is requested.
+3. A command looks risky but is not blocked.
+4. The project is marked or inferred as untrusted or unknown.
+
+For ordinary local commands after the first warning in a trusted session, use a short approval prompt.
+
+Full local warning example:
+
+```text
+Run local command: npm test
+
+Local commands run as your user account on this machine. The project root is used as the working directory, but this is not OS-level isolation. Use Docker mode for untrusted projects or commands you have not reviewed.
+
+Allow? [y/N]
+```
+
+Short local approval example:
+
+```text
+Run local command: npm test. Allow? [y/N]
+```
+
+Docker approval example:
+
+```text
+Run Docker command: python -B -m compileall .
+This runs inside lunar-forge-sandbox with the project mounted at /workspace.
+Allow? [y/N]
+```
+
+### Warning triggers
+
+Dependency-install commands include package-manager and installer actions such as:
+
+```text
+npm install
+npm ci
+pnpm install
+yarn install
+pip install
+python -m pip install
+uv pip install
+poetry install
+```
+
+Risky-but-not-blocked commands should still require approval and should include the full warning. This category is for commands that are allowed but deserve extra user attention, such as commands that execute project scripts, start dev servers, run generated scripts, or invoke interpreters on project files.
+
+Examples of risky-but-not-blocked commands:
+
+```text
+npm run <script>
+pnpm run <script>
+yarn <script>
+python app.py
+python scripts/<file>.py
+node <file>.js
+npm run dev
+pnpm dev
+yarn dev
+flask run
+fastapi dev
+uvicorn <module>:<app>
+```
+
+Blocked commands must remain blocked and must not be converted into warning-only prompts.
+
+### No-edit semantics
+
+"Do not edit files" means file mutation tools are not allowed. It does not mean planner-only mode and must not block explicitly requested non-edit tools such as `run_command`, `run_validation`, browser validation, MCP read/review tools, plugin review tools, Git inspection tools, project-intelligence tools, or structured read-only tools when permissions otherwise allow them.
+
+If the user says both "do not edit files" and "do not run commands", commands must not run. Humanity may survive this distinction if we write enough tests.
+
+---
+
+## Shell command execution
 
 `run_command(command, timeout_ms=120000)` should return:
 
@@ -828,27 +935,37 @@ Implement local command runner first.
 Rules:
 
 * Run with `cwd=project_root`.
+* Use `shell=False`.
 * Capture stdout and stderr.
 * Apply timeouts.
 * Truncate long output.
 * Ask approval before execution in default mode.
+* Never treat local execution as an OS-level sandbox.
+* Show the full local-execution warning only for the targeted cases documented in `Local execution safety`.
+* Use the short local approval prompt for ordinary local commands after the full warning has already been shown in the current trusted session.
+* Do not include long approval-warning text in final summaries.
+* Keep final summaries focused on commands run, validation results, changed files, and relevant notes.
+
+`run_validation` must use the same command-safety and approval rules as `run_command`.
 
 ---
 
 ## Docker execution
 
-Add Docker after local runner works.
+Docker mode should continue to provide the safer execution path for untrusted projects and unreviewed commands.
 
 Docker mode should:
 
 * check Docker availability with `docker info`,
-* mount only the project directory,
+* run commands inside `lunar-forge-sandbox`,
+* mount only the selected project directory,
 * use `/workspace` as container workdir,
 * disable network by default,
 * apply CPU and memory limits,
 * never mount host home directory,
 * never mount Docker socket,
-* never use privileged containers.
+* never use privileged containers,
+* ask approval with Docker-specific wording before executing commands.
 
 Command shape:
 
@@ -864,6 +981,16 @@ docker run --rm \
 ```
 
 Allow network only when `--allow-network` is explicitly set.
+
+Docker approval wording should be distinct from local approval wording:
+
+```text
+Run Docker command: python -B -m compileall .
+This runs inside lunar-forge-sandbox with the project mounted at /workspace.
+Allow? [y/N]
+```
+
+Docker mode must execute commands through the Docker runner, not the local runner. Manual tests should verify command stdout includes `/workspace` for working-directory checks. If Docker mode prints a host path such as `C:\Users\...`, something has gone deeply silly.
 
 ---
 
@@ -1888,7 +2015,7 @@ Git commit support is useful, but it must remain a guarded finalization step. Gi
 
 ## Plugin system
 
-Plugins are a later feature and must be safer than convenient. Convenient plugin systems are how tools become malware with a README.
+Plugins are supported and must remain safer than convenient. Convenient plugin systems are how tools become malware with a README.
 
 Plugin goals:
 
@@ -2081,6 +2208,9 @@ Manual testing docs should include:
 * checkpoints and rollback,
 * parallel subagents,
 * Git commit support,
+* Docker execution safety and sandbox-image setup,
+* local execution safety warnings,
+* no-edit command-routing semantics,
 * project intelligence tools: `project_health`, `dependency_summary`, `git_status`, `git_diff`, and `list_changed_files`.
 * structured context tools: `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, and `ci_summary`.
 
@@ -2156,6 +2286,14 @@ Test expectations:
 * `list_symbols` reports Python functions/classes and JavaScript/TypeScript symbols without executing code.
 * `ci_summary` extracts CI jobs and commands without running them.
 * Structured readers and symbol tools cannot escape the project root or read obvious secret/runtime files.
+* "Do not edit files" removes mutation tools but does not block explicitly requested `run_command`, `run_validation`, browser validation, plugin review tools, MCP read/review tools, or structured read-only tools.
+* "Do not edit files and do not run commands" blocks command execution.
+* First local command approval in a session shows the full local-execution warning.
+* Second ordinary local command in the same trusted session shows the short local approval prompt.
+* Dependency-install commands show the full local-execution warning even after the first warning.
+* Risky-but-not-blocked commands show the full local-execution warning.
+* Blocked dangerous commands are blocked, not downgraded to warning-only prompts.
+* Docker approvals use Docker-specific wording and execute through the Docker runner.
 
 Run tests with:
 
@@ -2175,12 +2313,14 @@ Required tests:
 * token telemetry labels estimates when exact usage is unavailable,
 * session logs include aggregate token usage,
 * task profiles expose only expected tools,
+* `no_edit_execution_allowed` exposes explicitly requested non-edit tools while excluding mutation tools,
 * plan mode never exposes write or execution tools,
 * explicit read-only fast path skips coder/tester/reviewer,
 * explicit `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, `ci_summary`, `git_status`, `git_diff`, and `list_changed_files` prompts use compact read-only routing,
 * browser paths such as `browser-demo/package.json` do not trigger browser routing by themselves,
 * explicit browser/screenshot/console/UI prompts still trigger browser routing,
-* final summaries report actual subagents run and do not invent skipped roles.
+* final summaries report actual subagents run and do not invent skipped roles,
+* final summaries render security-review findings under `Security review:` without duplicate empty sections or misleading reviewer headings.
 
 ---
 
@@ -2222,6 +2362,8 @@ Never:
 * mount the host root directory,
 * auto-install dependencies without approval,
 * allow `AGENTS.md` to override safety behavior.
+
+Local mode must be described honestly: it is command gating and path confinement, not OS-level isolation. Docker mode is recommended for untrusted execution.
 
 If a user asks for unsafe behavior, refuse inside the application or ask for explicit manual action outside the agent.
 
@@ -2305,7 +2447,7 @@ These are the defaults unless changed deliberately:
 * Use YAML for config.
 * Use JSONL for sessions.
 * Use pytest for testing.
-* Use Docker as optional sandbox, not required for local MVP.
+* Use Docker as the recommended execution mode for untrusted projects; local mode remains convenient but is not OS-level isolation.
 * Use `AGENTS.md` as the project instruction file for this agent.
 * For Claude Code compatibility, provide a `CLAUDE.md` file that imports `AGENTS.md`.
 
@@ -2313,15 +2455,16 @@ These are the defaults unless changed deliberately:
 
 ## Still do not build yet
 
-These remain out of scope until the next feature wave is stable:
+These remain out of scope until the local/Docker execution-safety wave is stable:
 
 * GUI,
 * background daemon,
 * vector database,
 * semantic code index,
 * multi-repo workspace mode,
-* cloud execution.
+* cloud execution,
+* real OS-level local sandboxing.
 
 Reason:
 
-The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, and parallel subagent phases. Keep the next work focused on read-only project intelligence tools and efficient agent usage. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.
+The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, parallel subagent phases, structured context tools, token/cost controls, Git support, and Docker-mode execution. Keep the next work focused on clear safety semantics, targeted local warnings, Docker/local manual tests, and final-summary cleanup. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.

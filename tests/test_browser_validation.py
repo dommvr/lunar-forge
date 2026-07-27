@@ -228,9 +228,13 @@ def test_browser_setup_approves_and_runs_each_exact_command(tmp_path):
         "run_command",
         "run_command",
     ]
-    assert [request.description for request in requests] == [
-        f"Run command: {command}." for command in BROWSER_SETUP_COMMANDS
-    ]
+    assert requests[0].description.startswith(
+        f"Run local command: {BROWSER_SETUP_COMMANDS[0]}\n\n"
+    )
+    assert "not OS-level isolation" in requests[0].description
+    assert requests[1].description == (
+        f"Run local command: {BROWSER_SETUP_COMMANDS[1]}."
+    )
     assert [call["command"] for call in calls] == list(BROWSER_SETUP_COMMANDS)
     assert all(call["project_root"] == tmp_path.resolve() for call in calls)
     assert all(call["runtime_mode"] == "local" for call in calls)

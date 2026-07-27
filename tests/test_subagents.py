@@ -2053,12 +2053,20 @@ def test_docker_security_summary_separates_roles_and_deduplicates_sections(
                 text=(
                     "Findings:\n"
                     "- Reviewer maintainability finding.\n\n"
+                    "Security findings:\n"
+                    "- Docker network isolation remains enabled.\n\n"
                     "Validation:\n"
                     "- Not run.\n\n"
                     "Commands run:\n"
                     "- None.\n\n"
                     "Checkpoints:\n"
                     "- None.\n\n"
+                    "Validation:\n"
+                    "- Not run (duplicate raw block).\n\n"
+                    "Commands run:\n"
+                    "- None (duplicate raw block).\n\n"
+                    "Checkpoints:\n"
+                    "- None (duplicate raw block).\n\n"
                     "Security review:"
                 )
             ),
@@ -2101,6 +2109,8 @@ def test_docker_security_summary_separates_roles_and_deduplicates_sections(
     assert "Reviewer maintainability finding." in output
     assert "Security review:\n- Docker network isolation remains enabled." in output
     assert "Security findings:" not in output
+    reviewer_block = output.partition("Security review:")[0]
+    assert "Docker network isolation remains enabled." not in reviewer_block
     assert output.count("Security review:") == 1
     assert output.count("Validation:") == 1
     assert output.count("Commands run:") == 1
@@ -2125,7 +2135,13 @@ def test_empty_security_role_output_does_not_add_empty_section(tmp_path):
                     "Commands run:\n"
                     "- None.\n\n"
                     "Checkpoints:\n"
-                    "- None."
+                    "- None.\n\n"
+                    "Validation:\n"
+                    "- Not run (duplicate raw block).\n\n"
+                    "Commands run:\n"
+                    "- None (duplicate raw block).\n\n"
+                    "Checkpoints:\n"
+                    "- None (duplicate raw block)."
                 )
             ),
             ModelResponse(

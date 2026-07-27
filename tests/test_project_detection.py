@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from lunar_forge.project_detection import detect_project, detect_project_type
+from lunar_forge.project_detection import (
+    detect_project,
+    detect_project_type,
+    resolve_project_trust,
+)
 
 
 def test_detect_empty_project(tmp_path):
@@ -20,6 +24,7 @@ def test_detect_empty_project(tmp_path):
         "is_empty": True,
     }
     assert detect_project_type(tmp_path) == "empty"
+    assert resolve_project_trust(tmp_path) == "unknown"
 
 
 def test_detect_python_project(tmp_path):
@@ -29,9 +34,37 @@ def test_detect_python_project(tmp_path):
 
     assert project["languages"] == ["python"]
     assert project["frameworks"] == []
-    assert project["test_command"] == "pytest"
+    assert project["test_command"] == "python -B -m compileall ."
     assert project["is_empty"] is False
     assert detect_project_type(tmp_path) == "python"
+    assert resolve_project_trust(tmp_path) == "trusted"
+
+
+@pytest.mark.parametrize("pytest_marker", ("tests", "test_file", "config"))
+def test_detect_python_project_prefers_pytest_only_with_test_setup(
+    tmp_path,
+    pytest_marker,
+):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\n",
+        encoding="utf-8",
+    )
+    if pytest_marker == "tests":
+        (tmp_path / "tests").mkdir()
+    elif pytest_marker == "test_file":
+        (tmp_path / "test_app.py").write_text(
+            "def test_app():\n    assert True\n",
+            encoding="utf-8",
+        )
+    else:
+        (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
+    assert detect_project(tmp_path)["test_command"] == "pytest"
+
+
+@pytest.mark.parametrize("trust", ("trusted", "untrusted", "unknown"))
+def test_explicit_project_trust_overrides_auto_detection(tmp_path, trust):
+    assert resolve_project_trust(tmp_path, trust) == trust
 
 
 def test_detect_vite_react_npm_project(tmp_path):
@@ -159,7 +192,7 @@ def test_detect_django_from_manage_py_and_requirements(tmp_path):
 
     assert project["languages"] == ["python"]
     assert project["frameworks"] == ["django"]
-    assert project["test_command"] == "pytest"
+    assert project["test_command"] == "python -B -m compileall ."
 
 
 def test_detect_flask_like_app_py(tmp_path):

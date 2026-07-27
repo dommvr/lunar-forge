@@ -25,10 +25,7 @@ def run_command(
 ) -> dict[str, Any]:
     """Dispatch a bounded command to the configured application-owned runner."""
     normalized_mode = runtime_mode.strip().lower()
-    if (
-        normalized_mode == "local"
-        and is_bare_python_interpreter_command(command)
-    ):
+    if is_bare_python_interpreter_command(command):
         return {
             "ok": False,
             "runtime": normalized_mode,

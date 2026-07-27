@@ -1239,6 +1239,7 @@ def create_tool_registry(
     approval_callback: ApprovalCallback | None = None,
     *,
     runtime_mode: str = "local",
+    project_trust: str = "auto",
     allow_network: bool = False,
     mcp_client: MCPClient | None = None,
     plugins: Sequence[LoadedPlugin] = (),
@@ -1246,7 +1247,13 @@ def create_tool_registry(
     session_changed_files: list[str] | None = None,
 ) -> ToolRegistry:
     """Create built-ins and explicitly enabled external extension tools."""
+    from lunar_forge.project_detection import resolve_project_trust
+
     normalized_mode = mode.strip().lower()
+    resolved_project_trust = resolve_project_trust(
+        project_root,
+        project_trust,
+    )
     session_tracker = (
         session_changed_files
         if session_changed_files is not None
@@ -1277,6 +1284,8 @@ def create_tool_registry(
         permission_manager=PermissionManager(
             mode=mode,
             approval_callback=approval_callback,
+            runtime_mode=runtime_mode,
+            project_trust=resolved_project_trust,
         ),
         session_changed_files=session_tracker,
     )

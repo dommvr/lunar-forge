@@ -24,11 +24,18 @@ When a command prompts for approval, compare the displayed action with the
 command described by the test before answering `y`. Paths beneath
 `$ManualRoot` can be removed between tests.
 
+The local/Docker safety section checks both enforcement and approval wording.
+Local and Docker routing, path boundaries, `shell=False`, dangerous-command
+denial, Docker `/workspace` behavior, first-session warnings, repeated ordinary
+approvals, dependency and risky-command warnings, and Docker-specific prompts
+are all current pass/fail checks.
+
 ## Progress
 
 - [ ] Install and CLI availability
 - [ ] Config loading and precedence
 - [ ] Plan mode
+- [ ] Local and Docker execution safety
 - [ ] Basic project inspection
 - [ ] Built-in project intelligence
 - [ ] Safe structured file readers
@@ -1370,6 +1377,16 @@ The result lists `python -B -m compileall .` and `pytest`; both exit with code 0
 the overall message says all validation commands passed; and no file edit is
 made.
 
+Delete the test file and repeat the same command:
+
+```powershell
+Remove-Item -LiteralPath (Join-Path $ValidationProject "test_app.py")
+lunar-forge --project $ValidationProject "Use run_validation now and report every detected command and result. Do not edit files."
+```
+
+The tiny Python project now selects only `python -B -m compileall .`; it must
+not attempt `pytest` when no tests or pytest configuration exist.
+
 **Cleanup**
 
 ```powershell
@@ -2029,9 +2046,13 @@ excludes `.agent`, requires another approval, and returns its hash.
 The session JSONL contains `git_status_summary`, `git_commit_proposal`,
 `git_commit_approval`, `git_commit_result`, and, for an approved commit,
 `git_commit_created` events. A separate run with a failed `run_validation`
-result and only the `--commit` flag ends with `Commit not created: validation
-failed`. Merely mentioning a commit in the prompt does not override this guard;
-the prompt must explicitly say something like `commit even if validation fails`.
+result and only the `--commit` flag must show the failed validation in the final
+answer, must not display the normal Git approval prompt, and must end with
+`Commit not created: validation failed`. A passing validation status must appear
+above `Git status --short` in the approval preview, before `Allow? [y/N]`.
+Merely mentioning a commit in the prompt does not override a failure; the prompt
+must explicitly say something like `commit even if validation fails`. That
+override approval repeats the failed status before the Git proposal.
 
 **Cleanup**
 
@@ -2120,6 +2141,201 @@ $ExampleGenerated | ForEach-Object {
 }
 ```
 
+## Local and Docker execution safety
+
+**Purpose**
+
+Confirm the current local/Docker execution boundaries and record the targeted
+approval-warning behavior without treating local execution as a sandbox.
+
+Current guarantees:
+
+- path-based tools are confined to the selected project root;
+- local commands use the project root as `cwd`, run with `shell=False`, and
+  execute as the current host user;
+- dangerous command patterns are blocked before execution;
+- Docker commands run inside `lunar-forge-sandbox` at `/workspace`;
+- Docker wrappers never request privileged mode or a Docker socket mount; and
+- plan and no-command modes block explicit command requests.
+
+Use Docker mode for untrusted projects, generated code, dependency installs,
+and scripts that have not been reviewed. The local-warning and Docker-approval
+text below is the expected current wording.
+
+**Setup**
+
+These agent-driven tests require a configured model. Git is used only as a
+small ordinary executable for warning-order tests. The Docker test requires the
+checked-in `lunar-forge-sandbox` image:
+
+```powershell
+$ExecutionProject = Join-Path $ManualRoot "execution-safety-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $ExecutionProject ".agent") | Out-Null
+@'
+runtime:
+  mode: local
+  allow_network: false
+  project_trust: trusted
+permissions:
+  mode: default
+'@ | Set-Content -LiteralPath (Join-Path $ExecutionProject ".agent\config.yaml") -Encoding utf8
+@'
+print("safe-script-ran")
+'@ | Set-Content -LiteralPath (Join-Path $ExecutionProject "safe_script.py") -Encoding utf8
+docker build -t lunar-forge-sandbox -f lunar_forge/sandbox/Dockerfile .
+```
+
+### First and second ordinary local command approvals
+
+Run two ordinary commands in one LunarForge session:
+
+```powershell
+lunar-forge --project $ExecutionProject "Use run_command to run python --version, then use run_command to run git --version. Do not edit files."
+```
+
+Targeted warning result:
+
+1. The first approval shows the full local warning:
+
+   ```text
+   Run local command: python --version
+
+   Local commands run as your user account on this machine. The project root is
+   used as the working directory, but this is not OS-level isolation. Use Docker
+   mode for untrusted projects or commands you have not reviewed.
+
+   Allow? [y/N]
+   ```
+
+2. After approving it, the second ordinary command in the same trusted session
+   uses short wording:
+
+   ```text
+   Run local command: git --version. Allow? [y/N]
+   ```
+
+Approve both commands. Both version commands should succeed, no mutation tool
+should be exposed, and `safe_script.py` should remain unchanged.
+
+### Dependency-install warning
+
+Use an ordinary command first so the dependency warning is not merely the
+first-command warning:
+
+```powershell
+lunar-forge --project $ExecutionProject "Use run_command to run git --version, then use run_command to run python -m pip install --dry-run lunar-forge-warning-probe. Do not edit files."
+```
+
+Approve `git --version`, then inspect and deny the install request. The targeted
+result is a full local warning for the second command because dependency
+installation always receives the long warning, even after the first trusted
+session warning. Denial must prevent pip from running.
+
+### Risky-but-not-blocked command warning
+
+Run an ordinary command followed by a benign project script:
+
+```powershell
+lunar-forge --project $ExecutionProject "Use run_command to run git --version, then use run_command to run python safe_script.py. Do not edit files."
+```
+
+Approve both commands. The targeted result is a full warning for
+`python safe_script.py` because direct execution of a project script is
+risky-but-not-blocked, even though it is the second command in the session.
+The command runs locally as the current user with `cwd=$ExecutionProject`,
+prints `safe-script-ran`, and does not imply OS-level isolation.
+
+### Blocked dangerous command
+
+```powershell
+lunar-forge --project $ExecutionProject "Use run_command to run sudo python --version. Do not edit files."
+```
+
+The command is rejected by the dangerous-command policy before any approval.
+No local subprocess runs. Blocked commands must never be converted into a full
+warning followed by an approval choice.
+
+### Docker approval wording and `/workspace` proof
+
+```powershell
+lunar-forge --docker --project $ExecutionProject "Use run_command to run pwd. Then include stdout. Do not edit files."
+```
+
+The targeted Docker-specific approval is:
+
+```text
+Run Docker command: pwd
+This runs inside lunar-forge-sandbox with the project mounted at /workspace.
+Allow? [y/N]
+```
+
+Approve the command. Docker stdout must report `/workspace`, proving the
+command ran in the container working directory. The application-generated
+wrapper must use one project mount, omit `--privileged`, omit
+`/var/run/docker.sock`, and retain network isolation unless `--allow-network`
+was explicitly supplied.
+
+### Safe Python inspection and bare-interpreter blocking
+
+```powershell
+lunar-forge --docker --project $ExecutionProject "Use run_command to run python --version. Do not edit files."
+lunar-forge --docker --project $ExecutionProject "Use run_command to run python -V. Do not edit files."
+lunar-forge --docker --project $ExecutionProject "Use run_command to run python. Do not edit files."
+```
+
+Approve each version inspection; both must run through the Docker runner. The
+bare `python` request must be rejected before approval because it would start an
+interactive interpreter. Repeat the last command with `python.exe`, `py`, and
+`py.exe`; each no-argument form must remain blocked.
+
+### No-edit and no-command wording
+
+The successful local and Docker tests above prove that `Do not edit files`
+blocks mutation tools without blocking an explicitly requested `run_command`.
+The same distinction applies to explicit `run_validation`, browser validation,
+plugin review tools, MCP read/review tools, Git inspection tools,
+project-intelligence tools, and structured read-only tools when their normal
+configuration, permission, and approval checks allow them.
+
+Now add an explicit command prohibition:
+
+```powershell
+lunar-forge --project $ExecutionProject "Use run_command to run python --version. Do not edit files and do not run commands."
+```
+
+No command schema should be exposed, no approval should appear, and no command
+should run.
+
+### Plan mode blocks explicit `run_command`
+
+```powershell
+lunar-forge --plan --project $ExecutionProject "Use run_command to run python --version. Do not edit files."
+```
+
+Plan mode remains authoritative: `run_command` is not exposed, no approval
+appears, and Python is not executed.
+
+### No-command mode blocks explicit `run_command`
+
+```powershell
+@'
+runtime:
+  mode: no-command
+permissions:
+  mode: no-command
+'@ | Set-Content -LiteralPath (Join-Path $ExecutionProject ".agent\config.yaml") -Encoding utf8
+lunar-forge --project $ExecutionProject "Use run_command to run python --version. Do not edit files."
+```
+
+No-command mode also remains authoritative: no command tool is exposed, no
+approval appears, and Python is not executed.
+
+**Cleanup**
+
+```powershell
+Remove-Item -Recurse -Force -LiteralPath $ExecutionProject
+```
+
 ## Repository validation after documentation changes
 
 **Purpose**
@@ -2155,9 +2371,3 @@ that it still points to the disposable directory created for this guide:
 Write-Host $ManualRoot
 Remove-Item -Recurse -Force -LiteralPath $ManualRoot
 ```
-
-## Docker testing deferred
-
-Docker manual testing is intentionally out of scope for this phase. Add a
-dedicated Docker checklist in a later hardening pass; do not treat the absence
-of Docker coverage here as a failure of the checks above.

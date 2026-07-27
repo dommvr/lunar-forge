@@ -705,6 +705,7 @@ def create_git_commit(
     session_files: Sequence[str] | None = None,
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
+    approval_context: str | None = None,
     timeout_ms: int = DEFAULT_GIT_TIMEOUT_MS,
 ) -> dict[str, Any]:
     """Preview, approve, and create one path-limited Git commit."""
@@ -770,6 +771,9 @@ def create_git_commit(
         }
 
     preview = format_git_proposal(proposal, message=normalized_message)
+    if isinstance(approval_context, str) and approval_context.strip():
+        bounded_context = approval_context.strip()[:4_000]
+        preview = f"{bounded_context}\n\n{preview}"
     permission_manager = PermissionManager(
         mode=mode,
         approval_callback=approval_callback,

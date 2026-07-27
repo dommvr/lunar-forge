@@ -11,6 +11,7 @@ from lunar_forge.tools.files import IGNORED_DIRECTORIES, safe_path
 
 
 PACKAGE_JSON_CHARACTER_LIMIT = 1_000_000
+PYTEST_CONFIG_CHARACTER_LIMIT = 200_000
 
 
 class ProjectInfo(TypedDict):
@@ -81,7 +82,11 @@ def detect_project(project_root: str | Path) -> ProjectInfo:
     if "test" in scripts and package_manager:
         test_command = _package_command(package_manager, "test")
     elif "python" in languages:
-        test_command = "pytest"
+        test_command = (
+            "pytest"
+            if _has_pytest_tests_or_config(root)
+            else "python -B -m compileall ."
+        )
 
     build_command: str | None = None
     if "build" in scripts and package_manager:
@@ -133,6 +138,30 @@ def detect_project_type(root: str | Path) -> str:
     if project["is_empty"]:
         return "empty"
     return "unknown"
+
+
+def resolve_project_trust(
+    root: str | Path,
+    configured_trust: str = "auto",
+) -> str:
+    """Resolve warning-tier trust without weakening any execution permission.
+
+    Explicit trust markers win. In automatic mode, recognized project shapes
+    are treated as known for approval-prompt length; empty or unrecognized
+    roots remain unknown and therefore receive the full local warning.
+    """
+    normalized = configured_trust.strip().lower()
+    if normalized in {"trusted", "untrusted", "unknown"}:
+        return normalized
+    if normalized != "auto":
+        raise ValueError(
+            "Project trust must be one of: auto, trusted, untrusted, unknown."
+        )
+    return (
+        "unknown"
+        if detect_project_type(root) in {"empty", "unknown"}
+        else "trusted"
+    )
 
 
 def _read_package_json(path: Path) -> dict[str, Any]:
@@ -220,6 +249,43 @@ def _has_react_app(root: Path) -> bool:
         except PermissionError:
             continue
     return False
+
+
+def _has_pytest_tests_or_config(root: Path) -> bool:
+    if _is_directory(root, "tests"):
+        return True
+    try:
+        candidates = root.iterdir()
+    except OSError:
+        candidates = ()
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if (
+            candidate.name.startswith("test_")
+            and candidate.suffix == ".py"
+        ) or candidate.name.endswith("_test.py"):
+            return True
+    if _is_file(root, "pytest.ini") or _is_file(root, ".pytest.ini"):
+        return True
+    return any(
+        _file_contains(root, path, marker)
+        for path, marker in (
+            ("pyproject.toml", "[tool.pytest.ini_options]"),
+            ("tox.ini", "[pytest]"),
+            ("setup.cfg", "[tool:pytest]"),
+        )
+    )
+
+
+def _file_contains(root: Path, relative_path: str, marker: str) -> bool:
+    try:
+        path = safe_path(root, relative_path)
+        with path.open("r", encoding="utf-8") as handle:
+            content = handle.read(PYTEST_CONFIG_CHARACTER_LIMIT + 1)
+    except (OSError, UnicodeError, PermissionError):
+        return False
+    return len(content) <= PYTEST_CONFIG_CHARACTER_LIMIT and marker in content
 
 
 def _is_file(root: Path, relative_path: str) -> bool:

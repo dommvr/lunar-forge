@@ -52,6 +52,46 @@ def test_model_api_defaults_to_chat(monkeypatch, tmp_path):
     assert load_config(project).model.api == "chat"
 
 
+def test_project_trust_defaults_to_auto(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert load_config(project).runtime.project_trust == "auto"
+
+
+@pytest.mark.parametrize("project_trust", ("trusted", "untrusted", "unknown"))
+def test_project_trust_can_be_marked_in_project_config(
+    monkeypatch,
+    tmp_path,
+    project_trust,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    config_directory = project / ".agent"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.yaml").write_text(
+        f"runtime:\n  project_trust: {project_trust}\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(project).runtime.project_trust == project_trust
+
+
+def test_project_trust_rejects_unknown_config_value(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    config_directory = project / ".agent"
+    config_directory.mkdir(parents=True)
+    (config_directory / "config.yaml").write_text(
+        "runtime:\n  project_trust: absolutely\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="runtime.project_trust"):
+        load_config(project)
+
+
 def test_subagents_default_to_disabled(monkeypatch, tmp_path):
     _isolate_user_config(monkeypatch, tmp_path / "home")
     project = tmp_path / "project"

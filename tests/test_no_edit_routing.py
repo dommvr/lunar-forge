@@ -89,7 +89,10 @@ def test_no_edit_explicit_command_uses_local_runner_after_approval(
         model_client=model,
         approval_callback=lambda request: approvals.append(request) or True,
     ).run(
-        "Use run_command to run python --version. Do not edit files.",
+        (
+            "Use run_command to run python --version. Then include stdout. "
+            "Do not edit files."
+        ),
         tmp_path,
     )
 
@@ -99,11 +102,16 @@ def test_no_edit_explicit_command_uses_local_runner_after_approval(
     assert runner_calls == [(tmp_path.resolve(), "python --version", 120000)]
     assert len(approvals) == 1
     assert approvals[0].tool_name == "run_command"
+    assert approvals[0].description.startswith(
+        "Run local command: python --version\n\n"
+    )
     assert "Inspection phase blocked command execution." not in output
     assert "Commands run:" in output
     assert "python --version: passed" in output
     assert "via run_command" in output
+    assert "stdout:\n    Python 3.12.0" in output
     assert "Subagents run:\n- tester" in output
+    assert "Local commands run as your user account" not in output
 
 
 def test_no_edit_explicit_command_uses_docker_runner_after_approval(
@@ -149,7 +157,7 @@ def test_no_edit_explicit_command_uses_docker_runner_after_approval(
         model_client=model,
         approval_callback=lambda request: approvals.append(request) or True,
     ).run(
-        "Use run_command to run pwd. Do not edit files.",
+        "Use run_command to run pwd. Then include stdout. Do not edit files.",
         tmp_path,
     )
 
@@ -159,10 +167,109 @@ def test_no_edit_explicit_command_uses_docker_runner_after_approval(
     assert runner_calls == [(tmp_path.resolve(), "pwd", 120000, False)]
     assert len(approvals) == 1
     assert approvals[0].tool_name == "run_command"
+    assert approvals[0].description == (
+        "Run Docker command: pwd\n"
+        "This runs inside lunar-forge-sandbox with the project mounted at "
+        "/workspace."
+    )
     assert "Commands run:" in output
     assert "pwd: passed" in output
     assert "via run_command" in output
+    assert "stdout:\n    /workspace" in output
     assert "Subagents run:\n- tester" in output
+
+
+@pytest.mark.parametrize("command", ("python --version", "python -V"))
+def test_docker_python_version_inspection_runs_after_approval(
+    monkeypatch,
+    tmp_path,
+    command,
+):
+    runner_calls = []
+    approvals = []
+
+    def fake_docker(
+        project_root,
+        selected_command,
+        timeout_ms,
+        *,
+        allow_network=False,
+    ):
+        runner_calls.append(selected_command)
+        return {
+            "ok": True,
+            "runtime": "docker",
+            "command": selected_command,
+            "exit_code": 0,
+            "stdout": "Python 3.12.0\n",
+            "stderr": "",
+            "duration_ms": 1,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_docker_command",
+        fake_docker,
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode="docker"),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=CommandCallingModel(command),
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        f"Use run_command to run {command}. Do not edit files.",
+        tmp_path,
+    )
+
+    assert runner_calls == [command]
+    assert len(approvals) == 1
+    assert approvals[0].description.startswith(
+        f"Run Docker command: {command}\n"
+    )
+    assert f"{command}: passed" in output
+
+
+def test_explicit_command_stdout_is_bounded(monkeypatch, tmp_path):
+    def fake_local(project_root, command, timeout_ms):
+        return {
+            "ok": True,
+            "runtime": "local",
+            "command": command,
+            "exit_code": 0,
+            "stdout": "x" * 10_000,
+            "stderr": "",
+            "duration_ms": 1,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_local_command",
+        fake_local,
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode="local", project_trust="trusted"),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=CommandCallingModel('python -c "print(\'x\')"'),
+        approval_callback=lambda request: True,
+    ).run(
+        (
+            "Use run_command to run the requested Python command and include "
+            "stdout. Do not edit files."
+        ),
+        tmp_path,
+    )
+
+    assert "stdout:" in output
+    assert "...[stdout truncated]" in output
+    assert output.count("x") < 5_000
 
 
 def test_each_no_edit_command_call_uses_normal_approval_flow(
@@ -216,7 +323,13 @@ def test_each_no_edit_command_call_uses_normal_approval_flow(
             return ModelResponse(text="Both requested commands completed.")
 
     output = CodeAgent(
-        AppConfig(subagents=SubagentConfig(enabled=True)),
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="local",
+                project_trust="trusted",
+            ),
+            subagents=SubagentConfig(enabled=True),
+        ),
         model_client=TwoCommandModel(),
         approval_callback=lambda request: approvals.append(request) or True,
     ).run(
@@ -232,6 +345,10 @@ def test_each_no_edit_command_call_uses_normal_approval_flow(
         "run_command",
         "run_command",
     ]
+    assert "not OS-level isolation" in approvals[0].description
+    assert approvals[1].description == (
+        "Run local command: python --version."
+    )
     assert "pwd: passed" in output
     assert "python --version: passed" in output
 

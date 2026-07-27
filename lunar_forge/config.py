@@ -27,6 +27,7 @@ class ModelConfig:
 class RuntimeConfig:
     mode: str = "local"  # local | docker | no-command
     allow_network: bool = False
+    project_trust: str = "auto"  # auto | trusted | untrusted | unknown
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,7 @@ def load_config(
                 runtime_data["allow_network"],
                 "runtime.allow_network",
             ),
+            project_trust=_project_trust(runtime_data["project_trust"]),
         ),
         permissions=PermissionConfig(
             mode=str(permissions_data["mode"]),
@@ -169,6 +171,7 @@ def _default_config() -> dict[str, Any]:
         "runtime": {
             "mode": "local",
             "allow_network": False,
+            "project_trust": "auto",
         },
         "permissions": {
             "mode": "default",
@@ -196,6 +199,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_API_BASE": ("model", "api_base"),
         "LUNAR_FORGE_RUNTIME_MODE": ("runtime", "mode"),
         "LUNAR_FORGE_ALLOW_NETWORK": ("runtime", "allow_network"),
+        "LUNAR_FORGE_PROJECT_TRUST": ("runtime", "project_trust"),
         "LUNAR_FORGE_PERMISSION_MODE": ("permissions", "mode"),
         "LUNAR_FORGE_SUBAGENTS": ("subagents", "enabled"),
         "LUNAR_FORGE_PARALLEL_SUBAGENTS": ("subagents", "parallel"),
@@ -231,6 +235,16 @@ def _runtime_mode(value: Any) -> str:
             "runtime.mode must be one of: local, docker, no-command."
         )
     return mode
+
+
+def _project_trust(value: Any) -> str:
+    trust = str(value).strip().lower()
+    if trust not in {"auto", "trusted", "untrusted", "unknown"}:
+        raise ValueError(
+            "runtime.project_trust must be one of: "
+            "auto, trusted, untrusted, unknown."
+        )
+    return trust
 
 
 def _model_api(value: Any) -> str:

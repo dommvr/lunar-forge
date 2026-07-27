@@ -35,7 +35,7 @@ from lunar_forge.plugins.registry import (
     register_plugin_tools,
     resolve_local_plugin_entrypoint,
 )
-from lunar_forge.project_detection import detect_project
+from lunar_forge.project_detection import detect_project, resolve_project_trust
 from lunar_forge.prompts import (
     MAX_READONLY_FAST_PATH_RESULT_CHARACTERS,
     BrowserIntent,
@@ -85,6 +85,8 @@ MAX_BROWSER_VALIDATION_RECORDS = 20
 MAX_COMMAND_EXECUTION_RECORDS = 50
 MAX_PLUGIN_PATH_SAFETY_RECORDS = 20
 MAX_RECORDED_COMMAND_CHARACTERS = 500
+MAX_RECORDED_COMMAND_STDOUT_CHARACTERS = 4_000
+MAX_FINAL_COMMAND_STDOUT_CHARACTERS = 4_000
 MAX_FINAL_CHANGED_FILES = 100
 MAX_FINAL_CHANGED_PATH_CHARACTERS = 500
 TOKEN_ESTIMATE_CHARACTERS_PER_TOKEN = 4
@@ -134,7 +136,21 @@ SECURITY_REVIEW_WRAPPER_HEADINGS = frozenset(
         "security review",
     }
 )
+PRIMARY_SECURITY_REVIEW_HEADINGS = frozenset(
+    {
+        "security analysis",
+        "security findings",
+        "security review",
+    }
+)
 SECURITY_RAW_SUMMARY_SECTION_NAMES = FINAL_SUMMARY_SECTION_NAMES | {"git"}
+RAW_DEDUPLICATED_SUMMARY_SECTION_NAMES = frozenset(
+    {
+        "validation",
+        "commands run",
+        "checkpoints",
+    }
+)
 _NO_REVIEWER_CONCERN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"none|n/?a|nothing to report|looks good|"
@@ -249,6 +265,9 @@ class CommandExecutionRecord:
     source: str
     ok: bool
     exit_code: int | None
+    is_validation: bool = False
+    stdout: str | None = None
+    stdout_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -269,6 +288,8 @@ class ValidationEvidence:
     validation_commands_run: bool = False
     validation_observed: bool = False
     validation_failed: bool = False
+    validation_requested: bool = False
+    include_command_stdout: bool = False
 
     def merge(self, result: SubagentPhaseResult) -> None:
         remaining = MAX_BROWSER_VALIDATION_RECORDS - len(self.browser_validations)
@@ -300,7 +321,9 @@ class ValidationEvidence:
         )
         if result.validation_observed:
             self.validation_observed = True
-            self.validation_failed = result.validation_failed
+            self.validation_failed = (
+                self.validation_failed or result.validation_failed
+            )
 
 
 @dataclass(frozen=True)
@@ -377,10 +400,16 @@ class CodeAgent:
                 raise ValueError("max_steps must be at least 1.")
 
             project_info = detect_project(root)
+            project_trust = resolve_project_trust(
+                root,
+                self.config.runtime.project_trust,
+            )
             instructions = load_project_instructions(root)
             permission_manager = PermissionManager(
                 mode=mode,
                 approval_callback=self.approval_callback,
+                runtime_mode=self.config.runtime.mode,
+                project_trust=project_trust,
             )
             browser_intent = detect_browser_intent(request, project_info)
             if browser_intent.detected:
@@ -406,6 +435,7 @@ class CodeAgent:
                         mode=mode,
                         approval_callback=self.approval_callback,
                         runtime_mode=self.config.runtime.mode,
+                        project_trust=project_trust,
                         allow_network=self.config.runtime.allow_network,
                     )
                 else:
@@ -446,6 +476,7 @@ class CodeAgent:
                     mode=mode,
                     approval_callback=self.approval_callback,
                     runtime_mode=self.config.runtime.mode,
+                    project_trust=project_trust,
                     allow_network=self.config.runtime.allow_network,
                     mcp_client=mcp_client,
                     plugins=loaded_plugins,
@@ -598,7 +629,10 @@ class CodeAgent:
                 commit_requested=offer_commit,
                 blocked_tools=task_selection.blocked_tools,
             )
-            validation_evidence = ValidationEvidence()
+            validation_evidence = ValidationEvidence(
+                validation_requested=_request_has_validation_intent(request),
+                include_command_stdout=_request_wants_command_stdout(request),
+            )
             changed_files: list[str] = []
 
             for step in range(self.max_steps):
@@ -910,6 +944,11 @@ class CodeAgent:
     ) -> str:
         if not offer_commit:
             return text
+        failed_validation_override = (
+            _request_allows_commit_after_failed_validation(request)
+        )
+        if validation_evidence.validation_failed:
+            text = _remove_failed_validation_commit_readiness_claims(text)
         if mode == "plan":
             _log_git_commit_skipped(
                 session,
@@ -919,7 +958,7 @@ class CodeAgent:
             return f"{text}\n\nGit:\n- Commit not created: plan mode"
         if (
             validation_evidence.validation_failed
-            and not _request_allows_commit_after_failed_validation(request)
+            and not failed_validation_override
         ):
             reason = (
                 "Validation failed and the task prompt did not explicitly request a "
@@ -931,6 +970,24 @@ class CodeAgent:
                 reason=reason,
             )
             return f"{text}\n\nGit:\n- Commit not created: validation failed"
+        if (
+            validation_evidence.validation_requested
+            and not validation_evidence.validation_observed
+            and not validation_evidence.validation_failed
+        ):
+            reason = (
+                "Validation was requested, but no validation result was recorded "
+                "before the commit stage."
+            )
+            _log_git_commit_skipped(
+                session,
+                result_code="validation_not_run",
+                reason=reason,
+            )
+            return (
+                f"{text}\n\nGit:\n"
+                "- Commit not created: requested validation did not run"
+            )
         if not changed_files:
             _log_git_commit_skipped(
                 session,
@@ -950,6 +1007,10 @@ class CodeAgent:
             session_files=tuple(changed_files),
             mode=git_mode,
             approval_callback=self.approval_callback,
+            approval_context=_format_commit_validation_context(
+                validation_evidence,
+                failed_validation_override=failed_validation_override,
+            ),
         )
         _log_git_commit_result(session, result)
         return f"{text}\n\nGit:\n{format_git_commit_result(result)}"
@@ -1009,7 +1070,10 @@ class CodeAgent:
         outputs: dict[str, str] = {}
         changed_files: list[str] = []
         roles_run: list[str] = []
-        validation_evidence = ValidationEvidence()
+        validation_evidence = ValidationEvidence(
+            validation_requested=_request_has_validation_intent(request),
+            include_command_stdout=_request_wants_command_stdout(request),
+        )
         for phase in phases:
             role = phase.role
             assert role is not None
@@ -1105,7 +1169,10 @@ class CodeAgent:
         roles_run: list[str] = []
         failures: list[SubagentPhaseFailure] = []
         parallel_groups: list[tuple[str, tuple[str, ...]]] = []
-        validation_evidence = ValidationEvidence()
+        validation_evidence = ValidationEvidence(
+            validation_requested=_request_has_validation_intent(request),
+            include_command_stdout=_request_wants_command_stdout(request),
+        )
         handled_groups: set[str] = set()
 
         for phase in role_phases:
@@ -1228,7 +1295,10 @@ class CodeAgent:
         roles_run: list[str] = []
         failures: list[SubagentPhaseFailure] = []
         parallel_groups: list[tuple[str, tuple[str, ...]]] = []
-        validation_evidence = ValidationEvidence()
+        validation_evidence = ValidationEvidence(
+            validation_requested=_request_has_validation_intent(request),
+            include_command_stdout=_request_wants_command_stdout(request),
+        )
 
         analysis_phases = tuple(
             phase
@@ -1606,6 +1676,7 @@ class CodeAgent:
         )
         try:
             result = _run_subagent_model_loop(
+                request=request,
                 model_client=model_client,
                 messages=messages,
                 tools=role.restrict(
@@ -1654,6 +1725,7 @@ class CodeAgent:
 
 def _run_subagent_model_loop(
     *,
+    request: str,
     model_client: ModelClient,
     messages: list[dict[str, Any]],
     tools: RestrictedToolRegistry,
@@ -1677,7 +1749,10 @@ def _run_subagent_model_loop(
         blocked_tools=blocked_tools,
     )
     changed_files: list[str] = []
-    validation_evidence = ValidationEvidence()
+    validation_evidence = ValidationEvidence(
+        validation_requested=_request_has_validation_intent(request),
+        include_command_stdout=_request_wants_command_stdout(request),
+    )
     for step in range(max_steps):
         _log_tool_schema_selection(
             session,
@@ -2479,6 +2554,42 @@ def _request_allows_commit_after_failed_validation(request: str) -> bool:
     return any(re.search(pattern, normalized) is not None for pattern in patterns)
 
 
+def _request_has_validation_intent(request: str) -> bool:
+    """Return whether the task explicitly asks LunarForge to validate."""
+    normalized = " ".join(request.casefold().split())
+    if re.search(
+        r"\b(?:do not|don't|dont|never)\s+"
+        r"(?:run\s+)?(?:validation|tests?|checks?|lint|build|validate)\b",
+        normalized,
+    ):
+        return False
+    return re.search(
+        r"\bvalidate\b|"
+        r"\bvalidation\b|"
+        r"\b(?:run|execute|perform)\s+(?:the\s+)?"
+        r"(?:build|checks?|lint|tests?|validation)\b",
+        normalized,
+    ) is not None
+
+
+def _request_wants_command_stdout(request: str) -> bool:
+    """Return whether the final answer should include bounded command stdout."""
+    normalized = " ".join(request.casefold().split())
+    if re.search(
+        r"\b(?:do not|don't|dont|never)\s+"
+        r"(?:include|show|report|return|print|display)?\s*"
+        r"(?:stdout|standard output|command output)\b",
+        normalized,
+    ):
+        return False
+    return re.search(
+        r"\b(?:stdout|standard output)\b|"
+        r"\b(?:include|show|report|return|print|display)\b.{0,40}"
+        r"\bcommand output\b",
+        normalized,
+    ) is not None
+
+
 def _resume_history_messages(
     messages: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -2601,6 +2712,7 @@ def _record_validation_evidence(
                         command=command,
                         source="run_validation",
                         result=item,
+                        is_validation=True,
                     )
         evidence.validation_commands_run = evidence.validation_commands_run or any(
             record.source == "run_validation"
@@ -2608,7 +2720,9 @@ def _record_validation_evidence(
         )
         if result.get("permission_denied") is not True:
             evidence.validation_observed = True
-            evidence.validation_failed = result.get("ok") is False
+            evidence.validation_failed = (
+                evidence.validation_failed or result.get("ok") is False
+            )
         return
     if tool_name == "run_command":
         if not _command_actually_ran(result):
@@ -2617,12 +2731,23 @@ def _record_validation_evidence(
         if not isinstance(command, str) or not command.strip():
             command = arguments.get("command")
         if isinstance(command, str) and command.strip():
+            is_validation = (
+                evidence.validation_requested
+                or _is_likely_validation_command(command)
+            )
             _append_command_execution(
                 evidence,
                 command=command,
                 source="run_command",
                 result=result,
+                is_validation=is_validation,
             )
+            if is_validation:
+                evidence.validation_commands_run = True
+                evidence.validation_observed = True
+                evidence.validation_failed = (
+                    evidence.validation_failed or result.get("ok") is False
+                )
         return
     if tool_name not in {
         "run_browser_validation",
@@ -2678,7 +2803,9 @@ def _record_validation_evidence(
     )
     if not_run_reason is None:
         evidence.validation_observed = True
-        evidence.validation_failed = result.get("ok") is False
+        evidence.validation_failed = (
+            evidence.validation_failed or result.get("ok") is False
+        )
 
 
 def _record_plugin_path_safety_evidence(
@@ -2719,6 +2846,7 @@ def _append_command_execution(
     command: str,
     source: str,
     result: Mapping[str, Any],
+    is_validation: bool = False,
 ) -> None:
     if len(evidence.command_executions) >= MAX_COMMAND_EXECUTION_RECORDS:
         evidence.command_executions_truncated = True
@@ -2735,14 +2863,47 @@ def _append_command_execution(
         if isinstance(raw_exit_code, int) and not isinstance(raw_exit_code, bool)
         else None
     )
+    raw_stdout = result.get("stdout")
+    stdout: str | None = None
+    stdout_truncated = False
+    if isinstance(raw_stdout, str) and raw_stdout:
+        stdout = raw_stdout.replace("\x00", "")
+        if len(stdout) > MAX_RECORDED_COMMAND_STDOUT_CHARACTERS:
+            stdout = stdout[:MAX_RECORDED_COMMAND_STDOUT_CHARACTERS]
+            stdout_truncated = True
+        if result.get("truncated") is True:
+            stdout_truncated = True
     evidence.command_executions.append(
         CommandExecutionRecord(
             command=normalized,
             source=source,
             ok=result.get("ok") is True,
             exit_code=exit_code,
+            is_validation=is_validation,
+            stdout=stdout,
+            stdout_truncated=stdout_truncated,
         )
     )
+
+
+def _is_likely_validation_command(command: str) -> bool:
+    """Recognize common checks when a model used run_command directly."""
+    normalized = " ".join(command.casefold().split())
+    if not normalized:
+        return False
+    if re.match(r"^(?:pytest|pytest\.exe|ruff|mypy|pyright|tox|nox)\b", normalized):
+        return True
+    if re.match(
+        r"^(?:python(?:\.exe)?|py(?:\.exe)?)\b.*"
+        r"(?:-m\s+(?:pytest|unittest|compileall)\b)",
+        normalized,
+    ):
+        return True
+    return re.match(
+        r"^(?:npm|pnpm|yarn)\s+(?:(?:run)\s+)?"
+        r"(?:test|lint|build|check)\b",
+        normalized,
+    ) is not None
 
 
 def _command_actually_ran(result: Mapping[str, Any]) -> bool:
@@ -2893,9 +3054,12 @@ def _finalize_subagent_summary(
     reviewer_advisory: bool = False,
 ) -> str:
     """Format role outputs without treating security findings as reviewer text."""
-    primary_without_security = _remove_summary_sections(
-        primary_text,
-        {"security review"},
+    primary_without_security, primary_security_body = (
+        _partition_primary_security_review(primary_text)
+    )
+    primary_without_security = _deduplicate_summary_sections(
+        primary_without_security,
+        RAW_DEDUPLICATED_SUMMARY_SECTION_NAMES,
     )
     final_text = _finalize_validation_summary(
         primary_without_security,
@@ -2904,10 +3068,57 @@ def _finalize_subagent_summary(
         mode=mode,
         reviewer_advisory=reviewer_advisory,
     )
-    security_body = _clean_security_review_body(security_output or "")
+    security_body = _merge_security_review_bodies(
+        primary_security_body,
+        _clean_security_review_body(security_output or ""),
+    )
     if not security_body:
         return final_text
     return _insert_security_review(final_text, security_body)
+
+
+def _partition_primary_security_review(text: str) -> tuple[str, str]:
+    """Extract security sections that a primary role restated in its output."""
+    primary_lines: list[str] = []
+    security_lines: list[str] = []
+    in_security_section = False
+
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading in PRIMARY_SECURITY_REVIEW_HEADINGS:
+            in_security_section = True
+            continue
+        if (
+            in_security_section
+            and heading in SECURITY_RAW_SUMMARY_SECTION_NAMES
+        ):
+            in_security_section = False
+
+        if in_security_section:
+            security_lines.append(line)
+        else:
+            primary_lines.append(line)
+
+    return (
+        _clean_reviewer_block(primary_lines),
+        _clean_security_review_body("\n".join(security_lines)),
+    )
+
+
+def _merge_security_review_bodies(*bodies: str) -> str:
+    """Combine distinct security blocks under one application-owned heading."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for body in bodies:
+        cleaned = body.strip()
+        if not cleaned:
+            continue
+        normalized = re.sub(r"\s+", " ", cleaned).casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(cleaned)
+    return "\n".join(merged)
 
 
 def _clean_security_review_body(text: str) -> str:
@@ -2961,6 +3172,75 @@ def _plugin_path_safety_summary(evidence: ValidationEvidence) -> str:
     )
 
 
+def _format_commit_validation_context(
+    evidence: ValidationEvidence,
+    *,
+    failed_validation_override: bool,
+) -> str | None:
+    """Build the authoritative validation block shown above commit approval."""
+    if not (
+        evidence.validation_requested
+        or evidence.validation_observed
+        or evidence.validation_failed
+    ):
+        return None
+
+    lines = ["Validation results before commit approval:"]
+    validation_records = [
+        record
+        for record in evidence.command_executions
+        if record.is_validation
+    ]
+    if validation_records:
+        lines.extend(
+            _format_command_execution_records(
+                validation_records,
+                include_source=False,
+                include_stdout=False,
+            )
+        )
+    for record in evidence.browser_validations:
+        if not record.ran:
+            continue
+        status = "passed" if record.ok else "failed"
+        lines.append(f"- {record.tool_name}: {status} (authoritative tool result)")
+    if len(lines) == 1:
+        if evidence.validation_failed:
+            lines.append("- Validation failed (authoritative tool result).")
+        elif evidence.validation_observed:
+            lines.append("- Validation passed; no command output was reported.")
+        else:
+            lines.append("- Validation was requested but did not run.")
+    if evidence.validation_failed and failed_validation_override:
+        lines.append(
+            "- The task explicitly requested a commit despite failed validation; "
+            "the commit still requires this separate approval."
+        )
+    return "\n".join(lines)
+
+
+def _remove_failed_validation_commit_readiness_claims(text: str) -> str:
+    """Drop positive commit-readiness claims contradicted by failed validation."""
+    retained: list[str] = []
+    for line in text.splitlines():
+        normalized = " ".join(line.casefold().split())
+        ready_claim = re.search(
+            r"\b(?:changes?|task|work|implementation)\b.{0,24}"
+            r"\bready\s+(?:to|for)\s+(?:be\s+)?commit(?:ted)?\b|"
+            r"\bready\s+to\s+commit\b",
+            normalized,
+        )
+        negative = re.search(
+            r"\b(?:not|isn't|isnt|aren't|arent)\s+ready\b",
+            normalized,
+        )
+        if ready_claim is not None and negative is None:
+            continue
+        retained.append(line)
+    cleaned = _clean_reviewer_block(retained)
+    return cleaned or "Validation failed."
+
+
 def _apply_authoritative_command_summary(
     text: str,
     evidence: ValidationEvidence,
@@ -2971,7 +3251,7 @@ def _apply_authoritative_command_summary(
     validation_records = [
         record
         for record in evidence.command_executions
-        if record.source == "run_validation"
+        if record.is_validation
     ]
     retained_text = _remove_false_validation_claims(
         _remove_summary_sections(
@@ -2984,8 +3264,11 @@ def _apply_authoritative_command_summary(
     if validation_records:
         validation_lines = ["Validation:"]
         validation_lines.extend(
-            _format_command_execution(record, include_source=False)
-            for record in validation_records
+            _format_command_execution_records(
+                validation_records,
+                include_source=False,
+                include_stdout=False,
+            )
         )
         blocks.append("\n".join(validation_lines))
     else:
@@ -2996,8 +3279,11 @@ def _apply_authoritative_command_summary(
 
     command_lines = ["Commands run:"]
     command_lines.extend(
-        _format_command_execution(record, include_source=True)
-        for record in evidence.command_executions
+        _format_command_execution_records(
+            evidence.command_executions,
+            include_source=True,
+            include_stdout=evidence.include_command_stdout,
+        )
     )
     if evidence.command_executions_truncated:
         command_lines.append("- Additional command execution records were truncated.")
@@ -3038,6 +3324,8 @@ def _format_command_execution(
     record: CommandExecutionRecord,
     *,
     include_source: bool,
+    include_stdout: bool = False,
+    stdout_limit: int = 0,
 ) -> str:
     status = "passed" if record.ok else "failed"
     details = ["authoritative tool result"]
@@ -3045,7 +3333,60 @@ def _format_command_execution(
         details.append(f"via {record.source}")
     if record.exit_code is not None:
         details.append(f"exit code {record.exit_code}")
-    return f"- {record.command}: {status} ({'; '.join(details)})"
+    summary = f"- {record.command}: {status} ({'; '.join(details)})"
+    if (
+        not include_stdout
+        or not record.stdout
+        or stdout_limit <= 0
+    ):
+        return summary
+    stdout = record.stdout[:stdout_limit]
+    stdout_lines = stdout.rstrip("\r\n").splitlines() or [stdout]
+    rendered_stdout = "\n".join(f"    {line}" for line in stdout_lines)
+    if record.stdout_truncated or len(record.stdout) > stdout_limit:
+        rendered_stdout = (
+            f"{rendered_stdout}\n"
+            "    ...[stdout truncated]"
+        )
+    return f"{summary}\n  stdout:\n{rendered_stdout}"
+
+
+def _format_command_execution_records(
+    records: Sequence[CommandExecutionRecord],
+    *,
+    include_source: bool,
+    include_stdout: bool,
+) -> list[str]:
+    """Format commands with one aggregate stdout budget for the final answer."""
+    rendered: list[str] = []
+    remaining_stdout = MAX_FINAL_COMMAND_STDOUT_CHARACTERS
+    stdout_omitted = False
+    for record in records:
+        stdout_limit = (
+            remaining_stdout
+            if include_stdout and record.stdout
+            else 0
+        )
+        rendered.append(
+            _format_command_execution(
+                record,
+                include_source=include_source,
+                include_stdout=include_stdout,
+                stdout_limit=stdout_limit,
+            )
+        )
+        if include_stdout and record.stdout:
+            consumed = min(len(record.stdout), stdout_limit)
+            remaining_stdout -= consumed
+            if consumed < len(record.stdout) or (
+                stdout_limit == 0 and record.stdout
+            ):
+                stdout_omitted = True
+    if stdout_omitted:
+        rendered.append(
+            "- Additional requested command stdout was omitted by the output limit."
+        )
+    return rendered
 
 
 def _remove_summary_sections(text: str, section_names: set[str]) -> str:
@@ -3057,6 +3398,29 @@ def _remove_summary_sections(text: str, section_names: set[str]) -> str:
             suppress_section = True
             continue
         if heading is not None:
+            suppress_section = False
+        if not suppress_section:
+            retained_lines.append(line)
+    return _clean_reviewer_block(retained_lines)
+
+
+def _deduplicate_summary_sections(
+    text: str,
+    section_names: frozenset[str],
+) -> str:
+    """Keep only the first raw copy of selected final-summary sections."""
+    retained_lines: list[str] = []
+    seen_sections: set[str] = set()
+    suppress_section = False
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading in section_names:
+            if heading in seen_sections:
+                suppress_section = True
+                continue
+            seen_sections.add(heading)
+            suppress_section = False
+        elif heading is not None:
             suppress_section = False
         if not suppress_section:
             retained_lines.append(line)

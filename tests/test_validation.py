@@ -186,7 +186,10 @@ def test_validation_tool_requires_execution_permission_and_plan_hides_it(tmp_pat
     assert len(requests) == 1
     assert requests[0].tool_name == "run_validation"
     assert requests[0].permission is PermissionLevel.EXECUTE
-    assert requests[0].description == "Run detected validation commands."
+    assert requests[0].description.startswith(
+        "Run local validation commands\n\n"
+    )
+    assert "not OS-level isolation" in requests[0].description
 
 
 @pytest.mark.parametrize(
@@ -226,6 +229,10 @@ def test_model_suggested_bare_interpreters_are_denied_before_approval(
         "python -m pytest",
         "python -B -m compileall .",
         "python app.py",
+        'python -c "print(\'ok\')"',
+        "python --version",
+        "python -V",
+        "python --help",
     ),
 )
 def test_validation_command_candidates_allow_meaningful_python_commands(command):

@@ -1,11 +1,15 @@
 import json
 from importlib import import_module
 
+import pytest
+
 from lunar_forge.permissions import (
     PermissionDecision,
     PermissionLevel,
     PermissionManager,
     PermissionRequest,
+    is_dependency_install_command,
+    is_risky_allowed_command,
     requires_approval,
 )
 from lunar_forge.tools.registry import (
@@ -115,7 +119,223 @@ def test_default_mode_asks_before_command_execution():
     assert decision.reason == "Denied by user."
     assert len(requests) == 1
     assert requests[0].permission is PermissionLevel.EXECUTE
-    assert requests[0].description == "Run command: python --version."
+    assert requests[0].description == (
+        "Run local command: python --version\n\n"
+        "Local commands run as your user account on this machine. The project "
+        "root is used as the working directory, but this is not OS-level "
+        "isolation. Use Docker mode for untrusted projects or commands you "
+        "have not reviewed."
+    )
+
+
+def test_first_local_prompt_is_full_and_second_ordinary_prompt_is_short(
+    monkeypatch,
+):
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "y",
+    )
+    manager = PermissionManager(
+        mode="default",
+        runtime_mode="local",
+        project_trust="trusted",
+    )
+
+    first = manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "python --version"},
+    )
+    second = manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "git --version"},
+    )
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert prompts == [
+        (
+            "Run local command: python --version\n\n"
+            "Local commands run as your user account on this machine. The "
+            "project root is used as the working directory, but this is not "
+            "OS-level isolation. Use Docker mode for untrusted projects or "
+            "commands you have not reviewed.\n\n"
+            "Allow? [y/N] "
+        ),
+        "Run local command: git --version. Allow? [y/N] ",
+    ]
+
+
+def test_first_local_warning_state_is_scoped_to_permission_manager_session():
+    first_session = []
+    second_session = []
+
+    PermissionManager(
+        approval_callback=lambda request: first_session.append(request) or False,
+    ).authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "git --version"},
+    )
+    PermissionManager(
+        approval_callback=lambda request: second_session.append(request) or False,
+    ).authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "git --version"},
+    )
+
+    assert "\n\nLocal commands run as your user account" in (
+        first_session[0].description
+    )
+    assert first_session[0].description == second_session[0].description
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "npm install",
+        "npm ci",
+        "pnpm install",
+        "yarn install",
+        "pip install package",
+        "python -m pip install package",
+        "uv pip install package",
+        "poetry install",
+    ),
+)
+def test_dependency_install_keeps_full_warning_after_first_command(command):
+    requests = []
+    manager = PermissionManager(
+        approval_callback=lambda request: requests.append(request) or True,
+        project_trust="trusted",
+    )
+
+    manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "git --version"},
+    )
+    manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": command},
+    )
+
+    assert is_dependency_install_command(command) is True
+    assert requests[1].description.startswith(f"Run local command: {command}\n\n")
+    assert "not OS-level isolation" in requests[1].description
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("python --version", "python -V", "python --help"),
+)
+def test_safe_python_inspection_reaches_normal_approval(command):
+    requests = []
+    decision = PermissionManager(
+        approval_callback=lambda request: requests.append(request) or True,
+        project_trust="trusted",
+    ).authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": command},
+    )
+
+    assert decision.allowed is True
+    assert len(requests) == 1
+    assert requests[0].tool_name == "run_command"
+    assert f"Run local command: {command}" in requests[0].description
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "npm run build",
+        "pnpm run lint",
+        "yarn test",
+        "python app.py",
+        r"python scripts\check.py",
+        "node scripts/check.js",
+        "npm run dev",
+        "pnpm dev",
+        "yarn dev",
+        "flask run",
+        "fastapi dev",
+        "uvicorn app:api",
+    ),
+)
+def test_risky_allowed_command_keeps_full_warning_after_first_command(command):
+    requests = []
+    manager = PermissionManager(
+        approval_callback=lambda request: requests.append(request) or True,
+        project_trust="trusted",
+    )
+
+    manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "git --version"},
+    )
+    decision = manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": command},
+    )
+
+    assert decision.allowed is True
+    assert is_risky_allowed_command(command) is True
+    assert requests[1].description.startswith(f"Run local command: {command}\n\n")
+    assert "not OS-level isolation" in requests[1].description
+
+
+@pytest.mark.parametrize("project_trust", ("unknown", "untrusted"))
+def test_unknown_or_untrusted_project_always_uses_full_local_warning(
+    project_trust,
+):
+    requests = []
+    manager = PermissionManager(
+        approval_callback=lambda request: requests.append(request) or True,
+        project_trust=project_trust,
+    )
+
+    for command in ("python --version", "git --version"):
+        manager.authorize(
+            PermissionLevel.EXECUTE,
+            "run_command",
+            {"command": command},
+        )
+
+    assert all("not OS-level isolation" in item.description for item in requests)
+
+
+def test_docker_approval_uses_container_wording_without_local_warning(
+    monkeypatch,
+):
+    prompts = []
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: prompts.append(prompt) or "n",
+    )
+    manager = PermissionManager(runtime_mode="docker")
+
+    manager.authorize(
+        PermissionLevel.EXECUTE,
+        "run_command",
+        {"command": "pwd"},
+    )
+
+    assert prompts == [
+        (
+            "Run Docker command: pwd\n"
+            "This runs inside lunar-forge-sandbox with the project mounted at "
+            "/workspace.\n"
+            "Allow? [y/N] "
+        )
+    ]
+    assert "Local commands run as your user account" not in prompts[0]
 
 
 def test_plan_and_no_command_modes_block_command_execution(tmp_path):

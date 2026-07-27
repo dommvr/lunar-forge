@@ -62,6 +62,7 @@ model:
 runtime:
   mode: local
   allow_network: false
+  project_trust: auto
 
 permissions:
   mode: default
@@ -319,6 +320,14 @@ LunarForge asks before each file mutation and command. `permissions.mode: yes`
 auto-approves safe writes but still asks before commands and dependency
 installation. `permissions.mode: no-command` disables command tools.
 
+`Do not edit files` blocks file-mutation tools; it does not mean planner-only
+mode. An explicitly requested non-edit tool may still run when its normal mode,
+configuration, and approval checks allow it. This includes `run_command`,
+`run_validation`, browser validation, plugin review tools, MCP read/review
+tools, Git inspection tools, project-intelligence tools, and structured
+read-only tools. `Do not edit files and do not run commands` blocks commands.
+Plan and no-command modes remain authoritative regardless of prompt wording.
+
 For an existing-project feature request, the system prompt requires inspection,
 a short plan before the first edit, permission-gated changes, and validation
 when practical. If validation fails, the agent is instructed to attempt at most
@@ -329,10 +338,11 @@ one focused fix.
 Every model call receives a deterministic profile-specific tool subset instead
 of the full registry. Direct requests such as `Run read_json on package.json`
 use `explicit_readonly`; plan mode uses `plan_only`; audits and diff inspection
-use `review_only`; normal changes use `edit_task`; explicit browser work uses
-`browser_task`; opted-in commit flows use `commit_task`; and scaffolding uses
-`new_project`. Subagent role allowlists are applied after the task profile, so a
-role can only narrow the selected set.
+use `review_only`; no-edit requests that explicitly name a non-edit execution
+tool use `no_edit_execution_allowed`; normal changes use `edit_task`; explicit
+browser work uses `browser_task`; opted-in commit flows use `commit_task`; and
+scaffolding uses `new_project`. Subagent role allowlists are applied after the
+task profile, so a role can only narrow the selected set.
 
 Plan mode never exposes mutation, command, managed-browser-server, plugin, or
 commit schemas. No-command mode removes execution and commit schemas. Browser
@@ -658,6 +668,12 @@ working directory using `subprocess.run(..., shell=False)`. Normal executables
 and quoted arguments are supported; shell built-ins, pipes, redirects, and
 operators such as `&&` are intentionally unsupported.
 
+File, search, structured-reader, plugin-file, and other path-based tools remain
+confined to the selected project root through the normal safe-path boundary.
+That path confinement does not sandbox a locally executed process: a local
+command runs as the current host user and may access any host resource that
+account and the operating system allow.
+
 Executables are resolved from `PATH` with `shutil.which`. On Windows, LunarForge
 also applies validated `PATHEXT` candidates, so commands such as `npm`, `npx`,
 `pnpm`, and `yarn` resolve to their `.cmd` launchers without enabling a shell. A
@@ -673,7 +689,64 @@ Docker wrappers, privileged containers, and Docker socket access.
 Working-directory scoping is not an operating-system filesystem sandbox. A
 locally executed program runs with the current user's OS permissions and may be
 able to access paths outside the project. Review every command approval; use
-Docker mode when stronger process isolation is needed.
+Docker mode for untrusted projects, generated code, dependency installation,
+unreviewed project scripts, and commands copied from an unknown source.
+
+### Targeted local approval warnings
+
+Local command approvals use targeted warning tiers so the host-execution
+boundary stays visible without repeating the long warning before every
+ordinary command.
+
+The full local warning appears only for:
+
+1. the first local command approval in a LunarForge session;
+2. every dependency-install command;
+3. a risky-but-not-blocked command; or
+4. a project marked or inferred as untrusted or unknown.
+
+An ordinary local command after the first full warning in a trusted session
+uses short wording:
+
+```text
+Run local command: git --version. Allow? [y/N]
+```
+
+The full warning makes the host-user boundary explicit:
+
+```text
+Run local command: python safe_script.py
+
+Local commands run as your user account on this machine. The project root is
+used as the working directory, but this is not OS-level isolation. Use Docker
+mode for untrusted projects or commands you have not reviewed.
+
+Allow? [y/N]
+```
+
+Dependency installs such as `npm install`, `npm ci`, `pip install`,
+`python -m pip install`, `uv pip install`, `pnpm install`, `yarn install`, and
+`poetry install`
+always use the full warning. Risky-but-not-blocked commands include project
+scripts, generated scripts, development servers, and direct interpreter
+invocations such as `python app.py`, `node script.js`, or `npm run dev`.
+Blocked dangerous commands remain denied before approval; they are never
+downgraded to warning-only prompts.
+
+`runtime.project_trust` accepts `auto`, `trusted`, `untrusted`, or `unknown`.
+The default `auto` mode treats recognized project types as known and treats
+empty or unrecognized roots as unknown. Mark a reviewed project as `trusted`
+in `.agent/config.yaml` when you want ordinary approvals after the first
+warning to use the short form:
+
+```yaml
+runtime:
+  mode: local
+  project_trust: trusted
+```
+
+This setting controls warning length only. It never auto-approves commands,
+weakens dangerous-command checks, or changes the selected runner.
 
 ## Docker command mode
 
@@ -696,10 +769,24 @@ model, constructs the wrapper. It mounts only the project root at `/workspace`,
 uses `/workspace` as the working directory, applies 2 GiB memory and 2 CPU
 limits, and uses the `lunar-forge-sandbox` image. It never requests privileged
 mode, mounts the host home directory, or mounts `/var/run/docker.sock`.
+Project-root validation rejects filesystem-root, host-home, Docker-socket, and
+outside-project mount targets. Manual testing confirmed approved commands report
+`/workspace` as their container working directory.
 
 The default Docker network is `none`. `--allow-network` explicitly switches it
 to `bridge`; it does not remove command approval requirements. The project mount
 is writable so approved build and validation commands can update project files.
+Docker mode is the recommended command runtime for untrusted projects,
+generated code, dependency installs, and unreviewed scripts.
+
+Docker approvals use separate wording so users do not confuse container
+execution with host-local execution.
+
+```text
+Run Docker command: python -B -m compileall .
+This runs inside lunar-forge-sandbox with the project mounted at /workspace.
+Allow? [y/N]
+```
 
 ## New-project mode
 
@@ -796,12 +883,16 @@ lunar-forge --project C:\path\to\project --commit --commit-message "Add pricing 
 ```
 
 `--commit` never commits automatically. The agent prefers files changed by the
-current LunarForge session and shows other dirty paths separately. If structured
-validation fails, it does not offer a commit unless the task prompt explicitly
-says to commit despite failed validation; a general request to commit is not an
-override. If LunarForge changed no eligible files, it does not show an approval
-prompt. Plan mode never commits, and no-command mode blocks all Git subprocess
-execution.
+current LunarForge session and shows other dirty paths separately. When the task
+requests validation, the authoritative validation status is displayed above the
+Git proposal before the approval question. Failed validation suppresses the
+normal commit prompt and ends with `Commit not created: validation failed`.
+Committing after failure requires an explicit request to commit despite failed
+validation; that override still receives a separate approval whose preview
+repeats the failed status. A general request to commit is not an override.
+Requested validation that never runs also suppresses the commit prompt. If
+LunarForge changed no eligible files, it does not show an approval prompt. Plan
+mode never commits, and no-command mode blocks all Git subprocess execution.
 
 Agent final output always reports the opt-in result in a stable section:
 
@@ -835,8 +926,11 @@ markers:
   `package.json`.
 
 Bare `python`, `python.exe`, `py`, and `py.exe` commands are rejected as
-non-checks. Module commands, compile commands, and targeted script runs remain
-available through the normal execution permission path.
+non-checks. Safe inspection forms such as `python --version`, `python -V`, and
+`python --help`, plus module commands, `python -c`, compile commands, and
+targeted script runs remain available through the normal execution permission
+path. When a task explicitly asks to include stdout, final command summaries
+include a bounded stdout excerpt; otherwise they stay status-only.
 
 Validation uses the same approved local or Docker command runner and reports
 every result. No detected commands is a successful, explicit no-op.
@@ -1006,9 +1100,9 @@ See the comprehensive, Windows-friendly
 [manual testing guide](docs/manual-testing.md). It covers installation,
 configuration, plan and no-command modes, file inspection and line edits, all
 six project starters, validation, browser setup and managed validation,
-Playwright MCP, every checked-in example project, plugin diagnostics, sessions,
-the web design review plugin, rollback, parallel subagents, and guarded Git
-finalization.
+Playwright MCP, local/Docker execution safety and warning acceptance tests,
+every checked-in example project, plugin diagnostics, sessions, the web design
+review plugin, rollback, parallel subagents, and guarded Git finalization.
 
 ## Known limitations
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -78,6 +78,17 @@ _DISPLAY_API_KEY = re.compile(
 _BARE_PYTHON_INTERPRETERS = frozenset(
     {"python", "python.exe", "py", "py.exe"}
 )
+_LOCAL_EXECUTION_WARNING = (
+    "Local commands run as your user account on this machine. The project "
+    "root is used as the working directory, but this is not OS-level "
+    "isolation. Use Docker mode for untrusted projects or commands you have "
+    "not reviewed."
+)
+_DOCKER_EXECUTION_NOTICE = (
+    "This runs inside lunar-forge-sandbox with the project mounted at "
+    "/workspace."
+)
+_LOCAL_COMMAND_TOOLS = frozenset({"run_command", "run_validation"})
 
 
 def dangerous_command_reason(command: str) -> str | None:
@@ -116,12 +127,89 @@ def is_bare_python_interpreter_command(command: str) -> bool:
     return executable.casefold() in _BARE_PYTHON_INTERPRETERS
 
 
+def is_dependency_install_command(command: str) -> bool:
+    """Return whether a command is a supported dependency-install shape."""
+    arguments = _normalized_command_arguments(command)
+    if not arguments:
+        return False
+    executable = _executable_name(arguments[0])
+    tail = [argument.casefold() for argument in arguments[1:]]
+    if executable == "npm":
+        return bool(tail and tail[0] in {"install", "ci"})
+    if executable in {"pnpm", "yarn", "poetry"}:
+        return bool(tail and tail[0] == "install")
+    if executable in {"pip", "pip3"}:
+        return bool(tail and tail[0] == "install")
+    if executable == "uv":
+        return len(tail) >= 2 and tail[:2] == ["pip", "install"]
+    if executable in {"python", "py"}:
+        return len(tail) >= 3 and tail[:3] == ["-m", "pip", "install"]
+    return False
+
+
+def is_risky_allowed_command(command: str) -> bool:
+    """Return whether an allowed command directly executes project code."""
+    arguments = _normalized_command_arguments(command)
+    if not arguments:
+        return False
+    executable = _executable_name(arguments[0])
+    tail = [argument.casefold() for argument in arguments[1:]]
+    if not tail:
+        return False
+    if executable in {"npm", "pnpm"}:
+        return tail[0] == "run" or tail[0] in {"dev", "test"}
+    if executable == "yarn":
+        return tail[0] not in {
+            "--version",
+            "-v",
+            "add",
+            "cache",
+            "config",
+            "help",
+            "init",
+            "install",
+            "remove",
+            "set",
+        }
+    if executable in {"python", "py"}:
+        script = _first_non_option_argument(tail)
+        if script is not None and script.endswith(".py"):
+            return True
+        return len(tail) >= 2 and tail[:2] in (
+            ["-m", "pytest"],
+            ["-m", "unittest"],
+        )
+    if executable == "node":
+        script = _first_non_option_argument(tail)
+        return script is not None and script.endswith(
+            (".js", ".cjs", ".mjs")
+        )
+    if executable == "flask":
+        return tail[0] == "run"
+    if executable == "fastapi":
+        return tail[0] == "dev"
+    if executable == "uvicorn":
+        return any(
+            ":" in argument
+            for argument in tail
+            if not argument.startswith("-")
+        )
+    return executable in {"pytest", "pytest.exe"}
+
+
 @dataclass
 class PermissionManager:
     """Apply mode rules before a tool handler can mutate project state."""
 
     mode: str = "default"
     approval_callback: ApprovalCallback | None = None
+    runtime_mode: str = "local"
+    project_trust: str = "trusted"
+    _local_command_warning_shown: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
 
     def authorize(
         self,
@@ -190,7 +278,7 @@ class PermissionManager:
         request = PermissionRequest(
             tool_name=tool_name,
             permission=permission,
-            description=_describe_request(tool_name, arguments),
+            description=self._describe_request(tool_name, arguments),
         )
         callback = self.approval_callback or prompt_for_approval
         try:
@@ -206,11 +294,60 @@ class PermissionManager:
             return PermissionDecision(allowed=True, reason="Approved by user.")
         return PermissionDecision(allowed=False, reason="Denied by user.")
 
+    def _describe_request(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> str:
+        if (
+            tool_name not in _LOCAL_COMMAND_TOOLS
+            or self.runtime_mode.strip().lower() not in {"local", "docker"}
+        ):
+            return _describe_request(tool_name, arguments)
+
+        command = arguments.get("command")
+        preview = _command_preview(command) if isinstance(command, str) else None
+        if self.runtime_mode.strip().lower() == "docker":
+            heading = (
+                f"Run Docker command: {preview}"
+                if preview is not None
+                else "Run Docker validation commands"
+            )
+            return f"{heading}\n{_DOCKER_EXECUTION_NOTICE}"
+
+        full_warning = (
+            not self._local_command_warning_shown
+            or self.project_trust.strip().lower() in {"untrusted", "unknown"}
+            or (
+                isinstance(command, str)
+                and (
+                    is_dependency_install_command(command)
+                    or is_risky_allowed_command(command)
+                )
+            )
+            or tool_name == "run_validation"
+        )
+        heading = (
+            f"Run local command: {preview}"
+            if preview is not None
+            else "Run local validation commands"
+        )
+        if full_warning:
+            self._local_command_warning_shown = True
+            return f"{heading}\n\n{_LOCAL_EXECUTION_WARNING}"
+        return f"{heading}."
+
 
 def prompt_for_approval(request: PermissionRequest) -> PermissionDecision:
     """Ask for interactive approval without echoing file contents."""
+    description = request.description.rstrip()
+    separator = "\n\n" if "\n\n" in description else (
+        "\n" if "\n" in description else " "
+    )
     try:
-        answer = input(f"{request.description} Allow? [y/N] ").strip().lower()
+        answer = input(
+            f"{description}{separator}Allow? [y/N] "
+        ).strip().lower()
     except (EOFError, OSError, KeyboardInterrupt):
         return PermissionDecision(
             allowed=False,
@@ -272,6 +409,35 @@ def _describe_request(tool_name: str, arguments: Mapping[str, Any]) -> str:
     }
     action = actions.get(tool_name, f"Run {tool_name}")
     return f"{action}{path_description}."
+
+
+def _command_preview(command: str) -> str:
+    preview = _redact_command_preview(" ".join(command.split()))
+    return f"{preview[:197]}..." if len(preview) > 200 else preview
+
+
+def _normalized_command_arguments(command: str) -> list[str]:
+    if not isinstance(command, str) or not command.strip():
+        return []
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+
+def _executable_name(value: str) -> str:
+    name = value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _first_non_option_argument(arguments: list[str]) -> str | None:
+    return next(
+        (argument for argument in arguments if not argument.startswith("-")),
+        None,
+    )
 
 
 def _redact_command_preview(command: str) -> str:
