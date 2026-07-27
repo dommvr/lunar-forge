@@ -126,6 +126,15 @@ REVIEWER_ADVISORY_HEADING_MARKERS = frozenset(
         "warning",
     }
 )
+SECURITY_REVIEW_WRAPPER_HEADINGS = frozenset(
+    {
+        "findings",
+        "security analysis",
+        "security findings",
+        "security review",
+    }
+)
+SECURITY_RAW_SUMMARY_SECTION_NAMES = FINAL_SUMMARY_SECTION_NAMES | {"git"}
 _NO_REVIEWER_CONCERN_PATTERN = re.compile(
     r"(?i)^(?:"
     r"none|n/?a|nothing to report|looks good|"
@@ -1059,12 +1068,10 @@ class CodeAgent:
         )
         if final_role is None:
             raise AgentError("Subagent routing produced no final response role.")
-        final_text = outputs[final_role]
         security_output = outputs.get("security")
-        if security_output:
-            final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
-        final_text = _finalize_validation_summary(
-            final_text,
+        final_text = _finalize_subagent_summary(
+            outputs[final_role],
+            security_output,
             browser_intent,
             validation_evidence,
             mode=mode,
@@ -1162,16 +1169,15 @@ class CodeAgent:
             ),
             None,
         )
-        final_text = (
+        primary_text = (
             outputs[final_role]
             if final_role is not None
             else "Selected subagent phases did not produce a final response."
         )
         security_output = outputs.get("security")
-        if security_output:
-            final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
-        final_text = _finalize_validation_summary(
-            final_text,
+        final_text = _finalize_subagent_summary(
+            primary_text,
+            security_output,
             browser_intent,
             validation_evidence,
             mode=mode,
@@ -1272,15 +1278,14 @@ class CodeAgent:
         )
 
         if "planner" not in outputs or mode == "plan":
-            final_text = outputs.get(
+            primary_text = outputs.get(
                 "planner",
                 "Parallel subagent analysis did not produce a planner result.",
             )
             security_output = outputs.get("security")
-            if security_output:
-                final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
-            final_text = _finalize_validation_summary(
-                final_text,
+            final_text = _finalize_subagent_summary(
+                primary_text,
+                security_output,
                 browser_intent,
                 validation_evidence,
                 mode=mode,
@@ -1394,12 +1399,13 @@ class CodeAgent:
             validation_evidence,
         )
 
-        final_text = outputs.get("reviewer") or outputs.get("tester") or outputs["coder"]
+        primary_text = (
+            outputs.get("reviewer") or outputs.get("tester") or outputs["coder"]
+        )
         security_output = outputs.get("security")
-        if security_output:
-            final_text = f"{final_text}\n\nSecurity review:\n{security_output}"
-        final_text = _finalize_validation_summary(
-            final_text,
+        final_text = _finalize_subagent_summary(
+            primary_text,
+            security_output,
             browser_intent,
             validation_evidence,
             mode=mode,
@@ -2875,6 +2881,77 @@ def _finalize_validation_summary(
     if evidence.browser_validations_truncated:
         lines.append("- Additional browser validation records were truncated.")
     return "\n".join(lines)
+
+
+def _finalize_subagent_summary(
+    primary_text: str,
+    security_output: str | None,
+    browser_intent: BrowserIntent,
+    evidence: ValidationEvidence,
+    *,
+    mode: str,
+    reviewer_advisory: bool = False,
+) -> str:
+    """Format role outputs without treating security findings as reviewer text."""
+    primary_without_security = _remove_summary_sections(
+        primary_text,
+        {"security review"},
+    )
+    final_text = _finalize_validation_summary(
+        primary_without_security,
+        browser_intent,
+        evidence,
+        mode=mode,
+        reviewer_advisory=reviewer_advisory,
+    )
+    security_body = _clean_security_review_body(security_output or "")
+    if not security_body:
+        return final_text
+    return _insert_security_review(final_text, security_body)
+
+
+def _clean_security_review_body(text: str) -> str:
+    """Keep security findings while dropping role-local workflow summaries."""
+    retained_lines: list[str] = []
+    suppress_section = False
+    for line in text.splitlines():
+        heading = _reviewer_section_heading(line)
+        if heading in SECURITY_RAW_SUMMARY_SECTION_NAMES:
+            suppress_section = True
+            continue
+        if heading is not None:
+            suppress_section = False
+            if heading in SECURITY_REVIEW_WRAPPER_HEADINGS:
+                continue
+        if not suppress_section:
+            retained_lines.append(line)
+    return _clean_reviewer_block(retained_lines)
+
+
+def _insert_security_review(text: str, security_body: str) -> str:
+    """Insert one normalized security block before final-summary sections."""
+    security_block = f"Security review:\n{security_body}"
+    lines = text.rstrip().splitlines()
+    insertion_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if _reviewer_section_heading(line) in FINAL_SUMMARY_SECTION_NAMES
+        ),
+        None,
+    )
+    if insertion_index is None:
+        return (
+            f"{text.rstrip()}\n\n{security_block}"
+            if text.strip()
+            else security_block
+        )
+
+    before = "\n".join(lines[:insertion_index]).rstrip()
+    after = "\n".join(lines[insertion_index:]).lstrip()
+    return "\n\n".join(
+        block for block in (before, security_block, after) if block
+    )
 
 
 def _plugin_path_safety_summary(evidence: ValidationEvidence) -> str:

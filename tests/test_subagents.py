@@ -5,7 +5,7 @@ from threading import Barrier, Lock
 import pytest
 
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig, SubagentConfig
+from lunar_forge.config import AppConfig, RuntimeConfig, SubagentConfig
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.permissions import PermissionLevel, PermissionManager
 from lunar_forge.subagents import (
@@ -2001,6 +2001,163 @@ def test_sensitive_existing_project_change_adds_security_subagent(tmp_path):
     assert "Security review:\nNo security findings." in output
     assert output.index("- reviewer") < output.index("- security")
     assert [call["role"] for call in model.calls][-1] == "security"
+
+
+def test_docker_security_summary_separates_roles_and_deduplicates_sections(
+    monkeypatch,
+    tmp_path,
+):
+    docker_calls = []
+    approvals = []
+
+    def fake_docker(
+        project_root,
+        command,
+        timeout_ms,
+        *,
+        allow_network=False,
+    ):
+        docker_calls.append(
+            (project_root, command, timeout_ms, allow_network)
+        )
+        return {
+            "ok": True,
+            "runtime": "docker",
+            "command": command,
+            "exit_code": 0,
+            "stdout": "Python 3.12.0\n",
+            "stderr": "",
+            "duration_ms": 2,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_docker_command",
+        fake_docker,
+    )
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="docker-version",
+                        name="run_command",
+                        arguments={"command": "python --version"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Docker command completed."),
+            ModelResponse(
+                text=(
+                    "Findings:\n"
+                    "- Reviewer maintainability finding.\n\n"
+                    "Validation:\n"
+                    "- Not run.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None.\n\n"
+                    "Security review:"
+                )
+            ),
+            ModelResponse(
+                text=(
+                    "Security findings:\n"
+                    "- Docker network isolation remains enabled.\n\n"
+                    "Validation:\n"
+                    "- Not run.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode="docker"),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=model,
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        (
+            "Use run_command to run python --version and review Docker "
+            "security. Do not edit files."
+        ),
+        tmp_path,
+    )
+
+    assert docker_calls == [
+        (tmp_path.resolve(), "python --version", 120000, False)
+    ]
+    assert len(approvals) == 1
+    assert approvals[0].tool_name == "run_command"
+    assert "Reviewer findings (advisory):" in output
+    assert "Reviewer maintainability finding." in output
+    assert "Security review:\n- Docker network isolation remains enabled." in output
+    assert "Security findings:" not in output
+    assert output.count("Security review:") == 1
+    assert output.count("Validation:") == 1
+    assert output.count("Commands run:") == 1
+    assert output.count("Checkpoints:") == 1
+    assert "python --version: passed" in output
+    assert "via run_command" in output
+    assert output.index("Reviewer findings (advisory):") < output.index(
+        "Security review:"
+    )
+    assert output.index("Security review:") < output.index("Validation:")
+    assert "Subagents run:\n- tester\n- reviewer\n- security" in output
+
+
+def test_empty_security_role_output_does_not_add_empty_section(tmp_path):
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text=(
+                    "Review complete.\n\n"
+                    "Validation:\n"
+                    "- Not run.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None."
+                )
+            ),
+            ModelResponse(
+                text=(
+                    "Security review:\n\n"
+                    "Validation:\n"
+                    "- Not run.\n\n"
+                    "Commands run:\n"
+                    "- None.\n\n"
+                    "Checkpoints:\n"
+                    "- None."
+                )
+            ),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode="docker"),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=model,
+    ).run(
+        "Review Docker security without changing files.",
+        tmp_path,
+    )
+
+    assert "Security review:" not in output
+    assert output.count("Validation:") == 1
+    assert output.count("Commands run:") == 1
+    assert output.count("Checkpoints:") == 1
+    assert "Subagents run:\n- reviewer\n- security" in output
 
 
 def test_subagent_plan_mode_runs_only_planner_without_writing(tmp_path):
