@@ -113,9 +113,18 @@ class SubagentRole:
         """Only roles without file mutation tools are parallel-safe."""
         return not self.is_writer
 
-    def restrict(self, registry: ToolRegistry) -> RestrictedToolRegistry:
+    def restrict(
+        self,
+        registry: ToolRegistry,
+        *,
+        requested_tools: Iterable[str] = (),
+    ) -> RestrictedToolRegistry:
         """Create a role-scoped view without replacing registry permissions."""
-        return RestrictedToolRegistry(registry, self)
+        return RestrictedToolRegistry(
+            registry,
+            self,
+            requested_tools=requested_tools,
+        )
 
 
 class RestrictedToolRegistry:
@@ -125,13 +134,37 @@ class RestrictedToolRegistry:
     so its permission manager, path protection, and command safety remain active.
     """
 
-    def __init__(self, registry: ToolRegistry, role: SubagentRole) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        role: SubagentRole,
+        *,
+        requested_tools: Iterable[str] = (),
+    ) -> None:
         self._registry = registry
         self.role = role
+        requested_read_only_extensions: set[str] = set()
+        for requested_name in requested_tools:
+            if not isinstance(requested_name, str):
+                continue
+            internal_name = registry.internal_name_for(requested_name)
+            if internal_name is None or internal_name in role.blocked_tools:
+                continue
+            if registry.get(internal_name).read_only_extension:
+                requested_read_only_extensions.add(internal_name)
+        self._requested_read_only_extensions = frozenset(
+            requested_read_only_extensions
+        )
+
+    def _allows(self, tool_name: str) -> bool:
+        return (
+            self.role.allows(tool_name)
+            or tool_name in self._requested_read_only_extensions
+        )
 
     def names(self) -> tuple[str, ...]:
         return tuple(
-            name for name in self._registry.names() if self.role.allows(name)
+            name for name in self._registry.names() if self._allows(name)
         )
 
     def schemas(
@@ -165,7 +198,7 @@ class RestrictedToolRegistry:
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
         internal_name = self.internal_name_for(name)
-        if internal_name is None or not self.role.allows(internal_name):
+        if internal_name is None or not self._allows(internal_name):
             return {
                 "ok": False,
                 "error": (

@@ -1,8 +1,9 @@
 """Bounded plugin invocation wrapper.
 
 This is an output and exception containment boundary, not an operating-system
-sandbox. It deliberately passes no project root, shell runner, or network
-client to plugin handlers.
+sandbox. The trusted local resolver may bind a confined project root for a
+filesystem-declaring handler that explicitly opts into that context. No shell
+runner or network client is passed to plugin handlers.
 """
 
 from __future__ import annotations

@@ -110,13 +110,21 @@ Completed structured context feature wave:
 47. Integrate `ci_summary` and structured readers into planning, testing, review, security checks, and final summaries where useful.
 48. Run a hardening and documentation pass for the second-batch tools.
 
-Next feature wave, in order:
+Completed token/cost-control feature wave:
 
 49. Add token telemetry for model calls and session totals.
 50. Add task-profile based tool-schema filtering so each model call receives only relevant tools.
 51. Add an explicit read-only fast path for direct inspection/tool requests.
 52. Skip coder/tester/reviewer subagents for read-only tasks unless their roles are explicitly needed.
 53. Run a hardening and documentation pass for cost controls and read-only routing.
+
+Next feature wave, in order:
+
+54. Add a real example plugin under `examples/plugins/web-design-review/`.
+55. Implement a read-only website design review plugin tool named `web_design.review_files`.
+56. Add example plugin configuration and manual tests that run the plugin against `examples/projects/browser-demo/`.
+57. Document plugin permissions, expected findings, and safe usage in README/example docs/manual testing.
+58. Run a hardening pass to prove the example plugin cannot execute commands, use network, write files, or escape the project root.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -174,6 +182,12 @@ lunar-forge/
       fastapi-api/
     mcp/
       playwright/
+    plugins/
+      web-design-review/
+        README.md
+        plugin.yaml
+        web_design_review.py
+        plugins.yaml.example
 
   lunar_forge/
     __init__.py
@@ -1923,6 +1937,124 @@ Plugin rules:
 * Plugin results must be JSON-serializable and bounded.
 
 
+## Example plugin: web design review
+
+Add a real example plugin under:
+
+```text
+examples/plugins/web-design-review/
+  README.md
+  plugin.yaml
+  web_design_review.py
+  plugins.yaml.example
+```
+
+The example plugin should expose one tool first:
+
+```text
+web_design.review_files
+```
+
+Purpose:
+
+* Review frontend files for basic website quality.
+* Demonstrate safe plugin loading, manifest validation, namespaced tools, and permission gating.
+* Stay read-only and deterministic.
+* Return structured findings that the normal LunarForge agent can use before making edits with built-in tools.
+
+Tool input:
+
+```json
+{
+  "files": ["index.html", "src/App.jsx", "src/App.css"],
+  "focus": "accessibility responsive visual_hierarchy"
+}
+```
+
+Tool output should be JSON-serializable and bounded:
+
+```json
+{
+  "ok": true,
+  "summary": "Short design review summary.",
+  "score": {
+    "accessibility": 8,
+    "visual_hierarchy": 7,
+    "responsive": 6,
+    "content_clarity": 8
+  },
+  "findings": [
+    {
+      "severity": "info",
+      "category": "accessibility",
+      "file": "src/App.jsx",
+      "line": 12,
+      "message": "Button has clear visible text."
+    }
+  ]
+}
+```
+
+Initial checks should be simple, local, and heuristic:
+
+* missing `<title>`,
+* missing `lang` on `<html>`,
+* missing viewport meta tag,
+* images without `alt`,
+* buttons or links with no visible text,
+* form inputs without labels or accessible names,
+* no clear `h1`,
+* weak heading structure,
+* overuse of generic containers when obvious landmarks would help,
+* missing responsive CSS/media queries,
+* hardcoded tiny font sizes,
+* unclear call-to-action or empty-state copy.
+
+Plugin permissions must remain conservative:
+
+```yaml
+permissions:
+  filesystem: read
+  commands: false
+  network: false
+```
+
+Rules:
+
+* Do not give this example plugin write permission.
+* Do not run shell commands from the plugin.
+* Do not use network access.
+* Do not depend on Playwright, browsers, npm, or external services.
+* Do not require API keys.
+* Do not auto-enable the plugin globally.
+* The example should be enabled only through an explicit project `.agent/plugins.yaml` entry.
+* The plugin must respect project-root path confinement through the existing plugin sandbox/loader mechanisms.
+* Plugin findings are advisory. File edits must still be performed by built-in tools after normal approval.
+
+Manual test target:
+
+```text
+examples/projects/browser-demo/
+```
+
+Example prompt:
+
+```bash
+lunar-forge --project examples/projects/browser-demo "Use web_design.review_files to review index.html, src/App.jsx, and src/App.css for accessibility, responsive layout, and visual hierarchy. Do not edit files."
+```
+
+Expected behavior:
+
+* Plugin is listed by `lunar-forge plugins list` when enabled for the demo project.
+* Plugin tool requires normal tool approval before execution when permissions require it.
+* Plugin returns structured findings.
+* No files are edited.
+* No shell commands run.
+* No network access is used.
+
+---
+
+
 ## Documentation and examples
 
 The repository should include documentation and runnable examples.
@@ -1973,6 +2105,8 @@ examples/
     fastapi-api/
   mcp/
     playwright/
+  plugins/
+    web-design-review/
 ```
 
 Example rules:
@@ -1987,7 +2121,7 @@ Example rules:
   * Playwright MCP inspection.
 * MCP Playwright example should include copy-paste `.agent/config.yaml` and `.agent/mcp.yaml` examples.
 * Examples should include README files with exact commands.
-* Do not add plugin examples in this batch unless explicitly requested later.
+* Include only the `web-design-review` plugin example in this batch; do not add additional plugin examples unless explicitly requested later.
 
 ---
 

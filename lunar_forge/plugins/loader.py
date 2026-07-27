@@ -61,6 +61,7 @@ class LoadedPlugin:
 
     manifest: PluginManifest
     manifest_path: Path
+    project_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,7 @@ def load_enabled_plugins(
             )
         _validate_manifest_reference(entry.manifest)
         try:
-            manifest_path = safe_path(root, entry.manifest)
+            manifest_path = _resolve_manifest_path(root, entry.manifest)
             manifest = load_plugin_manifest(manifest_path)
         except PermissionError:
             raise
@@ -187,6 +188,7 @@ def load_enabled_plugins(
             LoadedPlugin(
                 manifest=manifest,
                 manifest_path=manifest_path,
+                project_root=root,
             )
         )
     return tuple(loaded)
@@ -208,7 +210,7 @@ def inspect_configured_plugins(
         error: str | None = None
         try:
             _validate_manifest_reference(entry.manifest)
-            manifest_path = safe_path(root, entry.manifest)
+            manifest_path = _resolve_manifest_path(root, entry.manifest)
             manifest = load_plugin_manifest(manifest_path)
             if manifest.name != name:
                 raise PluginConfigError(
@@ -216,8 +218,8 @@ def inspect_configured_plugins(
                 )
         except PermissionError:
             error = (
-                f"Configured plugin '{name}' manifest path escapes "
-                "the project root."
+                f"Configured plugin '{name}' manifest path escapes the "
+                "project root or its containing repository."
             )
         except (PluginConfigError, PluginManifestError) as exc:
             error = str(exc)
@@ -244,3 +246,17 @@ def _validate_manifest_reference(manifest: str) -> None:
         )
     if manifest_path.suffix.lower() not in {".yaml", ".yml"}:
         raise PluginConfigError("Plugin manifests must be YAML files.")
+
+
+def _resolve_manifest_path(root: Path, manifest: str) -> Path:
+    """Resolve an explicit manifest within the project or containing Git repo."""
+    boundary = _plugin_source_boundary(root)
+    return safe_path(boundary, root / manifest)
+
+
+def _plugin_source_boundary(root: Path) -> Path:
+    """Use the nearest Git worktree as a shared local-plugin source boundary."""
+    for candidate in (root, *root.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+    return root

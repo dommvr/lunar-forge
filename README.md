@@ -188,8 +188,8 @@ forwarded automatically.
 ### Experimental local plugins
 
 Plugins are experimental and disabled by default. Enabling one requires two
-project-local opt-ins. First set `plugins.enabled: true` in
-`.agent/config.yaml`:
+explicit opt-ins. First set `plugins.enabled: true` in the project
+`.agent/config.yaml` or user `~/.lunar-forge/config.yaml`:
 
 ```yaml
 plugins:
@@ -236,15 +236,17 @@ def echo(message):
     return {"ok": True, "echo": message}
 ```
 
-The referenced module must live beneath the manifest directory. LunarForge does
-not scan arbitrary directories, fetch remote plugin code, or import a handler
-while discovering tools. It validates the manifest, registers the namespaced
-tool, asks through the normal permission system, and only then loads and invokes
-the local entrypoint. Tools declaring filesystem writes, commands, or network
-access are always permission-gated. All plugin tools are omitted from plan mode
-because in-process code cannot enforce a manifest's read-only claim. Plugin
-arguments, results, and exceptions are contained and bounded before entering
-model context.
+The referenced module must live beneath the manifest directory. Manifests are
+confined to the selected project or, for a nested project, its nearest
+containing Git repository; paths outside that boundary are rejected.
+LunarForge does not scan arbitrary directories, fetch remote plugin code, or
+import a handler while discovering tools. It validates the manifest, registers
+the namespaced tool, asks through the normal permission system, and only then
+loads and invokes the local entrypoint. Tools declaring filesystem writes,
+commands, or network access are always permission-gated. All plugin tools are
+omitted from plan mode because in-process code cannot enforce a manifest's
+read-only claim. Plugin arguments, results, and exceptions are contained and
+bounded before entering model context.
 
 Plugin diagnostics and permission requests use the manifest's dotted internal
 name, such as `example.echo`. Model providers see its safe alias,
@@ -271,6 +273,23 @@ the normal model and permission flow:
 ```powershell
 lunar-forge --project C:\path\to\project "Call example.echo with the message hello"
 ```
+
+A complete read-only example lives at
+[`examples/plugins/web-design-review/`](examples/plugins/web-design-review/).
+It registers `web_design.review_files` and uses bounded local heuristics to
+review project HTML, CSS, JSX, and TSX without an LLM, commands, network,
+browser dependencies, or writes. Its manifest declares `filesystem: read`,
+`commands: false`, and `network: false`. The example README includes exact
+Command Prompt setup for copying its config into browser-demo, enabling the
+global plugin switch in project config, inspecting it with `plugins list`, and
+invoking it through the normal approval flow. Static source review does not
+trigger browser validation and needs no browser dependencies. Exact scores are
+not promised as heuristics evolve, and the documented `src\App.css` request is
+honestly reported as missing because this demo uses `src\styles.css`. Plugin
+findings are advisory source heuristics, not browser-rendered evidence; use
+browser validation or Playwright MCP separately for rendered-page evidence.
+Any follow-up edits still use built-in LunarForge tools and their normal
+approvals and checkpoints.
 
 Plugin capability declarations are a trust contract, not an operating-system
 sandbox. Enable only code you have reviewed. The loader intentionally supports
@@ -722,8 +741,9 @@ Small source-only projects and copy-paste commands live in the
 Vite/React, Python CLI, Flask, and FastAPI projects plus a dedicated
 [browser validation demo](examples/projects/browser-demo/) with full-page
 content, interactive controls, optional console-error collection, managed Vite
-validation, and Playwright MCP configuration examples. Generated dependency and
-build directories are not checked in.
+validation, Playwright MCP configuration examples, and a
+[read-only web design review plugin](examples/plugins/web-design-review/).
+Generated dependency and build directories are not checked in.
 
 ## Guarded Git commits
 
@@ -987,7 +1007,8 @@ See the comprehensive, Windows-friendly
 configuration, plan and no-command modes, file inspection and line edits, all
 six project starters, validation, browser setup and managed validation,
 Playwright MCP, every checked-in example project, plugin diagnostics, sessions,
-rollback, parallel subagents, and guarded Git finalization.
+the web design review plugin, rollback, parallel subagents, and guarded Git
+finalization.
 
 ## Known limitations
 

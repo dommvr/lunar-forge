@@ -243,6 +243,19 @@ def test_file_paths_do_not_trigger_browser_intent(user_request):
     assert intent.dev_command is None
 
 
+def test_explicit_source_review_plugin_does_not_trigger_browser_intent():
+    request = (
+        "Use web_design.review_files to review index.html, src\\App.jsx, "
+        "and src\\App.css for accessibility, responsive layout, and visual "
+        "hierarchy. Do not edit files."
+    )
+
+    intent = detect_browser_intent(request, PROJECT_INFO)
+
+    assert intent.detected is False
+    assert intent.signals == ()
+
+
 @pytest.mark.parametrize(
     "user_request",
     (

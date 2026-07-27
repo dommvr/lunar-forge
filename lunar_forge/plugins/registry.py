@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -257,7 +258,39 @@ def resolve_local_plugin_entrypoint(
     handler = getattr(module, function_name, None)
     if not callable(handler):
         raise PluginRegistrationError("Plugin entrypoint is not callable.")
-    return handler
+    return _bind_project_root_context(handler, plugin, definition)
+
+
+def _bind_project_root_context(
+    handler: PluginHandler,
+    plugin: LoadedPlugin,
+    definition: PluginToolManifest,
+) -> PluginHandler:
+    """Bind a confined root for filesystem tools that explicitly request it."""
+    if definition.permissions.filesystem == "none":
+        return handler
+    try:
+        root_parameter = inspect.signature(handler).parameters.get("_project_root")
+    except (TypeError, ValueError):
+        return handler
+    if root_parameter is None or root_parameter.kind not in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        return handler
+    if plugin.project_root is None:
+        raise PluginRegistrationError(
+            "Plugin project-root context is unavailable."
+        )
+
+    project_root = plugin.project_root.expanduser().resolve()
+
+    def handler_with_project_root(**arguments: Any) -> Any:
+        if "_project_root" in arguments:
+            raise TypeError("Plugin project-root context cannot be overridden.")
+        return handler(_project_root=project_root, **arguments)
+
+    return handler_with_project_root
 
 
 def register_plugin_tools(
@@ -333,6 +366,9 @@ def _registry_tool(
         # plan-safe because declarations cannot enforce in-process behavior.
         permission=PermissionLevel.EXECUTE,
         plan_safe=False,
+        read_only_extension=_declares_read_only_capabilities(
+            definition.permissions
+        ),
     )
 
 

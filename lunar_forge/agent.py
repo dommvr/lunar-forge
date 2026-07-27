@@ -83,6 +83,7 @@ MAX_FINAL_OUTPUT_CHARACTERS = 50_000
 MAX_SUBAGENT_ERROR_CHARACTERS = 500
 MAX_BROWSER_VALIDATION_RECORDS = 20
 MAX_COMMAND_EXECUTION_RECORDS = 50
+MAX_PLUGIN_PATH_SAFETY_RECORDS = 20
 MAX_RECORDED_COMMAND_CHARACTERS = 500
 MAX_FINAL_CHANGED_FILES = 100
 MAX_FINAL_CHANGED_PATH_CHARACTERS = 500
@@ -212,6 +213,7 @@ class SubagentPhaseResult:
     browser_validations_truncated: bool = False
     command_executions: tuple[CommandExecutionRecord, ...] = ()
     command_executions_truncated: bool = False
+    plugin_path_safety_failures: tuple[PluginPathSafetyRecord, ...] = ()
     validation_commands_run: bool = False
     validation_observed: bool = False
     validation_failed: bool = False
@@ -240,12 +242,21 @@ class CommandExecutionRecord:
     exit_code: int | None
 
 
+@dataclass(frozen=True)
+class PluginPathSafetyRecord:
+    tool_name: str
+    path: str
+
+
 @dataclass
 class ValidationEvidence:
     browser_validations: list[BrowserValidationRecord] = field(default_factory=list)
     browser_validations_truncated: bool = False
     command_executions: list[CommandExecutionRecord] = field(default_factory=list)
     command_executions_truncated: bool = False
+    plugin_path_safety_failures: list[PluginPathSafetyRecord] = field(
+        default_factory=list
+    )
     validation_commands_run: bool = False
     validation_observed: bool = False
     validation_failed: bool = False
@@ -268,6 +279,12 @@ class ValidationEvidence:
             self.command_executions_truncated
             or result.command_executions_truncated
             or len(result.command_executions) > command_remaining
+        )
+        path_failure_remaining = MAX_PLUGIN_PATH_SAFETY_RECORDS - len(
+            self.plugin_path_safety_failures
+        )
+        self.plugin_path_safety_failures.extend(
+            result.plugin_path_safety_failures[:path_failure_remaining]
         )
         self.validation_commands_run = (
             self.validation_commands_run or result.validation_commands_run
@@ -1579,7 +1596,10 @@ class CodeAgent:
             result = _run_subagent_model_loop(
                 model_client=model_client,
                 messages=messages,
-                tools=role.restrict(registry),
+                tools=role.restrict(
+                    registry,
+                    requested_tools=requested_tools,
+                ),
                 role=role,
                 phase=phase,
                 parallel_group_id=parallel_group_id,
@@ -1781,6 +1801,9 @@ def _run_subagent_model_loop(
                 ),
                 command_executions_truncated=(
                     validation_evidence.command_executions_truncated
+                ),
+                plugin_path_safety_failures=tuple(
+                    validation_evidence.plugin_path_safety_failures
                 ),
                 validation_commands_run=(
                     validation_evidence.validation_commands_run
@@ -2508,6 +2531,7 @@ def _record_validation_evidence(
     arguments: Mapping[str, Any],
     result: Mapping[str, Any],
 ) -> None:
+    _record_plugin_path_safety_evidence(evidence, tool_name, result)
     if tool_name == "run_validation":
         results = result.get("results")
         commands = result.get("commands")
@@ -2615,6 +2639,38 @@ def _record_validation_evidence(
         evidence.validation_failed = result.get("ok") is False
 
 
+def _record_plugin_path_safety_evidence(
+    evidence: ValidationEvidence,
+    tool_name: str,
+    result: Mapping[str, Any],
+) -> None:
+    if tool_name != "web_design.review_files" or result.get("ok") is not False:
+        return
+    skipped = result.get("files_skipped")
+    if not isinstance(skipped, Sequence) or isinstance(skipped, (str, bytes)):
+        return
+    for item in skipped:
+        if len(evidence.plugin_path_safety_failures) >= (
+            MAX_PLUGIN_PATH_SAFETY_RECORDS
+        ):
+            return
+        if (
+            not isinstance(item, Mapping)
+            or item.get("reason") != "path is outside the project root"
+        ):
+            continue
+        path = item.get("file")
+        if not isinstance(path, str) or not path:
+            continue
+        bounded_path = path[:MAX_FINAL_CHANGED_PATH_CHARACTERS]
+        record = PluginPathSafetyRecord(
+            tool_name=tool_name,
+            path=bounded_path,
+        )
+        if record not in evidence.plugin_path_safety_failures:
+            evidence.plugin_path_safety_failures.append(record)
+
+
 def _append_command_execution(
     evidence: ValidationEvidence,
     *,
@@ -2691,6 +2747,10 @@ def _finalize_validation_summary(
     mode: str = "default",
     reviewer_advisory: bool = False,
 ) -> str:
+    path_safety_summary = _plugin_path_safety_summary(evidence)
+    if path_safety_summary:
+        return path_safety_summary
+
     final_text = text.rstrip()
     if (
         not evidence.validation_commands_run
@@ -2779,6 +2839,13 @@ def _finalize_validation_summary(
     if evidence.browser_validations_truncated:
         lines.append("- Additional browser validation records were truncated.")
     return "\n".join(lines)
+
+
+def _plugin_path_safety_summary(evidence: ValidationEvidence) -> str:
+    return "\n".join(
+        f"Could not review {record.path}: path is outside the project root."
+        for record in evidence.plugin_path_safety_failures
+    )
 
 
 def _apply_authoritative_command_summary(

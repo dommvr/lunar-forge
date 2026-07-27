@@ -239,6 +239,12 @@ def test_task_profile_selection_is_deterministic():
             (),
         ),
         (
+            "Use web_design.review_files to review index.html. Do not edit files.",
+            {},
+            TaskProfile.REVIEW_ONLY,
+            (),
+        ),
+        (
             "Update the UI and capture a screenshot.",
             {"browser_intent": True},
             TaskProfile.BROWSER_TASK,

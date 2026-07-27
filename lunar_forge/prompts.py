@@ -81,6 +81,17 @@ _INTERACTIVE_BROWSER_PATTERN = re.compile(
     r"\binspect\s+(?:the\s+)?page\b",
     re.IGNORECASE,
 )
+_EXPLICIT_SOURCE_REVIEW_TOOL_PATTERN = re.compile(
+    r"\b(?:call|run|use)\s+(?:the\s+)?"
+    r"[a-z][a-z0-9_-]*\.review_files\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_BROWSER_MEDIUM_PATTERN = re.compile(
+    r"\b(?:browser|playwright|screenshots?|render(?:ed|ing)?|"
+    r"localhost|start\s+(?:the\s+)?(?:dev\s+)?server)\b|"
+    r"https?://(?:localhost|127\.0\.0\.1|\[::1\])",
+    re.IGNORECASE,
+)
 _FILE_PATH_REFERENCE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"(?:[A-Za-z]:)?(?:[\\/]|\.{1,2}[\\/])?"
@@ -142,6 +153,11 @@ def detect_browser_intent(
         for label, pattern in _BROWSER_INTENT_PATTERNS
         if pattern.search(intent_text)
     )
+    if (
+        _EXPLICIT_SOURCE_REVIEW_TOOL_PATTERN.search(text) is not None
+        and _EXPLICIT_BROWSER_MEDIUM_PATTERN.search(intent_text) is None
+    ):
+        signals = ()
     detected = bool(signals)
     explicit_url_match = _LOCAL_URL_PATTERN.search(text)
     explicit_url = explicit_url_match.group(0).rstrip(".,;)") if explicit_url_match else None

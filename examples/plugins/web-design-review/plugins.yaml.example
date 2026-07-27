@@ -1,0 +1,4 @@
+plugins:
+  web_design:
+    manifest: ../../plugins/web-design-review/plugin.yaml
+    enabled: true

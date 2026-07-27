@@ -1,0 +1,26 @@
+name: web_design
+version: 0.1.0
+description: Read-only local heuristics for reviewing website source files.
+tools:
+  - name: web_design.review_files
+    description: Review project-local HTML, CSS, and JSX/TSX files with bounded design heuristics.
+    entrypoint: web_design_review:review_files
+    parameters:
+      type: object
+      properties:
+        files:
+          type: array
+          items:
+            type: string
+          description: Project-relative website source files to review.
+        focus:
+          type: string
+          default: general
+          description: Optional review emphasis, such as accessibility or responsive.
+      required:
+        - files
+      additionalProperties: false
+    permissions:
+      filesystem: read
+      commands: false
+      network: false

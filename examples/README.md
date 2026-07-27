@@ -19,6 +19,7 @@ environments.
 | [Flask API](projects/flask-api/) | A JSON endpoint and Flask test client | See `requirements.txt` |
 | [FastAPI API](projects/fastapi-api/) | A typed JSON endpoint and import-level test | See `requirements.txt` |
 | [Playwright MCP config](mcp/playwright/) | Windows stdio configuration using `npx.cmd` | Node.js and npm |
+| [Web design review plugin](plugins/web-design-review/) | Read-only HTML/CSS/JSX design heuristics and a browser-demo config | None |
 
 ## Browser validation quick start
 
@@ -35,6 +36,41 @@ lunar-forge browser-validate --serve "npm run dev" --url http://localhost:5173 -
 Approve the exact `npm run dev` command when LunarForge prompts. The screenshot
 is written beneath `examples/projects/browser-demo/.agent/artifacts/browser/`.
 See the browser demo README for console-error and Playwright MCP checks.
+
+## Web design review plugin quick start
+
+The checked-in `web_design.review_files` example is advisory and read-only. It
+uses local heuristics, has no dependencies, and declares no command or network
+permission. Its explicit manifest remains inside the same Git checkout as the
+nested browser-demo project; reviewed website files remain confined to
+browser-demo itself.
+
+Open Command Prompt. The config command enables plugins globally for this
+project; alternatively place the same `plugins.enabled: true` YAML in
+`%USERPROFILE%\.lunar-forge\config.yaml`. The commands assume browser-demo's
+ignored `.agent` directory is disposable; merge an existing config instead of
+overwriting settings you want to keep.
+
+```cmd
+cd /d C:\Users\tiron\Desktop\lunar-forge
+mkdir examples\projects\browser-demo\.agent 2>nul
+copy examples\plugins\web-design-review\plugins.yaml.example examples\projects\browser-demo\.agent\plugins.yaml
+(echo plugins: & echo   enabled: true)>examples\projects\browser-demo\.agent\config.yaml
+lunar-forge plugins list --project examples\projects\browser-demo
+lunar-forge --project examples\projects\browser-demo "Use web_design.review_files to review index.html, src\App.jsx, and src\App.css for accessibility, responsive layout, and visual hierarchy. Do not edit files."
+```
+
+The diagnostic is model-free. The final agent command needs the normally
+configured LunarForge model and asks for approval before loading the local
+plugin. It performs static source review and does not trigger browser validation
+or require browser, npm, Playwright, dev-server, or network dependencies.
+Browser-demo has `src/styles.css`, not `src/App.css`, so the exact command
+honestly reports that requested file as skipped; scores and finding counts may
+change with the heuristics. Review the plugin
+[README](plugins/web-design-review/) for permissions, path safety, the actual
+stylesheet variant, and cleanup. Its advisory source findings are not
+browser-rendered evidence; use browser validation or Playwright MCP separately
+when rendered-page evidence is required.
 
 ## Keeping the checkout clean
 

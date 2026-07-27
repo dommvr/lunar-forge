@@ -504,6 +504,7 @@ class Tool:
     handler: ToolHandler = field(repr=False, compare=False)
     permission: PermissionLevel = PermissionLevel.READ
     plan_safe: bool = False
+    read_only_extension: bool = False
 
 
 class ToolRegistry:
@@ -589,12 +590,15 @@ class ToolRegistry:
         commit_requested: bool = False,
     ) -> list[dict[str, Any]]:
         """Return LiteLLM/OpenAI-compatible function tool schemas."""
+        resolved_profile = (
+            None if profile is None else _normalize_task_profile(profile)
+        )
         profile_names = (
             None
-            if profile is None
+            if resolved_profile is None
             else set(
                 tool_names_for_profile(
-                    profile,
+                    resolved_profile,
                     requested_tools=requested_tools,
                     available_tools=self._tools,
                     browser_intent=browser_intent,
@@ -602,6 +606,13 @@ class ToolRegistry:
                 )
             )
         )
+        if resolved_profile is TaskProfile.REVIEW_ONLY:
+            profile_names.update(
+                name
+                for name in requested_tools
+                if name in self._tools
+                and self._tools[name].read_only_extension
+            )
         return [
             {
                 "type": "function",

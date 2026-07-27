@@ -205,6 +205,49 @@ def test_plugin_manifest_cannot_escape_project_root(tmp_path):
         load_enabled_plugins(tmp_path, config)
 
 
+def test_nested_project_can_load_manifest_from_containing_git_repository(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    project = repository / "examples" / "projects" / "demo"
+    project.mkdir(parents=True)
+    manifest_path = repository / "examples" / "plugins" / "example" / "plugin.yaml"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(yaml.safe_dump(_manifest()), encoding="utf-8")
+    _write_config(
+        project,
+        manifest="../../plugins/example/plugin.yaml",
+        enabled=True,
+    )
+
+    loaded = load_enabled_plugins(project)
+
+    assert len(loaded) == 1
+    assert loaded[0].manifest_path == manifest_path.resolve()
+    assert loaded[0].project_root == project.resolve()
+
+
+def test_nested_project_manifest_cannot_escape_containing_git_repository(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    project = repository / "project"
+    project.mkdir()
+    outside = tmp_path / "outside" / "plugin.yaml"
+    outside.parent.mkdir()
+    outside.write_text(yaml.safe_dump(_manifest()), encoding="utf-8")
+    _write_config(
+        project,
+        manifest="../../outside/plugin.yaml",
+        enabled=True,
+    )
+
+    with pytest.raises(PermissionError, match="outside the project root"):
+        load_enabled_plugins(project)
+
+
 def test_configured_name_must_match_manifest_name(tmp_path):
     manifest = _manifest()
     manifest["name"] = "different"

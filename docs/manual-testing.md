@@ -48,7 +48,7 @@ command described by the test before answering `y`. Paths beneath
 - [ ] `browser-setup`
 - [ ] Managed browser validation
 - [ ] Playwright MCP
-- [ ] Plugin diagnostics and echo usage
+- [ ] Plugin diagnostics, echo usage, and web design review
 - [ ] Session resume
 - [ ] Checkpoints and rollback
 - [ ] Parallel subagents
@@ -1603,6 +1603,83 @@ approval, and reports an echo result containing `hello`.
 Remove-Item -Recurse -Force -LiteralPath $PluginProject
 ```
 
+### Web design review example
+
+This test uses the real checked-in plugin against
+`examples/projects/browser-demo`. The plugin is advisory and read-only. It
+declares `filesystem: read`, `commands: false`, and `network: false`; it uses no
+LLM internally and does not require npm, Playwright, browser dependencies,
+network access, or an API key. The final LunarForge agent command still needs
+the normally configured model because the agent selects and calls the tool.
+
+Open Command Prompt (`cmd.exe`). These commands are intentionally CMD-friendly.
+The generated project `.agent/config.yaml` contains the required global plugin
+switch, `plugins.enabled: true`. The same setting may instead be placed in
+`%USERPROFILE%\.lunar-forge\config.yaml`. This manual test assumes
+browser-demo's ignored `.agent` directory is disposable; merge the YAML instead
+of overwriting it when it contains runtime state you want to keep.
+
+```cmd
+cd /d C:\Users\tiron\Desktop\lunar-forge
+mkdir examples\projects\browser-demo\.agent 2>nul
+copy examples\plugins\web-design-review\plugins.yaml.example examples\projects\browser-demo\.agent\plugins.yaml
+(echo plugins: & echo   enabled: true)>examples\projects\browser-demo\.agent\config.yaml
+lunar-forge plugins list --project examples\projects\browser-demo
+lunar-forge --project examples\projects\browser-demo "Use web_design.review_files to review index.html, src\App.jsx, and src\App.css for accessibility, responsive layout, and visual hierarchy. Do not edit files."
+```
+
+Approve only the `web_design.review_files` execution request. The diagnostic
+should report internal tool name `web_design.review_files`, provider alias
+`web_design_review_files`, and permissions `filesystem=read`,
+`commands=false`, and `network=false`. The tool result should:
+
+- return `ok: true`;
+- list `index.html` and `src/App.jsx` as reviewed;
+- list `src/App.css` in `files_skipped` because browser-demo's stylesheet is
+  named `src/styles.css`;
+- return integer 0-10 scores for accessibility, visual hierarchy, responsive
+  behavior, and content clarity;
+- report at most 50 concise findings; and
+- avoid command output, network activity, browser startup, and file changes.
+
+Do not require exact scores or a fixed finding count: the deterministic
+heuristics may evolve. A follow-up invocation may substitute
+`src\styles.css` to review the real stylesheet. A path such as
+`..\..\..\README.md` must still be rejected as outside the browser-demo
+project root.
+
+The request names a static source-review plugin. It must not start a dev server,
+expose browser validation tools, request Playwright, or create browser
+artifacts. Plugin execution still requires the normal
+`web_design.review_files` approval. This plugin call does not use the built-in
+read-only fast path; separate structured requests such as
+`Run read_json on package.json` continue to use that fast path normally.
+Findings are advisory source heuristics, not browser-rendered evidence; use the
+separate browser-validation or Playwright MCP checks when runtime, screenshot,
+computed-style, or pixel evidence is required. The result must stay bounded and
+must not copy reviewed source contents into findings.
+
+Run one explicit traversal check from the repository root:
+
+```cmd
+lunar-forge --project examples\projects\browser-demo "Use web_design.review_files to review ..\..\outside.txt. Do not edit files."
+```
+
+Approve only `web_design.review_files`. The result should return `ok: false`,
+review no files, report that the path is outside the project root, and include
+no outside-file content.
+
+The plugin never applies a finding. If a suggestion is worth adopting, request
+the edit separately so built-in LunarForge editing tools keep their normal
+approval and checkpoint protections.
+
+Clean up from Command Prompt:
+
+```cmd
+cd /d C:\Users\tiron\Desktop\lunar-forge
+rmdir /S /Q examples\projects\browser-demo\.agent
+```
+
 ## 17. Session resume
 
 **Purpose**
@@ -2060,13 +2137,14 @@ active.
 ```powershell
 python -m pytest -q
 python -B -m compileall lunar_forge
+python -B -m compileall examples/plugins/web-design-review
 git diff --check
 ```
 
 **Expected result**
 
-Pytest reports no failures, compileall reports no syntax errors, and
-`git diff --check` produces no whitespace errors.
+Pytest reports no failures, both compileall commands report no syntax errors,
+and `git diff --check` produces no whitespace errors.
 
 **Cleanup**
 

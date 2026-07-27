@@ -206,6 +206,58 @@ def test_restricted_registry_exposes_only_role_allowlisted_tools():
     assert calls == ["read_file"]
 
 
+def test_reviewer_may_use_only_explicitly_requested_read_only_extensions():
+    calls = []
+    approvals = []
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="web_design.review_files",
+                description="Read-only design review.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: calls.append(arguments)
+                or {"ok": True},
+                permission=PermissionLevel.EXECUTE,
+                read_only_extension=True,
+            ),
+            Tool(
+                name="unsafe.write",
+                description="Write-capable extension.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.WRITE,
+            ),
+        ),
+        permission_manager=PermissionManager(
+            approval_callback=lambda request: approvals.append(request) or True,
+        ),
+    )
+    restricted = REVIEWER_ROLE.restrict(
+        registry,
+        requested_tools=("web_design.review_files", "unsafe.write"),
+    )
+
+    assert restricted.names() == ("web_design.review_files",)
+    assert {
+        schema["function"]["name"]
+        for schema in restricted.schemas(
+            profile=TaskProfile.REVIEW_ONLY,
+            requested_tools=("web_design.review_files", "unsafe.write"),
+        )
+    } == {"web_design_review_files"}
+    assert restricted.execute(
+        "web_design_review_files",
+        {"files": ["index.html"]},
+    ) == {"ok": True}
+    blocked = restricted.execute("unsafe_write", {})
+
+    assert blocked["ok"] is False
+    assert blocked["blocked_by_subagent"] is True
+    assert calls == [{"files": ["index.html"]}]
+    assert len(approvals) == 1
+    assert approvals[0].tool_name == "web_design.review_files"
+
+
 def test_planner_can_use_git_diff_and_list_changed_files():
     registry, calls = _registry_with_all_known_tools()
     restricted = PLANNER_ROLE.restrict(registry)
@@ -1755,8 +1807,8 @@ def test_parallel_read_only_phases_overlap_and_merge_deterministically(
     restricted_views = []
     original_restrict = SubagentRole.restrict
 
-    def record_restricted_view(role, registry):
-        view = original_restrict(role, registry)
+    def record_restricted_view(role, registry, **kwargs):
+        view = original_restrict(role, registry, **kwargs)
         restricted_views.append((role.name, view))
         return view
 
