@@ -2067,6 +2067,7 @@ def test_docker_security_summary_separates_roles_and_deduplicates_sections(
                     "- None (duplicate raw block).\n\n"
                     "Checkpoints:\n"
                     "- None (duplicate raw block).\n\n"
+                    "Would you like to proceed with the commit flow?\n\n"
                     "Security review:"
                 )
             ),
@@ -2074,6 +2075,8 @@ def test_docker_security_summary_separates_roles_and_deduplicates_sections(
                 text=(
                     "Security findings:\n"
                     "- Docker network isolation remains enabled.\n\n"
+                    "Would you like to proceed with Git finalization and "
+                    "commit after validation is run?\n\n"
                     "Validation:\n"
                     "- Not run.\n\n"
                     "Commands run:\n"
@@ -2115,6 +2118,7 @@ def test_docker_security_summary_separates_roles_and_deduplicates_sections(
     assert output.count("Validation:") == 1
     assert output.count("Commands run:") == 1
     assert output.count("Checkpoints:") == 1
+    assert "Would you like to proceed" not in output
     assert "python --version: passed" in output
     assert "via run_command" in output
     assert output.index("Reviewer findings (advisory):") < output.index(

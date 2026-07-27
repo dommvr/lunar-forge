@@ -46,7 +46,11 @@ TESTER_ROLE = SubagentRole(
         "mode, console error count, and failed request count. Tool results are the "
         "authoritative validation record. Report the exact commands and outcomes "
         "returned by run_validation and run_command. Stop after identifying one "
-        "reasonable fix path. Never create or edit files."
+        "reasonable fix path. An explicit run_command request is literal: pass its "
+        "requested command unchanged, and never substitute run_validation or a "
+        "different check. Bare Python means only python, python.exe, py, or py.exe "
+        "with no arguments; version, help, -c, -m, and script forms are not bare. "
+        "Never create or edit files."
     ),
     allowed_tools=_ALLOWED_TOOLS,
     blocked_tools=BUILTIN_SUBAGENT_TOOLS - _ALLOWED_TOOLS,

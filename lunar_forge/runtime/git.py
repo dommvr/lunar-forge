@@ -102,9 +102,10 @@ class GitCommitProposal:
     unrelated_files: tuple[str, ...]
     excluded_files: tuple[str, ...]
     session_scoped: bool
+    proposed_files_label: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "repository_root": str(self.repository_root),
             "project_root": str(self.project_root),
             "status_short": list(self.status_lines),
@@ -114,6 +115,9 @@ class GitCommitProposal:
             "excluded_files": list(self.excluded_files),
             "session_scoped": self.session_scoped,
         }
+        if self.proposed_files_label is not None:
+            result["proposed_files_label"] = self.proposed_files_label
+        return result
 
 
 @dataclass(frozen=True)
@@ -624,6 +628,7 @@ def prepare_git_commit(
     project_root: str | Path,
     *,
     session_files: Sequence[str] | None = None,
+    proposed_files_label: str | None = None,
     mode: str = "default",
     timeout_ms: int = DEFAULT_GIT_TIMEOUT_MS,
 ) -> dict[str, Any]:
@@ -694,6 +699,9 @@ def prepare_git_commit(
         unrelated_files=tuple(_stable_unique(unrelated)),
         excluded_files=tuple(_stable_unique(excluded)),
         session_scoped=session_files is not None,
+        proposed_files_label=_normalize_proposed_files_label(
+            proposed_files_label
+        ),
     )
     return {"ok": True, "proposal": proposal, **proposal.as_dict()}
 
@@ -703,6 +711,7 @@ def create_git_commit(
     message: str,
     *,
     session_files: Sequence[str] | None = None,
+    proposed_files_label: str | None = None,
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
     approval_context: str | None = None,
@@ -740,6 +749,7 @@ def create_git_commit(
     prepared = prepare_git_commit(
         project_root,
         session_files=session_files,
+        proposed_files_label=proposed_files_label,
         mode=mode,
         timeout_ms=timeout_ms,
     )
@@ -877,6 +887,15 @@ def normalize_commit_message(message: str) -> str:
     return normalized
 
 
+def _normalize_proposed_files_label(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return None
+    return normalized[:200]
+
+
 def format_git_status(result: dict[str, Any]) -> str:
     """Format a deterministic status result for CLI display."""
     if result.get("ok") is not True:
@@ -899,7 +918,7 @@ def format_git_proposal(
     lines = ["Git status --short:"]
     lines.extend(proposal.status_lines or ("(clean)",))
     lines.extend(("", "Bounded diff summary:", proposal.diff_summary or "(none)"))
-    proposed_label = (
+    proposed_label = proposal.proposed_files_label or (
         "Files changed by LunarForge (proposed for commit):"
         if proposal.session_scoped
         else "Files proposed for commit:"
@@ -934,6 +953,9 @@ def format_git_commit_result(result: dict[str, Any]) -> str:
             unrelated_files=tuple(str(item) for item in result.get("unrelated_files", [])),
             excluded_files=tuple(str(item) for item in result.get("excluded_files", [])),
             session_scoped=result.get("session_scoped") is True,
+            proposed_files_label=_normalize_proposed_files_label(
+                result.get("proposed_files_label")
+            ),
         )
         message = result.get("message")
         proposal_text = format_git_proposal(

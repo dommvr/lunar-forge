@@ -233,6 +233,202 @@ def test_docker_python_version_inspection_runs_after_approval(
     assert f"{command}: passed" in output
 
 
+def test_local_python_help_inspection_runs_after_approval(
+    monkeypatch,
+    tmp_path,
+):
+    runner_calls = []
+    approvals = []
+
+    def fake_local(project_root, command, timeout_ms):
+        runner_calls.append(command)
+        return {
+            "ok": True,
+            "runtime": "local",
+            "command": command,
+            "exit_code": 0,
+            "stdout": "usage: python [option]\n",
+            "stderr": "",
+            "duration_ms": 1,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(
+        "lunar_forge.tools.shell.run_local_command",
+        fake_local,
+    )
+
+    CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode="local"),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=CommandCallingModel("python --help"),
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        "Use run_command to run python --help. Do not edit files.",
+        tmp_path,
+    )
+
+    assert runner_calls == ["python --help"]
+    assert len(approvals) == 1
+    assert approvals[0].description.startswith(
+        "Run local command: python --help\n\n"
+    )
+
+
+@pytest.mark.parametrize("runtime_mode", ("local", "docker"))
+def test_explicit_bare_python_is_blocked_before_approval_or_dispatch(
+    monkeypatch,
+    tmp_path,
+    runtime_mode,
+):
+    approvals = []
+
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("Bare Python must not reach a command runner")
+
+    monkeypatch.setattr(
+        (
+            "lunar_forge.tools.shell.run_docker_command"
+            if runtime_mode == "docker"
+            else "lunar_forge.tools.shell.run_local_command"
+        ),
+        unexpected_runner,
+    )
+    model = CommandCallingModel(
+        "python",
+        final_text="No command ran because bare Python is blocked.",
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode=runtime_mode),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=model,
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        "Use run_command to run python. Do not edit files.",
+        tmp_path,
+    )
+
+    result = _tool_result(model)
+    assert result["ok"] is False
+    assert "Bare Python interpreter" in result["error"]
+    assert approvals == []
+    assert "Commands run:" not in output
+    assert "No command ran" in output
+
+
+@pytest.mark.parametrize("runtime_mode", ("local", "docker"))
+def test_explicit_run_command_preserves_literal_instead_of_compileall(
+    monkeypatch,
+    tmp_path,
+    runtime_mode,
+):
+    approvals = []
+
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("Blocked literal command must not be rewritten")
+
+    monkeypatch.setattr(
+        (
+            "lunar_forge.tools.shell.run_docker_command"
+            if runtime_mode == "docker"
+            else "lunar_forge.tools.shell.run_local_command"
+        ),
+        unexpected_runner,
+    )
+    model = CommandCallingModel(
+        "python -B -m compileall .",
+        final_text="No command ran because bare Python is blocked.",
+    )
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode=runtime_mode),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=model,
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        "Use run_command to run python. Do not edit files.",
+        tmp_path,
+    )
+
+    result = _tool_result(model)
+    assert result["ok"] is False
+    assert "Bare Python interpreter" in result["error"]
+    assert result.get("command") != "python -B -m compileall ."
+    assert approvals == []
+    assert "compileall" not in output
+
+
+@pytest.mark.parametrize("runtime_mode", ("local", "docker"))
+def test_explicit_run_command_preserves_safe_requested_command_string(
+    monkeypatch,
+    tmp_path,
+    runtime_mode,
+):
+    runner_calls = []
+    approvals = []
+
+    def fake_local(project_root, command, timeout_ms):
+        runner_calls.append(command)
+        return {
+            "ok": True,
+            "runtime": "local",
+            "command": command,
+            "exit_code": 0,
+            "stdout": "Python 3.12.0\n",
+            "stderr": "",
+            "duration_ms": 1,
+            "timed_out": False,
+            "truncated": False,
+        }
+
+    def fake_docker(
+        project_root,
+        command,
+        timeout_ms,
+        *,
+        allow_network=False,
+    ):
+        result = fake_local(project_root, command, timeout_ms)
+        result["runtime"] = "docker"
+        return result
+
+    monkeypatch.setattr(
+        (
+            "lunar_forge.tools.shell.run_docker_command"
+            if runtime_mode == "docker"
+            else "lunar_forge.tools.shell.run_local_command"
+        ),
+        fake_docker if runtime_mode == "docker" else fake_local,
+    )
+    model = CommandCallingModel("python -B -m compileall .")
+
+    output = CodeAgent(
+        AppConfig(
+            runtime=RuntimeConfig(mode=runtime_mode),
+            subagents=SubagentConfig(enabled=True),
+        ),
+        model_client=model,
+        approval_callback=lambda request: approvals.append(request) or True,
+    ).run(
+        "Use run_command to run python --version. Do not edit files.",
+        tmp_path,
+    )
+
+    assert runner_calls == ["python --version"]
+    assert len(approvals) == 1
+    assert "python --version" in approvals[0].description
+    assert "python -B -m compileall ." not in approvals[0].description
+    assert "python --version: passed" in output
+
+
 def test_explicit_command_stdout_is_bounded(monkeypatch, tmp_path):
     def fake_local(project_root, command, timeout_ms):
         return {

@@ -50,6 +50,7 @@ from lunar_forge.runtime.git import (
     create_git_commit,
     derive_commit_message,
     format_git_commit_result,
+    list_changed_files as list_git_changed_files,
 )
 from lunar_forge.runtime.sessions import (
     SessionLogger,
@@ -149,7 +150,24 @@ RAW_DEDUPLICATED_SUMMARY_SECTION_NAMES = frozenset(
         "validation",
         "commands run",
         "checkpoints",
+        "git",
     }
+)
+_EXPLICIT_RUN_COMMAND_REQUEST_PATTERN = re.compile(
+    r"(?is)\b(?:use|call)\s+(?:the\s+)?run_command\s+to\s+run\s+"
+    r"(?P<command>.+?)"
+    r"(?="
+    r"(?:,\s*|\s+)then\s+(?:use|call)\s+(?:the\s+)?run_command\b|"
+    r"\.\s+(?:do|then|include|show|report|return|please)\b|"
+    r"\s+and\s+(?:include|show|report|return|review|inspect|summarize|explain)\b|"
+    r"$"
+    r")"
+)
+_REQUESTED_FILE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<path>[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)*"
+    r"\.[A-Za-z0-9]{1,12})"
+    r"(?![A-Za-z0-9_.-])"
 )
 _NO_REVIEWER_CONCERN_PATTERN = re.compile(
     r"(?i)^(?:"
@@ -166,6 +184,40 @@ _NO_REVIEWER_CONCERN_PATTERN = re.compile(
 
 class AgentError(RuntimeError):
     """Raised when the bounded agent loop cannot produce a final response."""
+
+
+@dataclass
+class _ExplicitRunCommandTracker:
+    """Preserve literal commands named in explicit run_command requests."""
+
+    commands: tuple[str, ...] = ()
+    next_index: int = 0
+
+    @property
+    def has_pending(self) -> bool:
+        return self.next_index < len(self.commands)
+
+    def prepare(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        effective = dict(arguments)
+        if tool_name == "run_validation" and self.has_pending:
+            expected = self.commands[self.next_index]
+            return effective, {
+                "ok": False,
+                "error": (
+                    "An explicit run_command request is still pending. "
+                    f"Use run_command with the exact requested command: {expected}"
+                ),
+                "blocked_by_explicit_command_preservation": True,
+            }
+        if tool_name != "run_command" or not self.has_pending:
+            return effective, None
+        effective["command"] = self.commands[self.next_index]
+        self.next_index += 1
+        return effective, None
 
 
 @dataclass
@@ -580,6 +632,7 @@ class CodeAgent:
                     validation_evidence=subagent_result.validation_evidence,
                     offer_commit=offer_commit,
                     commit_message=commit_message,
+                    registry=tools,
                 )
                 return _append_session_note(
                     final_output,
@@ -633,6 +686,9 @@ class CodeAgent:
                 validation_requested=_request_has_validation_intent(request),
                 include_command_stdout=_request_wants_command_stdout(request),
             )
+            explicit_command_tracker = _ExplicitRunCommandTracker(
+                _explicit_run_command_requests(request)
+            )
             changed_files: list[str] = []
 
             for step in range(self.max_steps):
@@ -674,6 +730,12 @@ class CodeAgent:
                         internal_tool_name = (
                             tools.internal_name_for(tool_call.name) or tool_call.name
                         )
+                        effective_arguments, preservation_error = (
+                            explicit_command_tracker.prepare(
+                                internal_tool_name,
+                                tool_call.arguments,
+                            )
+                        )
                         _log_session(
                             session,
                             "tool_call",
@@ -682,18 +744,22 @@ class CodeAgent:
                             name=internal_tool_name,
                             model_tool_name=tool_call.name,
                             internal_tool_name=internal_tool_name,
-                            arguments=tool_call.arguments,
+                            arguments=effective_arguments,
                         )
-                        result = _execute_exposed_tool(
-                            tools,
-                            tool_call.name,
-                            tool_call.arguments,
-                            tool_schemas,
+                        result = (
+                            preservation_error
+                            if preservation_error is not None
+                            else _execute_exposed_tool(
+                                tools,
+                                tool_call.name,
+                                effective_arguments,
+                                tool_schemas,
+                            )
                         )
                         _record_validation_evidence(
                             validation_evidence,
                             internal_tool_name,
-                            tool_call.arguments,
+                            effective_arguments,
                             result,
                         )
                         changed_path = _changed_path(internal_tool_name, result)
@@ -767,6 +833,7 @@ class CodeAgent:
                         validation_evidence=validation_evidence,
                         offer_commit=offer_commit,
                         commit_message=commit_message,
+                        registry=tools,
                     )
                     return _append_session_note(
                         final_text,
@@ -941,14 +1008,15 @@ class CodeAgent:
         validation_evidence: ValidationEvidence,
         offer_commit: bool,
         commit_message: str | None,
+        registry: ToolRegistry | None = None,
     ) -> str:
         if not offer_commit:
             return text
+        text = _strip_subagent_calls_to_action(text)
+        text = _remove_summary_sections(text, {"git"})
         failed_validation_override = (
             _request_allows_commit_after_failed_validation(request)
         )
-        if validation_evidence.validation_failed:
-            text = _remove_failed_validation_commit_readiness_claims(text)
         if mode == "plan":
             _log_git_commit_skipped(
                 session,
@@ -956,6 +1024,50 @@ class CodeAgent:
                 reason="Plan mode blocks Git commits.",
             )
             return f"{text}\n\nGit:\n- Commit not created: plan mode"
+        git_mode = (
+            "no-command"
+            if self.config.runtime.mode.strip().lower() == "no-command"
+            else mode
+        )
+        if (
+            failed_validation_override
+            and not validation_evidence.validation_observed
+            and not validation_evidence.validation_failed
+            and git_mode != "no-command"
+            and not _request_blocks_commands(request)
+            and registry is not None
+            and "run_validation" in registry.names()
+        ):
+            validation_evidence.validation_requested = True
+            _log_session(
+                session,
+                "tool_call",
+                phase="commit_validation",
+                name="run_validation",
+                internal_tool_name="run_validation",
+                arguments={},
+            )
+            validation_result = registry.execute("run_validation", {})
+            _record_validation_evidence(
+                validation_evidence,
+                "run_validation",
+                {},
+                validation_result,
+            )
+            _log_session(
+                session,
+                "tool_result",
+                phase="commit_validation",
+                name="run_validation",
+                internal_tool_name="run_validation",
+                result=validation_result,
+            )
+            text = _apply_authoritative_validation_outcome(
+                text,
+                validation_evidence,
+            )
+        if validation_evidence.validation_failed:
+            text = _remove_failed_validation_commit_readiness_claims(text)
         if (
             validation_evidence.validation_failed
             and not failed_validation_override
@@ -988,25 +1100,37 @@ class CodeAgent:
                 f"{text}\n\nGit:\n"
                 "- Commit not created: requested validation did not run"
             )
-        if not changed_files:
+        commit_files = tuple(changed_files)
+        proposed_files_label: str | None = None
+        if not commit_files:
+            commit_files = _requested_current_commit_files(
+                root,
+                request,
+                mode=git_mode,
+            )
+            if commit_files:
+                proposed_files_label = (
+                    "Requested current files (proposed for commit):"
+                )
+                text = _apply_authoritative_changed_files(text, commit_files)
+        if not commit_files:
             _log_git_commit_skipped(
                 session,
                 result_code="no_changes",
-                reason="LunarForge did not change any files in this session.",
+                reason=(
+                    "LunarForge did not change files in this session and no "
+                    "explicitly requested current Git changes were eligible."
+                ),
             )
             return f"{text}\n\nGit:\n- Commit not created: no changes"
 
-        git_mode = (
-            "no-command"
-            if self.config.runtime.mode.strip().lower() == "no-command"
-            else mode
-        )
         result = create_git_commit(
             root,
             commit_message or derive_commit_message(request),
-            session_files=tuple(changed_files),
+            session_files=commit_files,
             mode=git_mode,
             approval_callback=self.approval_callback,
+            proposed_files_label=proposed_files_label,
             approval_context=_format_commit_validation_context(
                 validation_evidence,
                 failed_validation_override=failed_validation_override,
@@ -1753,6 +1877,9 @@ def _run_subagent_model_loop(
         validation_requested=_request_has_validation_intent(request),
         include_command_stdout=_request_wants_command_stdout(request),
     )
+    explicit_command_tracker = _ExplicitRunCommandTracker(
+        _explicit_run_command_requests(request)
+    )
     for step in range(max_steps):
         _log_tool_schema_selection(
             session,
@@ -1798,6 +1925,12 @@ def _run_subagent_model_loop(
                 internal_tool_name = (
                     tools.internal_name_for(tool_call.name) or tool_call.name
                 )
+                effective_arguments, preservation_error = (
+                    explicit_command_tracker.prepare(
+                        internal_tool_name,
+                        tool_call.arguments,
+                    )
+                )
                 _log_session(
                     session,
                     "tool_call",
@@ -1810,18 +1943,22 @@ def _run_subagent_model_loop(
                     name=internal_tool_name,
                     model_tool_name=tool_call.name,
                     internal_tool_name=internal_tool_name,
-                    arguments=tool_call.arguments,
+                    arguments=effective_arguments,
                 )
-                result = _execute_exposed_tool(
-                    tools,
-                    tool_call.name,
-                    tool_call.arguments,
-                    tool_schemas,
+                result = (
+                    preservation_error
+                    if preservation_error is not None
+                    else _execute_exposed_tool(
+                        tools,
+                        tool_call.name,
+                        effective_arguments,
+                        tool_schemas,
+                    )
                 )
                 _record_validation_evidence(
                     validation_evidence,
                     internal_tool_name,
-                    tool_call.arguments,
+                    effective_arguments,
                     result,
                 )
                 _log_session(
@@ -2488,6 +2625,7 @@ def _apply_authoritative_changed_files(
     text: str,
     changed_files: Sequence[str],
 ) -> str:
+    text = _remove_stale_changed_file_claims(text, changed_files)
     displayed_paths = tuple(changed_files[:MAX_FINAL_CHANGED_FILES])
     changed_block = ["Changed files:"]
     changed_block.extend(
@@ -2522,6 +2660,47 @@ def _apply_authoritative_changed_files(
             return f"{changed_text}\n\n{body}"
         return changed_text
     return "\n".join(output_lines).strip()
+
+
+def _remove_stale_changed_file_claims(
+    text: str,
+    changed_files: Sequence[str],
+) -> str:
+    """Remove file-absence claims contradicted by authoritative mutations."""
+    changed_names = {
+        variant.casefold()
+        for path in changed_files
+        for variant in (
+            path.replace("\\", "/"),
+            Path(path.replace("\\", "/")).name,
+        )
+        if variant
+    }
+    stale_markers = (
+        "does not exist",
+        "doesn't exist",
+        "has not been added",
+        "hasn't been added",
+        "was not added",
+        "wasn't added",
+        "has not been created",
+        "hasn't been created",
+        "is missing",
+        "not present",
+        "no readme",
+    )
+    retained: list[str] = []
+    for line in text.splitlines():
+        normalized = line.casefold().replace("\\", "/")
+        mentions_changed_file = any(
+            name in normalized for name in changed_names
+        )
+        if mentions_changed_file and any(
+            marker in normalized for marker in stale_markers
+        ):
+            continue
+        retained.append(line)
+    return _remove_empty_section_headings(_clean_reviewer_block(retained))
 
 
 def _bounded_changed_path(path: str) -> str:
@@ -2588,6 +2767,98 @@ def _request_wants_command_stdout(request: str) -> bool:
         r"\bcommand output\b",
         normalized,
     ) is not None
+
+
+def _explicit_run_command_requests(request: str) -> tuple[str, ...]:
+    """Extract bounded literal commands from explicit run_command phrasing."""
+    commands: list[str] = []
+    for match in _EXPLICIT_RUN_COMMAND_REQUEST_PATTERN.finditer(request):
+        command = match.group("command").strip()
+        if len(command) >= 2 and command[0] == command[-1] == "`":
+            command = command[1:-1].strip()
+        if not command:
+            continue
+        command = command[:MAX_RECORDED_COMMAND_CHARACTERS]
+        commands.append(command)
+        if len(commands) >= MAX_COMMAND_EXECUTION_RECORDS:
+            break
+    return tuple(commands)
+
+
+def _request_blocks_commands(request: str) -> bool:
+    normalized = " ".join(request.casefold().split())
+    return re.search(
+        r"\b(?:do not|don't|dont|never)\s+"
+        r"(?:run|execute)\s+(?:shell\s+)?commands?\b|"
+        r"\bwithout\s+(?:running|executing)\s+(?:shell\s+)?commands?\b|"
+        r"\bno[- ]command\b",
+        normalized,
+    ) is not None
+
+
+def _requested_current_commit_files(
+    root: Path,
+    request: str,
+    *,
+    mode: str,
+) -> tuple[str, ...]:
+    """Select only explicitly named eligible Git changes for a new invocation."""
+    changed = list_git_changed_files(root, source="git", mode=mode)
+    if changed.get("ok") is not True:
+        return ()
+    raw_candidates = changed.get("commit_candidates")
+    if not isinstance(raw_candidates, Sequence) or isinstance(
+        raw_candidates,
+        (str, bytes),
+    ):
+        return ()
+    candidates = tuple(
+        str(candidate)
+        for candidate in raw_candidates
+        if isinstance(candidate, str) and candidate
+    )
+    requested_paths = tuple(
+        match.group("path").replace("\\", "/").lstrip("./")
+        for match in _REQUESTED_FILE_PATH_PATTERN.finditer(request)
+    )
+    repository_root_value = changed.get("repository_root")
+    repository_root = (
+        Path(str(repository_root_value)).resolve()
+        if isinstance(repository_root_value, str) and repository_root_value
+        else root
+    )
+    selected: list[str] = []
+    for candidate in candidates:
+        try:
+            project_relative = (
+                repository_root / candidate
+            ).resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        candidate_names = {
+            candidate.casefold(),
+            project_relative.casefold(),
+            Path(project_relative).name.casefold(),
+        }
+        if any(path.casefold() in candidate_names for path in requested_paths):
+            selected.append(project_relative)
+    if selected:
+        return tuple(dict.fromkeys(selected))
+    if (
+        len(candidates) == 1
+        and re.search(
+            r"(?i)\b(?:the\s+)?current\s+(?:file\s+)?changes?\b",
+            request,
+        )
+    ):
+        try:
+            only_path = (
+                repository_root / candidates[0]
+            ).resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            return ()
+        return (only_path,)
+    return ()
 
 
 def _resume_history_messages(
@@ -3054,6 +3325,8 @@ def _finalize_subagent_summary(
     reviewer_advisory: bool = False,
 ) -> str:
     """Format role outputs without treating security findings as reviewer text."""
+    primary_text = _strip_subagent_calls_to_action(primary_text)
+    security_output = _strip_subagent_calls_to_action(security_output or "")
     primary_without_security, primary_security_body = (
         _partition_primary_security_review(primary_text)
     )
@@ -3070,7 +3343,7 @@ def _finalize_subagent_summary(
     )
     security_body = _merge_security_review_bodies(
         primary_security_body,
-        _clean_security_review_body(security_output or ""),
+        _clean_security_review_body(security_output),
     )
     if not security_body:
         return final_text
@@ -3136,7 +3409,9 @@ def _clean_security_review_body(text: str) -> str:
                 continue
         if not suppress_section:
             retained_lines.append(line)
-    return _clean_reviewer_block(retained_lines)
+    return _remove_empty_section_headings(
+        _clean_reviewer_block(retained_lines)
+    )
 
 
 def _insert_security_review(text: str, security_body: str) -> str:
@@ -3239,6 +3514,29 @@ def _remove_failed_validation_commit_readiness_claims(text: str) -> str:
         retained.append(line)
     cleaned = _clean_reviewer_block(retained)
     return cleaned or "Validation failed."
+
+
+def _apply_authoritative_validation_outcome(
+    text: str,
+    evidence: ValidationEvidence,
+) -> str:
+    """Replace raw validation claims after app-owned commit validation."""
+    if evidence.command_executions:
+        return _apply_authoritative_command_summary(text, evidence)
+    if not evidence.validation_observed:
+        return text
+    retained = _remove_false_validation_claims(
+        _remove_summary_sections(text, {"validation", "commands run"})
+    )
+    status = "failed" if evidence.validation_failed else "passed"
+    validation_block = (
+        "Validation:\n"
+        f"- {status.capitalize()} (authoritative run_validation result; "
+        "no command output was reported)."
+    )
+    return "\n\n".join(
+        block for block in (retained, validation_block) if block
+    )
 
 
 def _apply_authoritative_command_summary(
@@ -3425,6 +3723,51 @@ def _deduplicate_summary_sections(
         if not suppress_section:
             retained_lines.append(line)
     return _clean_reviewer_block(retained_lines)
+
+
+def _strip_subagent_calls_to_action(text: str) -> str:
+    """Remove role-local questions that cannot control the application flow."""
+    question_pattern = re.compile(
+        r"(?i)^\s*(?:[-*]\s*)?"
+        r"(?:(?:would|could|can|may|do)\s+you|"
+        r"(?:shall|should|can|may)\s+(?:i|we)|"
+        r"please\s+(?:confirm|approve|choose|reply|respond)|"
+        r"let\s+me\s+know\s+(?:if|whether))\b"
+    )
+    retained = [
+        line
+        for line in text.splitlines()
+        if question_pattern.search(line) is None
+    ]
+    return _remove_empty_section_headings(_clean_reviewer_block(retained))
+
+
+def _remove_empty_section_headings(text: str) -> str:
+    """Remove headings with no body after authoritative cleanup."""
+    lines = text.splitlines()
+    while True:
+        retained: list[str] = []
+        removed = False
+        for index, line in enumerate(lines):
+            if _reviewer_section_heading(line) is None:
+                retained.append(line)
+                continue
+            following = next(
+                (
+                    candidate
+                    for candidate in lines[index + 1 :]
+                    if candidate.strip()
+                ),
+                "",
+            )
+            if not following or _reviewer_section_heading(following) is not None:
+                removed = True
+                continue
+            retained.append(line)
+        lines = retained
+        if not removed:
+            break
+    return _clean_reviewer_block(lines)
 
 
 def _reviewer_advisory_text(

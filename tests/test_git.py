@@ -8,9 +8,9 @@ import pytest
 import lunar_forge.agent as agent_module
 import lunar_forge.runtime.git as git_module
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig, SubagentConfig
+from lunar_forge.config import AppConfig, RuntimeConfig, SubagentConfig
 from lunar_forge.model_clients import ModelResponse, ToolCall
-from lunar_forge.permissions import PermissionLevel
+from lunar_forge.permissions import PermissionLevel, PermissionManager
 from lunar_forge.runtime.git import (
     create_git_commit,
     format_git_commit_result,
@@ -933,6 +933,179 @@ def test_explicit_failed_validation_override_allows_commit_proposal(
     )
     assert "Proposed commit message: Commit despite failure" in output
     assert output.endswith("- Commit not created: approval denied")
+
+
+@pytest.mark.parametrize("approve_commit", (True, False))
+def test_new_invocation_commit_despite_failure_validates_before_special_approval(
+    monkeypatch,
+    tmp_path,
+    approve_commit,
+):
+    (tmp_path / "README.md").write_text("Current change\n", encoding="utf-8")
+    calls = _mock_git(
+        monkeypatch,
+        tmp_path,
+        " M README.md\0 M unrelated.py\0?? .env\0",
+    )
+    approvals = []
+    validation_calls = []
+
+    def approve(request):
+        approvals.append(request)
+        if request.tool_name == "git_commit":
+            return approve_commit
+        return True
+
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=lambda: validation_calls.append(True) or {
+                    "ok": False,
+                    "commands": ["python -B -m compileall ."],
+                    "results": [
+                        {
+                            "ok": False,
+                            "command": "python -B -m compileall .",
+                            "exit_code": 1,
+                            "stdout": "",
+                            "stderr": "compile error",
+                            "truncated": False,
+                        }
+                    ],
+                },
+                permission=PermissionLevel.EXECUTE,
+            ),
+        ),
+        permission_manager=PermissionManager(
+            mode="default",
+            runtime_mode="docker",
+            approval_callback=approve,
+        ),
+    )
+    evidence = agent_module.ValidationEvidence(validation_requested=True)
+
+    output = CodeAgent(
+        AppConfig(runtime=RuntimeConfig(mode="docker")),
+        approval_callback=approve,
+    )._finalize_git_commit_offer(
+        (
+            "Project health reports no README.md, so the requested README "
+            "sentence has not been added.\n\n"
+            "Would you like to proceed with Git finalization and commit after "
+            "validation is run?\n\n"
+            "Git:\n"
+            "- Commit pending."
+        ),
+        request=(
+            "Commit the current README.md change despite failed validation. "
+            "Do not edit files."
+        ),
+        root=tmp_path,
+        mode="default",
+        session=None,
+        changed_files=(),
+        validation_evidence=evidence,
+        offer_commit=True,
+        commit_message="Update README",
+        registry=registry,
+    )
+
+    assert validation_calls == [True]
+    assert evidence.validation_observed is True
+    assert evidence.validation_failed is True
+    assert [request.tool_name for request in approvals] == [
+        "run_validation",
+        "git_commit",
+    ]
+    special_prompt = approvals[1].description
+    assert special_prompt.startswith(
+        "Validation results before commit approval:\n"
+        "- python -B -m compileall .: failed"
+    )
+    assert "explicitly requested a commit despite failed validation" in (
+        special_prompt
+    )
+    assert special_prompt.index("failed") < special_prompt.index(
+        "Git status --short:"
+    )
+    assert "Requested current files (proposed for commit):" in special_prompt
+    assert "- README.md" in special_prompt
+    assert "unrelated.py" in special_prompt
+    assert ".env" in special_prompt
+    assert "has not been added" not in output
+    assert "Would you like" not in output
+    assert output.index("Validation:") < output.index("Git:")
+    assert output.count("Validation:") == 1
+    assert output.count("Commands run:") == 1
+    assert output.count("Git:") == 1
+    if approve_commit:
+        assert output.endswith("- Commit created: abc123def456")
+        assert any(
+            args == ("add", "--", "README.md")
+            for _, args, _ in calls
+        )
+        assert any(
+            args[:4] == ("commit", "--only", "-m", "Update README")
+            and args[-2:] == ("--", "README.md")
+            for _, args, _ in calls
+        )
+    else:
+        assert output.endswith("- Commit not created: approval denied")
+        assert not any(
+            args[:1] in {("add",), ("commit",)}
+            for _, args, _ in calls
+        )
+
+
+@pytest.mark.parametrize("mode", ("plan", "no-command"))
+def test_restricted_mode_blocks_commit_despite_failed_validation(
+    monkeypatch,
+    tmp_path,
+    mode,
+):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Restricted mode must not validate or commit")
+
+    monkeypatch.setattr(agent_module, "create_git_commit", unexpected)
+    registry = ToolRegistry(
+        (
+            Tool(
+                name="run_validation",
+                description="Run validation.",
+                parameters={"type": "object"},
+                handler=unexpected,
+                permission=PermissionLevel.EXECUTE,
+            ),
+        )
+    )
+
+    output = CodeAgent(AppConfig())._finalize_git_commit_offer(
+        "Inspection complete.",
+        request=(
+            "Commit the current README.md change despite failed validation."
+        ),
+        root=tmp_path,
+        mode=mode,
+        session=None,
+        changed_files=(),
+        validation_evidence=agent_module.ValidationEvidence(
+            validation_requested=True
+        ),
+        offer_commit=True,
+        commit_message="Update README",
+        registry=registry,
+    )
+
+    assert "Commit not created" in output
+    if mode == "plan":
+        assert output.endswith("Git:\n- Commit not created: plan mode")
+    else:
+        assert output.endswith(
+            "Git:\n- Commit not created: requested validation did not run"
+        )
 
 
 def test_agent_with_no_changed_files_does_not_prepare_commit(monkeypatch, tmp_path):
