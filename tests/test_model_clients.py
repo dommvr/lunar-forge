@@ -5,7 +5,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig, ModelConfig
+from lunar_forge.config import AppConfig, ModelConfig, ReasoningConfig
 from lunar_forge.model_clients import (
     LiteLLMClient,
     LiteLLMResponsesClient,
@@ -79,7 +79,10 @@ def test_responses_client_calls_responses_and_flattens_tools(monkeypatch):
         completion=unexpected_completion,
         responses=responses,
     )
-    client = LiteLLMResponsesClient("openai/gpt-5.6-terra")
+    client = LiteLLMResponsesClient(
+        "openai/gpt-5.6-sol",
+        reasoning_effort="xhigh",
+    )
     tools = [
         {
             "type": "function",
@@ -101,7 +104,8 @@ def test_responses_client_calls_responses_and_flattens_tools(monkeypatch):
     )
 
     assert result.content == "Done."
-    assert captured["model"] == "openai/gpt-5.6-terra"
+    assert captured["model"] == "openai/gpt-5.6-sol"
+    assert captured["reasoning"] == {"effort": "xhigh"}
     assert captured["input"] == [
         {"role": "user", "content": "Inspect README.md"}
     ]
@@ -117,6 +121,55 @@ def test_responses_client_calls_responses_and_flattens_tools(monkeypatch):
             },
         }
     ]
+
+
+def test_chat_api_warns_and_omits_unsupported_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def completion(**request):
+        captured.update(request)
+        return {
+            "model": "gpt-chat",
+            "choices": [{"message": {"content": "Chat response"}}],
+        }
+
+    _fake_litellm(monkeypatch, completion=completion)
+    client = LiteLLMClient(
+        "openai/gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="only sent for OpenAI Responses API calls",
+    ):
+        client.complete([{"role": "user", "content": "Hello"}])
+
+    assert captured["model"] == "openai/gpt-5.6-sol"
+    assert "reasoning" not in captured
+
+
+def test_non_openai_responses_warns_and_omits_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def responses(**request):
+        captured.update(request)
+        return _plain_response()
+
+    _fake_litellm(monkeypatch, responses=responses)
+    client = LiteLLMResponsesClient(
+        "anthropic/claude-sonnet-4",
+        reasoning_effort="max",
+    )
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="only sent for OpenAI Responses API calls",
+    ):
+        client.complete([{"role": "user", "content": "Hello"}])
+
+    assert captured["model"] == "anthropic/claude-sonnet-4"
+    assert "reasoning" not in captured
 
 
 def test_responses_normalizes_mixed_text_and_tool_calls(monkeypatch):
@@ -314,9 +367,10 @@ def test_agent_uses_responses_path_from_config(monkeypatch, tmp_path):
     )
     config = AppConfig(
         model=ModelConfig(
-            model="openai/gpt-5.6-terra",
+            model="openai/gpt-5.6-sol",
             api_key_env=None,
             api="responses",
+            reasoning=ReasoningConfig(effort="high"),
         )
     )
 
@@ -327,6 +381,7 @@ def test_agent_uses_responses_path_from_config(monkeypatch, tmp_path):
     )
 
     assert result == "Repository explained.\n\nSession log: disabled in plan mode"
-    assert captured["model"] == "openai/gpt-5.6-terra"
+    assert captured["model"] == "openai/gpt-5.6-sol"
+    assert captured["reasoning"] == {"effort": "high"}
     assert captured["input"][0]["role"] == "system"
     assert captured["input"][1]["role"] == "user"

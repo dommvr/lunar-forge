@@ -349,6 +349,7 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
         "errors": 0,
     }
     usage_totals = _empty_usage_totals()
+    reasoning_effort: str | None = None
     last_user_prompt: str | None = None
     last_assistant_message: str | None = None
     for event in session.events:
@@ -372,6 +373,9 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
             counts["errors"] += 1
         elif event_name == "model_usage":
             _accumulate_usage(usage_totals, data)
+            logged_effort = data.get("reasoning_effort")
+            if isinstance(logged_effort, str) and logged_effort:
+                reasoning_effort = logged_effort
 
     return {
         "session": session.safe_display_path,
@@ -380,6 +384,7 @@ def summarize_session(session: LoadedSession) -> dict[str, Any]:
         "last_timestamp": session.events[-1]["timestamp"],
         **counts,
         "model_usage": usage_totals,
+        "reasoning_effort": reasoning_effort,
         "historical_context_messages": len(session.messages),
         "last_user_prompt": last_user_prompt,
         "last_assistant_message": last_assistant_message,
@@ -411,16 +416,30 @@ def format_session_summary(
             f"Last assistant message: {summary['last_assistant_message']}"
         )
     if include_usage:
-        lines.extend(("", format_model_usage_totals(summary["model_usage"])))
+        lines.extend(
+            (
+                "",
+                format_model_usage_totals(
+                    summary["model_usage"],
+                    reasoning_effort=summary["reasoning_effort"],
+                ),
+            )
+        )
     lines.append("Historical tool results are context only and are never replayed.")
     return "\n".join(lines)
 
 
-def format_model_usage_totals(usage: Mapping[str, Any]) -> str:
+def format_model_usage_totals(
+    usage: Mapping[str, Any],
+    *,
+    reasoning_effort: str | None = None,
+) -> str:
     """Format compact aggregate counts for explicit usage output."""
-    return "\n".join(
+    lines = ["Model usage:"]
+    if reasoning_effort:
+        lines.append(f"- Reasoning effort: {reasoning_effort}")
+    lines.extend(
         (
-            "Model usage:",
             (
                 f"- Calls: {_nonnegative_integer(usage.get('model_calls'))} "
                 f"({_nonnegative_integer(usage.get('exact_calls'))} exact, "
@@ -431,6 +450,7 @@ def format_model_usage_totals(usage: Mapping[str, Any]) -> str:
             f"- Total tokens: {_nonnegative_integer(usage.get('total_tokens'))}",
         )
     )
+    return "\n".join(lines)
 
 
 def _empty_usage_totals() -> dict[str, int]:

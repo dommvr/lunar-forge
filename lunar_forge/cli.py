@@ -149,6 +149,16 @@ def run(
             help="Append aggregate model token usage to the final output.",
         ),
     ] = False,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option(
+            "--reasoning-effort",
+            help=(
+                "Override model.reasoning.effort "
+                "(low, medium, high, xhigh, or max)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Accept a coding task for a target project."""
     project_root = project.expanduser().resolve()
@@ -158,6 +168,7 @@ def run(
         allow_network,
         subagents,
         parallel_subagents,
+        reasoning_effort=reasoning_effort,
     )
 
     try:
@@ -671,6 +682,16 @@ def resume_command(
             help="Continue with safe concurrent read-only specialist phases.",
         ),
     ] = False,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option(
+            "--reasoning-effort",
+            help=(
+                "Override model.reasoning.effort "
+                "(low, medium, high, xhigh, or max)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Safely summarize or continue a previous project session."""
     project_root = project.expanduser().resolve()
@@ -691,6 +712,7 @@ def resume_command(
             allow_network,
             subagents,
             parallel_subagents,
+            reasoning_effort=reasoning_effort,
         )
         config = load_config(project_root, cli_overrides=cli_overrides)
         _validate_network_flag(allow_network, config.runtime.mode)
@@ -716,6 +738,7 @@ def _runtime_overrides(
     allow_network: bool,
     subagents: bool = False,
     parallel_subagents: bool = False,
+    reasoning_effort: str | None = None,
 ) -> dict[str, dict[str, object]] | None:
     overrides: dict[str, dict[str, object]] = {}
     if plan:
@@ -732,6 +755,12 @@ def _runtime_overrides(
         if parallel_subagents:
             subagent_overrides["parallel"] = True
         overrides["subagents"] = subagent_overrides
+    if reasoning_effort is not None:
+        overrides["model"] = {
+            "reasoning": {
+                "effort": reasoning_effort,
+            }
+        }
     return overrides or None
 
 

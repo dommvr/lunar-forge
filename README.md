@@ -54,10 +54,12 @@ Example configuration:
 ```yaml
 model:
   provider: litellm
-  api: chat
-  model: openai/gpt-5.5
+  api: responses
+  model: openai/gpt-5.6-sol
   api_key_env: OPENAI_API_KEY
   api_base: null
+  reasoning:
+    effort: medium
 
 runtime:
   mode: local
@@ -91,6 +93,7 @@ Supported environment overrides are:
 - `LUNAR_FORGE_MODEL_PROVIDER`
 - `LUNAR_FORGE_MODEL`
 - `LUNAR_FORGE_MODEL_API`
+- `LUNAR_FORGE_REASONING_EFFORT`
 - `LUNAR_FORGE_API_KEY_ENV`
 - `LUNAR_FORGE_API_BASE`
 - `LUNAR_FORGE_RUNTIME_MODE`
@@ -108,21 +111,42 @@ have unreliable tool-calling support, so read-only planning is the safer first
 test.
 
 `model.api` defaults to `chat`, preserving the existing
-`litellm.completion()` path. Set it to `responses` for models that need
-LiteLLM's Responses API, including GPT-5.6 reasoning with function tools:
+`litellm.completion()` path. `model.reasoning.effort` defaults to `medium` and
+accepts only `low`, `medium`, `high`, `xhigh`, or `max`. Reasoning effort
+changes the model's thinking budget; it does not select, suffix, or rewrite the
+model identifier.
+
+Set `model.api` to `responses` to send reasoning effort to an OpenAI model
+through LiteLLM's Responses API, including GPT-5.6 reasoning with function
+tools:
 
 ```yaml
 model:
   provider: litellm
   api: responses
-  model: openai/gpt-5.6-terra
+  model: openai/gpt-5.6-sol
   api_key_env: OPENAI_API_KEY
   api_base: null
+  reasoning:
+    effort: xhigh
 ```
 
 Responses mode requires a LiteLLM release that exposes `litellm.responses`
 (LiteLLM documents support in 1.63.8 and newer). If that function is unavailable,
 LunarForge reports a clear upgrade-or-use-chat error.
+
+Use `--reasoning-effort` to override user and project configuration for one
+run:
+
+```bash
+lunar-forge --reasoning-effort high --show-usage "Explain this project"
+```
+
+The effective precedence is CLI flag, project `.agent/config.yaml`, user
+`~/.lunar-forge/config.yaml`, environment overrides, then the built-in
+`medium` default. Unsupported non-OpenAI or non-Responses combinations emit a
+clear warning and continue without sending reasoning effort. LunarForge does
+not request reasoning summaries and never exposes hidden reasoning content.
 
 ### Experimental MCP integration
 
@@ -305,6 +329,7 @@ Run against the current directory:
 lunar-forge "Explain this repository"
 lunar-forge "Add a small feature and run validation"
 lunar-forge --show-usage "Explain this repository"
+lunar-forge --reasoning-effort high --show-usage "Explain this project"
 ```
 
 Select another project or request a read-only plan:
@@ -1065,10 +1090,11 @@ Non-plan agent runs write redacted JSONL events to
 model usage, tool-schema selections, tool calls and results, denials, and errors.
 Provider-reported token counts are recorded as exact when available. Otherwise,
 LunarForge records a clearly labeled estimate based on character counts. Usage
-events include message and exposed-tool counts plus numeric context-size
-estimates; they do not include raw environment values. API-key-like values and
-environment values are redacted, event sizes are bounded, and the `sessions`
-command lists only filenames and sizes; it does not print log contents.
+events include the effective reasoning effort, message and exposed-tool counts,
+and numeric context-size estimates; they do not include raw environment values.
+API-key-like values and environment values are redacted, event sizes are
+bounded, and the `sessions` command lists only filenames and sizes; it does not
+print log contents.
 
 Resume validates that the session is project-local, loads a bounded redacted
 history, and starts a new session that references the old one. Historical tool
@@ -1080,6 +1106,13 @@ stored session total. In plan mode, usage is accumulated in memory so
 `--show-usage --plan` reports exact provider totals or labeled estimates without
 creating `.agent` runtime files. Normal final output remains unchanged without
 the flag.
+
+Example usage excerpt:
+
+```text
+Model usage:
+- Reasoning effort: high
+```
 
 ## Development
 

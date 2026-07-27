@@ -134,6 +134,15 @@ Completed Docker-mode manual validation:
 62. Confirm privileged Docker commands, Docker socket mounts, and path escapes are blocked.
 63. Confirm Docker Git commit support commits only LunarForge-changed files and excludes unrelated dirty files.
 
+Completed configurable model reasoning effort:
+
+* Add the nested `model.reasoning.effort` setting with a `medium` default.
+* Accept only `low`, `medium`, `high`, `xhigh`, and `max`.
+* Keep model identity independent from reasoning effort.
+* Add the `--reasoning-effort` CLI override.
+* Send effective effort to OpenAI Responses API calls through LiteLLM.
+* Record effective effort in session usage events and `--show-usage`.
+
 Next feature wave, in order:
 
 64. Document local execution safety clearly: local mode is useful, but it is not OS-level isolation.
@@ -324,6 +333,7 @@ lunar-forge --project ~/dev/my-app "Explain this project"
 lunar-forge --plan "Add pricing page with navbar link"
 lunar-forge --docker "Run tests and fix failures"
 lunar-forge --docker --allow-network "Create Vite portfolio site"
+lunar-forge --reasoning-effort high --show-usage "Explain this project"
 lunar-forge new "Build a calculator app in Python with UI"
 ```
 
@@ -352,9 +362,12 @@ Example config:
 ```yaml
 model:
   provider: litellm
-  model: openai/gpt-5.5
+  api: responses
+  model: openai/gpt-5.6-sol
   api_key_env: OPENAI_API_KEY
   api_base: null
+  reasoning:
+    effort: medium
 
 runtime:
   mode: local
@@ -406,6 +419,8 @@ model:
   provider: litellm
   model: openai/gpt-5.5
   api_key_env: OPENAI_API_KEY
+  reasoning:
+    effort: medium
 ```
 
 Also support later:
@@ -426,6 +441,31 @@ model:
 
 Local models may not reliably support tool calling. When local or unknown models are used, keep warnings clear and prefer plan/read-only mode for weak models.
 
+### Model reasoning effort
+
+Configure reasoning effort only through:
+
+```yaml
+model:
+  provider: litellm
+  api: responses
+  model: openai/gpt-5.6-sol
+  reasoning:
+    effort: xhigh
+```
+
+Rules:
+
+* `model.reasoning.effort` defaults to `medium`.
+* Allowed values are `low`, `medium`, `high`, `xhigh`, and `max`.
+* CLI `--reasoning-effort` overrides project, user, environment, and default values.
+* Reasoning effort changes the thinking budget, not model identity.
+* Never rewrite or switch model names based on effort.
+* OpenAI Responses calls should use the LiteLLM-compatible Responses reasoning payload.
+* Unsupported non-OpenAI or non-Responses combinations should warn clearly and continue without the reasoning parameter.
+* Do not request reasoning summaries by default.
+* Never expose hidden reasoning content.
+
 ---
 
 ## Token telemetry and cost controls
@@ -436,6 +476,7 @@ Goals:
 
 * Record token usage per model call when provider usage metadata is available.
 * Record approximate context component sizes even when the provider does not return detailed usage.
+* Record the effective `model.reasoning.effort` for every model call.
 * Aggregate token usage per run and per session.
 * Make usage visible in debug/session logs without cluttering normal final answers.
 * Use usage data to guide future context-budget and routing improvements.
@@ -448,6 +489,7 @@ Model usage records should include:
   "phase": "planner",
   "role": "planner",
   "model": "openai/gpt-5.5",
+  "reasoning_effort": "medium",
   "input_tokens": 18420,
   "output_tokens": 610,
   "total_tokens": 19030,
@@ -2294,6 +2336,11 @@ Test expectations:
 * Risky-but-not-blocked commands show the full local-execution warning.
 * Blocked dangerous commands are blocked, not downgraded to warning-only prompts.
 * Docker approvals use Docker-specific wording and execute through the Docker runner.
+* Reasoning effort defaults to `medium` and accepts only `low`, `medium`, `high`, `xhigh`, and `max`.
+* Project reasoning configuration overrides user configuration, and the CLI flag overrides both.
+* OpenAI Responses requests include the effective reasoning effort without changing the model name or removing tools.
+* Unsupported providers or API modes warn and continue without crashing.
+* Session usage events and `--show-usage` include the effective reasoning effort.
 
 Run tests with:
 
@@ -2421,6 +2468,7 @@ When usage reporting is enabled, append a compact section:
 
 ```text
 Usage:
+- Reasoning effort: medium
 - Model calls: 2
 - Input tokens: 12,430
 - Output tokens: 710

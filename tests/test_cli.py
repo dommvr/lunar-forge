@@ -5,6 +5,7 @@ import pytest
 from typer.testing import CliRunner
 
 import lunar_forge.cli as cli_module
+import lunar_forge.config as config_module
 import lunar_forge.workflows.browser_validation as browser_module
 from lunar_forge.cli import app
 from lunar_forge.config import AppConfig, RuntimeConfig
@@ -262,6 +263,72 @@ def test_show_usage_flag_is_available_and_forwarded(monkeypatch, tmp_path):
     assert "--show-usage" in help_result.stdout
     assert result.exit_code == 0
     assert captured["show_usage"] is True
+
+
+def test_reasoning_effort_flag_sets_nested_model_override(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_load_config(project_root, cli_overrides=None):
+        captured["cli_overrides"] = cli_overrides
+        return AppConfig()
+
+    monkeypatch.setattr(cli_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        cli_module,
+        "run_agent",
+        lambda *args, **kwargs: "Done.",
+    )
+
+    runner = CliRunner()
+    for command in ("run", "resume"):
+        help_result = runner.invoke(app, [command, "--help"])
+        assert help_result.exit_code == 0
+        assert "--reasoning-effort" in help_result.stdout
+
+    result = runner.invoke(
+        app,
+        [
+            "--reasoning-effort",
+            "high",
+            "Inspect reasoning configuration",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["cli_overrides"]["model"] == {
+        "reasoning": {
+            "effort": "high",
+        }
+    }
+
+
+def test_invalid_reasoning_effort_fails_clearly(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        config_module.Path,
+        "home",
+        classmethod(lambda cls: tmp_path / "home"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_agent",
+        lambda *args, **kwargs: pytest.fail("model call should not start"),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--reasoning-effort",
+            "light",
+            "Inspect reasoning configuration",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "model.reasoning.effort must be one of" in result.output
 
 
 def test_git_status_and_commit_commands_format_results(monkeypatch, tmp_path):

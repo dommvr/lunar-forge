@@ -122,6 +122,7 @@ def test_session_usage_totals_combine_exact_and_estimated_calls(tmp_path):
         total_tokens=120,
         exact=True,
         estimated=False,
+        reasoning_effort="high",
     )
     logger.log(
         "model_usage",
@@ -147,6 +148,7 @@ def test_session_usage_totals_combine_exact_and_estimated_calls(tmp_path):
     assert "Model usage:" not in format_session_summary(loaded)
     formatted = format_session_summary(loaded, include_usage=True)
     assert "Model usage:" in formatted
+    assert "- Reasoning effort: high" in formatted
     assert "- Calls: 2 (1 exact, 1 estimated)" in formatted
     assert "- Total tokens: 170" in formatted
 

@@ -12,6 +12,12 @@ from lunar_forge.tools.files import safe_path
 
 
 MAX_CONFIG_CHARACTERS = 1_000_000
+ALLOWED_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True)
+class ReasoningConfig:
+    effort: str = "medium"
 
 
 @dataclass(frozen=True)
@@ -21,6 +27,7 @@ class ModelConfig:
     api_key_env: str | None = "OPENAI_API_KEY"
     api_base: str | None = None
     api: str = "chat"  # chat | responses
+    reasoning: ReasoningConfig = field(default_factory=ReasoningConfig)
 
 
 @dataclass(frozen=True)
@@ -104,6 +111,11 @@ def load_config(
         merged = deep_merge(merged, dict(cli_overrides))
 
     model_data = _section(merged, "model")
+    reasoning_data = _section(
+        model_data,
+        "reasoning",
+        qualified_name="model.reasoning",
+    )
     runtime_data = _section(merged, "runtime")
     permissions_data = _section(merged, "permissions")
     subagents_data = _section(merged, "subagents")
@@ -122,6 +134,9 @@ def load_config(
             api_key_env=_optional_string(model_data.get("api_key_env")),
             api_base=_optional_string(model_data.get("api_base")),
             api=_model_api(model_data["api"]),
+            reasoning=ReasoningConfig(
+                effort=_reasoning_effort(reasoning_data["effort"]),
+            ),
         ),
         runtime=RuntimeConfig(
             mode=_runtime_mode(runtime_data["mode"]),
@@ -167,6 +182,9 @@ def _default_config() -> dict[str, Any]:
             "api_key_env": "OPENAI_API_KEY",
             "api_base": None,
             "api": "chat",
+            "reasoning": {
+                "effort": "medium",
+            },
         },
         "runtime": {
             "mode": "local",
@@ -195,6 +213,7 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_MODEL_PROVIDER": ("model", "provider"),
         "LUNAR_FORGE_MODEL": ("model", "model"),
         "LUNAR_FORGE_MODEL_API": ("model", "api"),
+        "LUNAR_FORGE_REASONING_EFFORT": ("model", "reasoning", "effort"),
         "LUNAR_FORGE_API_KEY_ENV": ("model", "api_key_env"),
         "LUNAR_FORGE_API_BASE": ("model", "api_base"),
         "LUNAR_FORGE_RUNTIME_MODE": ("runtime", "mode"),
@@ -207,17 +226,28 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_PLUGINS_ENABLED": ("plugins", "enabled"),
     }
 
-    for variable, (section, key) in mappings.items():
+    for variable, path in mappings.items():
         if variable in environ:
-            config.setdefault(section, {})[key] = environ[variable]
+            destination = config
+            for key in path[:-1]:
+                destination = destination.setdefault(key, {})
+            destination[path[-1]] = environ[variable]
 
     return config
 
 
-def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+def _section(
+    config: Mapping[str, Any],
+    name: str,
+    *,
+    qualified_name: str | None = None,
+) -> Mapping[str, Any]:
     section = config.get(name, {})
     if not isinstance(section, Mapping):
-        raise ValueError(f"Config section must be a YAML object: {name}")
+        raise ValueError(
+            "Config section must be a YAML object: "
+            f"{qualified_name or name}"
+        )
     return section
 
 
@@ -252,6 +282,16 @@ def _model_api(value: Any) -> str:
     if api not in {"chat", "responses"}:
         raise ValueError("model.api must be one of: chat, responses.")
     return api
+
+
+def _reasoning_effort(value: Any) -> str:
+    effort = str(value).strip().lower()
+    if effort not in ALLOWED_REASONING_EFFORTS:
+        allowed = ", ".join(ALLOWED_REASONING_EFFORTS)
+        raise ValueError(
+            f"model.reasoning.effort must be one of: {allowed}."
+        )
+    return effort
 
 
 def _as_bool(value: Any, name: str) -> bool:

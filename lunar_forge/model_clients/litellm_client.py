@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -19,10 +20,13 @@ class LiteLLMClient:
         *,
         api_key_env: str | None = None,
         api_base: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.model = model
         self.api_key_env = api_key_env
         self.api_base = api_base
+        self.reasoning_effort = reasoning_effort
+        self._reasoning_warning_emitted = False
 
     def complete(
         self,
@@ -35,14 +39,14 @@ class LiteLLMClient:
         }
         if tools:
             request["tools"] = [dict(tool) for tool in tools]
-        request.update(self._request_options())
+        request.update(self._request_options(api="chat"))
 
         response = _litellm_completion(**request)
         return _normalize_response(response, fallback_model=self.model)
 
-    def _request_options(self) -> dict[str, Any]:
+    def _request_options(self, *, api: str) -> dict[str, Any]:
         """Return shared LiteLLM connection options without retaining a raw key."""
-        options: dict[str, Any] = {}
+        options = self._reasoning_request_options(api=api)
         if self.api_base:
             options["api_base"] = self.api_base
         if self.api_key_env:
@@ -53,6 +57,33 @@ class LiteLLMClient:
                 )
             options["api_key"] = api_key
         return options
+
+    def _reasoning_request_options(self, *, api: str) -> dict[str, Any]:
+        """Shape configured reasoning effort only where LiteLLM supports it."""
+        if self.reasoning_effort is None:
+            return {}
+        if api != "responses":
+            self._warn_unsupported_reasoning(
+                "the configured model API is not 'responses'"
+            )
+            return {}
+        if not self.model.strip().lower().startswith("openai/"):
+            self._warn_unsupported_reasoning(
+                f"the configured model {self.model!r} is not an OpenAI model"
+            )
+            return {}
+        return {"reasoning": {"effort": self.reasoning_effort}}
+
+    def _warn_unsupported_reasoning(self, reason: str) -> None:
+        if self._reasoning_warning_emitted:
+            return
+        warnings.warn(
+            "model.reasoning.effort is only sent for OpenAI Responses API "
+            f"calls; continuing without it because {reason}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        self._reasoning_warning_emitted = True
 
 
 def _litellm_completion(**request: Any) -> Any:

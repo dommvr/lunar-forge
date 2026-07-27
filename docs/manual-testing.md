@@ -34,6 +34,7 @@ are all current pass/fail checks.
 
 - [ ] Install and CLI availability
 - [ ] Config loading and precedence
+- [ ] Configurable model reasoning effort
 - [ ] Plan mode
 - [ ] Local and Docker execution safety
 - [ ] Basic project inspection
@@ -136,6 +137,67 @@ project file.
 ```powershell
 Remove-Item Env:\LUNAR_FORGE_MODEL -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force -LiteralPath $ConfigProject
+```
+
+### 2a. Configurable model reasoning effort
+
+**Purpose**
+
+Confirm that `model.reasoning.effort` changes the thinking budget without
+changing the configured model identity, that project configuration overrides
+the environment, that the CLI overrides project configuration, and that
+invalid values fail before a model call.
+
+**Setup**
+
+This test requires a configured OpenAI API key for the successful agent call.
+
+```powershell
+$ReasoningProject = Join-Path $ManualRoot "reasoning-project"
+New-Item -ItemType Directory -Force -Path (Join-Path $ReasoningProject ".agent") | Out-Null
+@'
+model:
+  provider: litellm
+  api: responses
+  model: openai/gpt-5.6-sol
+  reasoning:
+    effort: xhigh
+'@ | Set-Content -LiteralPath (Join-Path $ReasoningProject ".agent\config.yaml") -Encoding utf8
+$env:LUNAR_FORGE_REASONING_EFFORT = "low"
+```
+
+**Command**
+
+```powershell
+python -c "from pathlib import Path; from lunar_forge.config import load_config; c=load_config(Path(r'$ReasoningProject')); print(c.model.model, c.model.reasoning.effort)"
+lunar-forge --reasoning-effort high --show-usage --project $ReasoningProject "Explain this project"
+lunar-forge --reasoning-effort invalid --project $ReasoningProject "This must fail before contacting the model"
+```
+
+**Expected result**
+
+The Python command prints `openai/gpt-5.6-sol xhigh`, proving the project value
+overrides the environment without rewriting the model. The successful CLI call
+keeps that same model and includes:
+
+```text
+Model usage:
+- Reasoning effort: high
+```
+
+The final CLI command exits nonzero and reports that
+`model.reasoning.effort` must be one of `low`, `medium`, `high`, `xhigh`, or
+`max`. It does not contact a model.
+
+For an OpenAI Responses call, debug with a fake client or session log if needed:
+the outgoing payload contains `reasoning: {"effort": "high"}` and retains any
+function tools. No reasoning summary is requested.
+
+**Cleanup**
+
+```powershell
+Remove-Item Env:\LUNAR_FORGE_REASONING_EFFORT -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force -LiteralPath $ReasoningProject
 ```
 
 ## 3. Plan mode

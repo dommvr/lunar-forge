@@ -40,11 +40,13 @@ class LiteLLMResponsesClient(LiteLLMClient):
         *,
         api_key_env: str | None = None,
         api_base: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(
             model,
             api_key_env=api_key_env,
             api_base=api_base,
+            reasoning_effort=reasoning_effort,
         )
         self._output_groups_by_call_id: dict[str, _OutputGroup] = {}
 
@@ -59,7 +61,7 @@ class LiteLLMResponsesClient(LiteLLMClient):
         }
         if tools:
             request["tools"] = _responses_tools(tools)
-        request.update(self._request_options())
+        request.update(self._request_options(api="responses"))
 
         response = _litellm_responses(**request)
         normalized = _normalize_responses_response(

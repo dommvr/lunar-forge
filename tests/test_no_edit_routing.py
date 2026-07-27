@@ -3,7 +3,13 @@ import json
 import pytest
 
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig, RuntimeConfig, SubagentConfig
+from lunar_forge.config import (
+    AppConfig,
+    ModelConfig,
+    ReasoningConfig,
+    RuntimeConfig,
+    SubagentConfig,
+)
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.tools.registry import WRITE_TOOL_NAMES
 
@@ -83,6 +89,9 @@ def test_no_edit_explicit_command_uses_local_runner_after_approval(
 
     output = CodeAgent(
         AppConfig(
+            model=ModelConfig(
+                reasoning=ReasoningConfig(effort="high"),
+            ),
             runtime=RuntimeConfig(mode="local"),
             subagents=SubagentConfig(enabled=True),
         ),
@@ -151,6 +160,9 @@ def test_no_edit_explicit_command_uses_docker_runner_after_approval(
 
     output = CodeAgent(
         AppConfig(
+            model=ModelConfig(
+                reasoning=ReasoningConfig(effort="xhigh"),
+            ),
             runtime=RuntimeConfig(mode="docker"),
             subagents=SubagentConfig(enabled=True),
         ),

@@ -17,6 +17,7 @@ def create_litellm_client(
     model: str,
     api_key_env: str | None = None,
     api_base: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> ModelClient:
     """Create the configured LiteLLM transport behind the neutral protocol."""
     normalized_api = api.strip().lower()
@@ -31,6 +32,7 @@ def create_litellm_client(
         model=model,
         api_key_env=api_key_env,
         api_base=api_base,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -47,6 +49,7 @@ def create_model_client(config: ModelConfig) -> ModelClient:
         model=config.model,
         api_key_env=config.api_key_env,
         api_base=config.api_base,
+        reasoning_effort=config.reasoning.effort,
     )
 
 

@@ -4,7 +4,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 from lunar_forge.agent import CodeAgent
-from lunar_forge.config import AppConfig
+from lunar_forge.config import AppConfig, ModelConfig, ReasoningConfig
 from lunar_forge.model_clients import (
     LiteLLMClient,
     LiteLLMResponsesClient,
@@ -129,7 +129,12 @@ def test_agent_logs_and_aggregates_exact_usage_without_secrets(
         )
     )
 
-    output = CodeAgent(AppConfig(), model_client=model).run(
+    config = AppConfig(
+        model=ModelConfig(
+            reasoning=ReasoningConfig(effort="high"),
+        )
+    )
+    output = CodeAgent(config, model_client=model).run(
         f"Inspect the project without exposing {secret}.",
         tmp_path,
         show_usage=True,
@@ -148,6 +153,7 @@ def test_agent_logs_and_aggregates_exact_usage_without_secrets(
     assert usage["output_tokens"] == 25
     assert usage["total_tokens"] == 225
     assert usage["provider"] == "openai"
+    assert usage["reasoning_effort"] == "high"
     assert usage["task_profile"] == "review_only"
     assert usage["phase"] == "agent"
     assert usage["role"] == "agent"
@@ -176,6 +182,7 @@ def test_agent_logs_and_aggregates_exact_usage_without_secrets(
         "total_tokens": 225,
     }
     assert "Model usage:" in output
+    assert "- Reasoning effort: high" in output
     assert "- Total tokens: 225" in output
 
 
@@ -187,7 +194,12 @@ def test_agent_estimates_usage_when_provider_metadata_is_missing(tmp_path):
         )
     )
 
-    output = CodeAgent(AppConfig(), model_client=model).run(
+    config = AppConfig(
+        model=ModelConfig(
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+    )
+    output = CodeAgent(config, model_client=model).run(
         "Explain the project.",
         tmp_path,
     )
@@ -223,7 +235,12 @@ def test_plan_show_usage_uses_in_memory_estimates_without_runtime_files(tmp_path
 
     model = PlanModel()
 
-    output = CodeAgent(AppConfig(), model_client=model).run(
+    config = AppConfig(
+        model=ModelConfig(
+            reasoning=ReasoningConfig(effort="xhigh"),
+        )
+    )
+    output = CodeAgent(config, model_client=model).run(
         "Plan a parser cleanup.",
         tmp_path,
         mode="plan",
@@ -231,6 +248,7 @@ def test_plan_show_usage_uses_in_memory_estimates_without_runtime_files(tmp_path
     )
 
     assert "Model usage:" in output
+    assert "- Reasoning effort: xhigh" in output
     assert "- Calls: 1 (0 exact, 1 estimated)" in output
     assert re.search(r"- Input tokens: [1-9]\d*", output)
     assert re.search(r"- Output tokens: [1-9]\d*", output)

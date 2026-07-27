@@ -254,3 +254,141 @@ def test_model_api_rejects_unknown_mode(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="model.api"):
         load_config(project)
+
+
+def test_reasoning_effort_defaults_to_medium(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert load_config(project).model.reasoning.effort == "medium"
+
+
+def test_user_reasoning_effort_is_loaded(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    _isolate_user_config(monkeypatch, home)
+    user_config = home / ".lunar-forge" / "config.yaml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text(
+        "model:\n  reasoning:\n    effort: low\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert load_config(project).model.reasoning.effort == "low"
+
+
+def test_project_reasoning_effort_overrides_user_config(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    _isolate_user_config(monkeypatch, home)
+    user_config = home / ".lunar-forge" / "config.yaml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text(
+        "model:\n  reasoning:\n    effort: low\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "model:\n  reasoning:\n    effort: xhigh\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(project).model.reasoning.effort == "xhigh"
+
+
+def test_cli_reasoning_effort_overrides_project_and_user_config(
+    monkeypatch,
+    tmp_path,
+):
+    home = tmp_path / "home"
+    _isolate_user_config(monkeypatch, home)
+    user_config = home / ".lunar-forge" / "config.yaml"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_text(
+        "model:\n  reasoning:\n    effort: low\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "model:\n  reasoning:\n    effort: xhigh\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        project,
+        cli_overrides={
+            "model": {
+                "reasoning": {
+                    "effort": "high",
+                }
+            }
+        },
+    )
+
+    assert config.model.reasoning.effort == "high"
+
+
+@pytest.mark.parametrize("effort", ("low", "medium", "high", "xhigh", "max"))
+def test_reasoning_effort_accepts_supported_values(
+    monkeypatch,
+    tmp_path,
+    effort,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        f"model:\n  reasoning:\n    effort: {effort}\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(project).model.reasoning.effort == effort
+
+
+def test_reasoning_effort_can_be_loaded_from_environment(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("LUNAR_FORGE_REASONING_EFFORT", "max")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert load_config(project).model.reasoning.effort == "max"
+
+
+def test_reasoning_effort_rejects_unknown_value(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "model:\n  reasoning:\n    effort: light\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "model.reasoning.effort must be one of: "
+            "low, medium, high, xhigh, max"
+        ),
+    ):
+        load_config(project)
+
+
+def test_reasoning_config_must_be_a_mapping(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "model:\n  reasoning: high\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="model.reasoning"):
+        load_config(project)

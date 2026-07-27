@@ -639,6 +639,7 @@ class CodeAgent:
                     session,
                     normalized_mode,
                     show_usage=show_usage,
+                    reasoning_effort=self.config.model.reasoning.effort,
                     usage_totals=(
                         in_memory_usage_totals.snapshot()
                         if in_memory_usage_totals is not None
@@ -710,6 +711,7 @@ class CodeAgent:
                     phase="agent",
                     role="agent",
                     task_profile=task_selection.profile,
+                    reasoning_effort=self.config.model.reasoning.effort,
                 )
                 _log_session(
                     session,
@@ -840,6 +842,7 @@ class CodeAgent:
                         session,
                         normalized_mode,
                         show_usage=show_usage,
+                        reasoning_effort=self.config.model.reasoning.effort,
                         usage_totals=(
                             in_memory_usage_totals.snapshot()
                             if in_memory_usage_totals is not None
@@ -968,6 +971,7 @@ class CodeAgent:
             phase="readonly_fast_path",
             role="agent",
             task_profile=TaskProfile.EXPLICIT_READONLY,
+            reasoning_effort=self.config.model.reasoning.effort,
             embedded_tool_result=bounded_serialized_result,
         )
         _log_session(
@@ -989,6 +993,7 @@ class CodeAgent:
             session,
             mode,
             show_usage=show_usage,
+            reasoning_effort=self.config.model.reasoning.effort,
             usage_totals=(
                 usage_totals.snapshot()
                 if usage_totals is not None
@@ -1817,6 +1822,7 @@ class CodeAgent:
                 requested_tools=requested_tools,
                 blocked_tools=base_selection.blocked_tools,
                 browser_intent=browser_intent_detected,
+                reasoning_effort=self.config.model.reasoning.effort,
             )
         except Exception as exc:
             _log_session(
@@ -1863,6 +1869,7 @@ def _run_subagent_model_loop(
     requested_tools: Sequence[str],
     blocked_tools: Sequence[str],
     browser_intent: bool,
+    reasoning_effort: str,
 ) -> SubagentPhaseResult:
     tool_schemas = tools.schemas(
         read_only=mode == "plan",
@@ -1901,6 +1908,7 @@ def _run_subagent_model_loop(
             role=role.name,
             parallel_group_id=parallel_group_id,
             task_profile=task_profile,
+            reasoning_effort=reasoning_effort,
         )
         _log_session(
             session,
@@ -2218,6 +2226,7 @@ def _log_model_usage(
     phase: str,
     role: str,
     task_profile: TaskProfile | str,
+    reasoning_effort: str,
     parallel_group_id: str | None = None,
     embedded_tool_result: str | None = None,
 ) -> None:
@@ -2246,6 +2255,7 @@ def _log_model_usage(
         parallel_group_id=parallel_group_id,
         model=usage.model or response.model,
         provider=usage.provider or _provider_from_model(response.model),
+        reasoning_effort=reasoning_effort,
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
@@ -2423,15 +2433,25 @@ def _append_session_note(
     mode: str,
     *,
     show_usage: bool = False,
+    reasoning_effort: str | None = None,
     usage_totals: Mapping[str, Any] | None = None,
 ) -> str:
     if show_usage:
+        reported_usage: Mapping[str, Any] | None = None
         if session is not None:
-            text = f"{text}\n\n{format_model_usage_totals(session.usage_totals)}"
+            reported_usage = session.usage_totals
         elif usage_totals is not None:
-            text = f"{text}\n\n{format_model_usage_totals(usage_totals)}"
+            reported_usage = usage_totals
+        if reported_usage is not None:
+            usage_text = format_model_usage_totals(
+                reported_usage,
+                reasoning_effort=reasoning_effort,
+            )
+            text = f"{text}\n\n{usage_text}"
         else:
-            text = f"{text}\n\nModel usage: no model calls recorded."
+            text = (
+                f"{text}\n\nModel usage: no model calls recorded."
+            )
     if session is not None:
         note = session.relative_path
     elif mode == "plan":
