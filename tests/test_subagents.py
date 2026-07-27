@@ -657,7 +657,23 @@ def test_task_phase_plans_skip_unneeded_roles():
     validation = build_task_phase_plan(
         WorkflowKind.EXISTING_PROJECT,
         request="Run validation without changing files.",
-        task_profile=TaskProfile.EDIT_TASK,
+        task_profile=TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+    )
+    command = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request=(
+            "Use run_command to run python --version. "
+            "Do not edit files."
+        ),
+        task_profile=TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+    )
+    prohibited_command = build_task_phase_plan(
+        WorkflowKind.EXISTING_PROJECT,
+        request=(
+            "Use run_command to run python --version. Do not edit files "
+            "and do not run commands."
+        ),
+        task_profile=TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
     )
     edit = build_task_phase_plan(
         WorkflowKind.EXISTING_PROJECT,
@@ -669,6 +685,8 @@ def test_task_phase_plans_skip_unneeded_roles():
     assert readonly.phases[0].name == "inspect"
     assert review.role_names == ("reviewer",)
     assert validation.role_names == ("tester",)
+    assert command.role_names == ("tester",)
+    assert prohibited_command.role_names == ("planner",)
     assert edit.role_names == ("planner", "coder", "tester", "reviewer")
 
 
@@ -782,6 +800,10 @@ def test_role_task_profiles_compose_with_base_profile():
             role,
             TaskProfile.EXPLICIT_READONLY,
         ) is TaskProfile.EXPLICIT_READONLY
+        assert task_profile_for_role(
+            role,
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        ) is TaskProfile.NO_EDIT_EXECUTION_ALLOWED
 
 
 def test_exported_roles_are_the_canonical_definitions():
@@ -953,7 +975,10 @@ def test_single_agent_browser_intent_uses_direct_tool_for_running_url(tmp_path):
         model_client=model,
         approval_callback=lambda request: True,
     ).run(
-        "Inspect page http://localhost:5173 in a browser and capture a screenshot",
+        (
+            "Inspect page http://localhost:5173 in a browser and capture a "
+            "screenshot. Do not edit files."
+        ),
         tmp_path,
         registry=registry,
     )

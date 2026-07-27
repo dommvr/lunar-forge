@@ -269,6 +269,74 @@ servers:
     )
 
 
+def test_no_edit_request_can_run_explicit_read_only_mcp_tool(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        mcp_config_module.Path,
+        "home",
+        classmethod(lambda cls: tmp_path / "home"),
+    )
+    config_directory = tmp_path / ".agent"
+    config_directory.mkdir()
+    (config_directory / "mcp.yaml").write_text(
+        """
+servers:
+  github:
+    command: github-mcp-server
+    enabled: true
+""".lstrip(),
+        encoding="utf-8",
+    )
+    approvals = []
+    transport = FakeTransport(
+        _github_tools_with_read_only_search(),
+        result={"issues": []},
+    )
+    transport.close = lambda: None
+    model = SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="mcp-read",
+                        name="mcp_github_search_issues",
+                        arguments={"query": "is:open"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="Issue review complete."),
+        )
+    )
+
+    output = CodeAgent(
+        AppConfig(mcp=MCPRuntimeConfig(enabled=True)),
+        model_client=model,
+        approval_callback=lambda request: approvals.append(request) or True,
+        mcp_transport_factory=lambda server: transport,
+    ).run(
+        (
+            "Use mcp.github.search_issues to review open issues. "
+            "Do not edit files."
+        ),
+        tmp_path,
+    )
+
+    first_schema_names = {
+        schema["function"]["name"] for schema in model.tool_schemas[0]
+    }
+    assert "mcp_github_search_issues" in first_schema_names
+    assert "mcp_github_create_issue" not in first_schema_names
+    assert "write_file" not in first_schema_names
+    assert "run_command" not in first_schema_names
+    assert transport.calls == [("search_issues", {"query": "is:open"})]
+    assert len(approvals) == 1
+    assert approvals[0].tool_name == "mcp.github.search_issues"
+    assert output.startswith("Issue review complete.")
+
+
 def test_agent_does_not_discover_mcp_when_global_switch_is_disabled(tmp_path):
     config_directory = tmp_path / ".agent"
     config_directory.mkdir()

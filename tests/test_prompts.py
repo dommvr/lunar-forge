@@ -231,6 +231,10 @@ def test_browser_intent_detects_natural_request_and_vite_hints():
             "Use list_symbols on "
             "examples/projects/browser-demo/src/App.jsx."
         ),
+        (
+            "Use list_symbols on browser-demo/App.jsx. "
+            "Do not edit files."
+        ),
         "Use list_symbols on App.jsx.",
     ),
 )
@@ -317,6 +321,19 @@ def test_system_prompt_requires_final_summary_sections():
     for heading in ("Changed files:", "Validation:", "Commands run:", "Checkpoints:"):
         assert heading in prompt
     assert "runtime appends the session log path" in prompt
+
+
+def test_no_edit_execution_profile_guidance_preserves_non_edit_tools():
+    prompt = build_system_prompt(
+        PROJECT_INFO,
+        "No extra instructions.",
+        "default",
+        task_profile="no_edit_execution_allowed",
+    )
+
+    assert "blocks filesystem mutation tools" in prompt
+    assert "explicitly requested command" in prompt
+    assert "normal permissions allow it" in prompt
 
 
 def test_plan_prompt_and_registry_remain_read_only(tmp_path):

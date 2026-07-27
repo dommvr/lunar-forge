@@ -280,7 +280,7 @@ def test_browser_demo_one_copy_config_uses_plugin_without_browser_routing(
     selection = next(
         event for event in events if event["event"] == "tool_schema_selection"
     )
-    assert selection["data"]["task_profile"] == "review_only"
+    assert selection["data"]["task_profile"] == "no_edit_execution_allowed"
 
 
 def test_plugin_traversal_final_summary_reports_only_path_safety_failure(

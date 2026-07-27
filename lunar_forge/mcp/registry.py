@@ -87,6 +87,7 @@ def _registry_tool(
         handler=call_mcp_tool,
         permission=mcp_tool_permission(read_only=definition.read_only),
         plan_safe=definition.read_only,
+        read_only_extension=definition.read_only,
     )
 
 

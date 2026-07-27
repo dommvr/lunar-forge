@@ -587,6 +587,7 @@ class CodeAgent:
                 requested_tools=requested_tools,
                 browser_intent=browser_intent.detected,
                 commit_requested=offer_commit,
+                blocked_tools=task_selection.blocked_tools,
             )
             validation_evidence = ValidationEvidence()
             changed_files: list[str] = []
@@ -640,7 +641,12 @@ class CodeAgent:
                             internal_tool_name=internal_tool_name,
                             arguments=tool_call.arguments,
                         )
-                        result = tools.execute(tool_call.name, tool_call.arguments)
+                        result = _execute_exposed_tool(
+                            tools,
+                            tool_call.name,
+                            tool_call.arguments,
+                            tool_schemas,
+                        )
                         _record_validation_evidence(
                             validation_evidence,
                             internal_tool_name,
@@ -1608,6 +1614,7 @@ class CodeAgent:
                 max_steps=self.max_steps,
                 task_profile=task_profile,
                 requested_tools=requested_tools,
+                blocked_tools=base_selection.blocked_tools,
                 browser_intent=browser_intent_detected,
             )
         except Exception as exc:
@@ -1652,6 +1659,7 @@ def _run_subagent_model_loop(
     max_steps: int,
     task_profile: TaskProfile,
     requested_tools: Sequence[str],
+    blocked_tools: Sequence[str],
     browser_intent: bool,
 ) -> SubagentPhaseResult:
     tool_schemas = tools.schemas(
@@ -1660,6 +1668,7 @@ def _run_subagent_model_loop(
         profile=task_profile,
         requested_tools=requested_tools,
         browser_intent=browser_intent,
+        blocked_tools=blocked_tools,
     )
     changed_files: list[str] = []
     validation_evidence = ValidationEvidence()
@@ -1722,7 +1731,12 @@ def _run_subagent_model_loop(
                     internal_tool_name=internal_tool_name,
                     arguments=tool_call.arguments,
                 )
-                result = tools.execute(tool_call.name, tool_call.arguments)
+                result = _execute_exposed_tool(
+                    tools,
+                    tool_call.name,
+                    tool_call.arguments,
+                    tool_schemas,
+                )
                 _record_validation_evidence(
                     validation_evidence,
                     internal_tool_name,
@@ -2508,6 +2522,28 @@ def _tool_call_message(tool_call: ToolCall, call_id: str) -> dict[str, Any]:
     }
 
 
+def _execute_exposed_tool(
+    registry: ToolRegistry | RestrictedToolRegistry,
+    name: str,
+    arguments: Mapping[str, Any],
+    schemas: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    exposed_names = {
+        function["name"]
+        for schema in schemas
+        if isinstance((function := schema.get("function")), Mapping)
+        and isinstance(function.get("name"), str)
+    }
+    if registry.internal_name_for(name) is not None and name not in exposed_names:
+        return {
+            "ok": False,
+            "error": f"Tool {name!r} is blocked by the active task profile.",
+            "permission_denied": True,
+            "blocked_by_task_profile": True,
+        }
+    return registry.execute(name, arguments)
+
+
 def _serialize_tool_result(result: dict[str, Any]) -> str:
     serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
     if len(serialized) <= MAX_TOOL_RESULT_CHARACTERS:
@@ -2901,8 +2937,24 @@ def _remove_false_validation_claims(text: str) -> str:
         line
         for line in text.splitlines()
         if not any(marker in line.casefold() for marker in conflict_markers)
+        and not _is_false_command_routing_claim(line)
     ]
     return _clean_reviewer_block(retained)
+
+
+def _is_false_command_routing_claim(line: str) -> bool:
+    normalized = line.casefold()
+    if "command" not in normalized and "run_command" not in normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "inspection phase",
+            "inspection-only",
+            "planner phase",
+            "planner-only",
+        )
+    )
 
 
 def _format_command_execution(

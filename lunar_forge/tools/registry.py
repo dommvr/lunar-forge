@@ -141,7 +141,18 @@ _NO_MUTATION_PATTERN = re.compile(
     r"(?i)\b(?:do not|don't|dont|never)\s+"
     r"(?:change|edit|modify|write)\b|"
     r"\bwithout\s+(?:changing|editing|modifying|writing)\b|"
-    r"\bread[- ]only\b"
+    r"\bread[- ]only\b|"
+    r"\bonly\s+inspect\b"
+)
+_STRICT_INSPECTION_PATTERN = re.compile(
+    r"(?i)\bread[- ]only\b|"
+    r"\bonly\s+inspect\b"
+)
+_NO_COMMAND_PATTERN = re.compile(
+    r"(?i)\b(?:do not|don't|dont|never)\s+"
+    r"(?:run|execute)\s+(?:shell\s+)?commands?\b|"
+    r"\bwithout\s+(?:running|executing)\s+(?:shell\s+)?commands?\b|"
+    r"\bno[- ]command\b"
 )
 _REVIEW_INTENT_PATTERN = re.compile(
     r"(?i)\b(?:audit|explain|inspect|review|summarize)\b|"
@@ -196,6 +207,13 @@ _BROWSER_EXECUTION_INTENT_PATTERN = re.compile(
     r"(?i)\b(?:browser|playwright|screenshots?)\b|"
     r"https?://(?:localhost|127\.0\.0\.1|\[::1\])"
 )
+_EXPLICIT_NAMESPACED_TOOL_PATTERN = re.compile(
+    r"(?i)\b(?:use|call|run)\s+(?:the\s+)?"
+    r"[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\b"
+)
+_COMMAND_STARTING_TOOL_NAMES = frozenset(
+    {"run_managed_browser_validation"}
+)
 MAX_EXPLICIT_READONLY_REQUEST_CHARACTERS = 4_000
 
 
@@ -205,6 +223,7 @@ class TaskProfile(str, Enum):
     EXPLICIT_READONLY = "explicit_readonly"
     PLAN_ONLY = "plan_only"
     REVIEW_ONLY = "review_only"
+    NO_EDIT_EXECUTION_ALLOWED = "no_edit_execution_allowed"
     EDIT_TASK = "edit_task"
     BROWSER_TASK = "browser_task"
     COMMIT_TASK = "commit_task"
@@ -217,6 +236,7 @@ class TaskProfileSelection:
 
     profile: TaskProfile
     requested_tools: tuple[str, ...] = ()
+    blocked_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -249,7 +269,10 @@ def parse_explicit_readonly_tool_request(
     if mentioned_tools != (tool_name,):
         return None
     if (
-        _MUTATION_INTENT_PATTERN.search(text) is not None
+        (
+            _MUTATION_INTENT_PATTERN.search(text) is not None
+            and _NO_MUTATION_PATTERN.search(text) is None
+        )
         or _VALIDATION_EXECUTION_INTENT_PATTERN.search(text) is not None
         or _COMMIT_INTENT_PATTERN.search(text) is not None
         or _BROWSER_EXECUTION_INTENT_PATTERN.search(intent_text) is not None
@@ -332,11 +355,57 @@ def select_task_profile(
     normalized_mode = str(mode).strip().lower()
     text = request if isinstance(request, str) else str(request)
     requested_read_tools = _mentioned_names(text, READ_ONLY_PROFILE_TOOLS)
+    requested_command_tools = _mentioned_names(text, COMMAND_TOOL_NAMES)
+    no_edit_requested = _NO_MUTATION_PATTERN.search(text) is not None
+    commands_prohibited = (
+        normalized_mode == "no-command"
+        or _NO_COMMAND_PATTERN.search(text) is not None
+    )
 
     if normalized_mode == "plan":
         return TaskProfileSelection(TaskProfile.PLAN_ONLY)
     if new_project:
         return TaskProfileSelection(TaskProfile.NEW_PROJECT)
+    if no_edit_requested:
+        requested_tools = set(requested_read_tools)
+        requested_tools.update(requested_command_tools)
+        strict_inspection = _STRICT_INSPECTION_PATTERN.search(text) is not None
+        if (
+            _VALIDATION_EXECUTION_INTENT_PATTERN.search(text) is not None
+            and not requested_command_tools
+            and not strict_inspection
+        ):
+            requested_tools.add("run_validation")
+        blocked_tools: set[str] = set()
+        if commands_prohibited:
+            blocked_tools.update(COMMAND_TOOL_NAMES)
+            blocked_tools.update(_COMMAND_STARTING_TOOL_NAMES)
+            requested_tools.difference_update(COMMAND_TOOL_NAMES)
+        has_non_read_execution = bool(
+            requested_command_tools
+            or browser_intent
+            or _EXPLICIT_NAMESPACED_TOOL_PATTERN.search(text) is not None
+            or (
+                not strict_inspection
+                and _VALIDATION_EXECUTION_INTENT_PATTERN.search(text) is not None
+            )
+        )
+        if requested_read_tools and not has_non_read_execution:
+            return TaskProfileSelection(
+                TaskProfile.EXPLICIT_READONLY,
+                requested_read_tools,
+                tuple(sorted(blocked_tools)),
+            )
+        if not has_non_read_execution:
+            return TaskProfileSelection(
+                TaskProfile.REVIEW_ONLY,
+                blocked_tools=tuple(sorted(blocked_tools)),
+            )
+        return TaskProfileSelection(
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+            tuple(sorted(requested_tools)),
+            tuple(sorted(blocked_tools)),
+        )
     if commit_requested:
         return TaskProfileSelection(TaskProfile.COMMIT_TASK)
 
@@ -371,6 +440,7 @@ def tool_names_for_profile(
     available_tools: Iterable[str] | None = None,
     browser_intent: bool = False,
     commit_requested: bool = False,
+    blocked_tools: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Return stable internal names allowed by one profile before role filtering."""
     resolved = _normalize_task_profile(profile)
@@ -379,12 +449,20 @@ def tool_names_for_profile(
         for name in requested_tools
         if isinstance(name, str) and name.strip()
     }
+    blocked = {
+        name.strip()
+        for name in blocked_tools
+        if isinstance(name, str) and name.strip()
+    }
     if resolved is TaskProfile.EXPLICIT_READONLY:
         allowed = set(requested & READ_ONLY_PROFILE_TOOLS)
         for name in tuple(allowed):
             allowed.update(_EXPLICIT_READONLY_SUPPORT.get(name, ()))
     elif resolved in {TaskProfile.PLAN_ONLY, TaskProfile.REVIEW_ONLY}:
         allowed = set(READ_ONLY_PROFILE_TOOLS)
+    elif resolved is TaskProfile.NO_EDIT_EXECUTION_ALLOWED:
+        allowed = set(READ_ONLY_PROFILE_TOOLS)
+        allowed.update(requested & COMMAND_TOOL_NAMES)
     elif resolved is TaskProfile.EDIT_TASK:
         allowed = set(
             READ_ONLY_PROFILE_TOOLS | WRITE_TOOL_NAMES | COMMAND_TOOL_NAMES
@@ -423,6 +501,7 @@ def tool_names_for_profile(
         TaskProfile.EXPLICIT_READONLY,
         TaskProfile.PLAN_ONLY,
         TaskProfile.REVIEW_ONLY,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
     }:
         relevant_extensions = requested - BUILTIN_TASK_PROFILE_TOOLS
         if available is not None:
@@ -433,6 +512,7 @@ def tool_names_for_profile(
         TaskProfile.BROWSER_TASK,
         TaskProfile.COMMIT_TASK,
         TaskProfile.NEW_PROJECT,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
     }:
         allowed.update(BROWSER_TOOL_NAMES)
         if available is not None:
@@ -447,6 +527,7 @@ def tool_names_for_profile(
     ):
         allowed.difference_update(COMMIT_EXECUTION_TOOL_NAMES)
 
+    allowed.difference_update(blocked)
     if available is not None:
         allowed.intersection_update(available)
     return tuple(sorted(allowed))
@@ -588,8 +669,11 @@ class ToolRegistry:
         requested_tools: Iterable[str] = (),
         browser_intent: bool = False,
         commit_requested: bool = False,
+        blocked_tools: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """Return LiteLLM/OpenAI-compatible function tool schemas."""
+        requested_tool_names = tuple(requested_tools)
+        blocked_tool_names = tuple(blocked_tools)
         resolved_profile = (
             None if profile is None else _normalize_task_profile(profile)
         )
@@ -599,19 +683,25 @@ class ToolRegistry:
             else set(
                 tool_names_for_profile(
                     resolved_profile,
-                    requested_tools=requested_tools,
+                    requested_tools=requested_tool_names,
                     available_tools=self._tools,
                     browser_intent=browser_intent,
                     commit_requested=commit_requested,
+                    blocked_tools=blocked_tool_names,
                 )
             )
         )
-        if resolved_profile is TaskProfile.REVIEW_ONLY:
+        if resolved_profile in {
+            TaskProfile.REVIEW_ONLY,
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        }:
+            blocked = set(blocked_tool_names)
             profile_names.update(
                 name
-                for name in requested_tools
+                for name in requested_tool_names
                 if name in self._tools
                 and self._tools[name].read_only_extension
+                and name not in blocked
             )
         return [
             {
@@ -1367,8 +1457,9 @@ def _execution_tools(
         Tool(
             name="run_command",
             description=(
-                "Run one local command in the project after approval. Shell "
-                "operators and dangerous commands are not supported."
+                "Run one command in the project through the configured local "
+                "or Docker runner after approval. Shell operators and dangerous "
+                "commands are not supported."
             ),
             parameters={
                 "type": "object",

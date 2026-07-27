@@ -185,6 +185,35 @@ def test_explicit_readonly_tools_use_one_deterministic_call_and_one_summary(
     )
 
 
+def test_structured_reader_with_no_edit_wording_keeps_fast_path(tmp_path):
+    executions = []
+    model = RecordingModel((ModelResponse(text="Scripts summarized."),))
+
+    output = CodeAgent(
+        AppConfig(subagents=SubagentConfig(enabled=True)),
+        model_client=model,
+    ).run(
+        (
+            "Use read_json to inspect package.json and summarize scripts. "
+            "Do not edit files."
+        ),
+        tmp_path,
+        registry=_recording_registry(executions),
+    )
+
+    assert executions == [("read_json", {"path": "package.json"})]
+    assert len(model.calls) == 1
+    assert model.calls[0]["tools"] == []
+    assert output.startswith("Scripts summarized.")
+    assert "Subagents run:" not in output
+    route = next(
+        event
+        for event in _events(tmp_path)
+        if event["event"] == "readonly_fast_path"
+    )
+    assert route["data"]["tool_name"] == "read_json"
+
+
 def test_readonly_fast_path_does_not_run_validation_or_browser_tools(tmp_path):
     executions = []
     model = RecordingModel((ModelResponse(text="Scripts summarized."),))

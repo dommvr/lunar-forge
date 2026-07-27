@@ -357,11 +357,21 @@ def build_system_prompt(
         sort_keys=True,
     )
     browser_guidance = _browser_intent_guidance(browser_intent)
+    no_edit_guidance = (
+        (
+            "This profile blocks filesystem mutation tools. It may still use "
+            "an explicitly requested command, validation, browser, plugin, or "
+            "MCP tool when that tool is exposed and normal permissions allow it.\n"
+        )
+        if task_profile == "no_edit_execution_allowed"
+        else ""
+    )
     profile_guidance = (
         (
             f"Active task profile: {task_profile}\n"
             "Only the profile-relevant provider-safe tool schemas are exposed "
             "for this model call.\n"
+            f"{no_edit_guidance}"
         )
         if task_profile
         else ""

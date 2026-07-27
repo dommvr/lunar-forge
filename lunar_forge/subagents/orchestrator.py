@@ -27,7 +27,18 @@ _NO_MUTATION_REQUEST_PATTERN = re.compile(
     r"(?i)\b(?:do not|don't|dont|never)\s+"
     r"(?:change|edit|modify|write)\b|"
     r"\bwithout\s+(?:changing|editing|modifying|writing)\b|"
-    r"\bread[- ]only\b"
+    r"\bread[- ]only\b|"
+    r"\bonly\s+inspect\b"
+)
+_NO_COMMAND_REQUEST_PATTERN = re.compile(
+    r"(?i)\b(?:do not|don't|dont|never)\s+"
+    r"(?:run|execute)\s+(?:shell\s+)?commands?\b|"
+    r"\bwithout\s+(?:running|executing)\s+(?:shell\s+)?commands?\b|"
+    r"\bno[- ]command\b"
+)
+_STRICT_INSPECTION_REQUEST_PATTERN = re.compile(
+    r"(?i)\bread[- ]only\b|"
+    r"\bonly\s+inspect\b"
 )
 _VALIDATION_REQUEST_PATTERN = re.compile(
     r"(?i)\b(?:run|execute|perform)\s+(?:the\s+)?"
@@ -40,6 +51,9 @@ _REVIEW_REQUEST_PATTERN = re.compile(
     r"\bready\s+(?:for|to)\s+commit\b|"
     r"\buncommitted\s+changes?\b|"
     r"\b(?:diff|changes?)\s+(?:correctness|quality|readiness)\b"
+)
+_EXPLICIT_COMMAND_TOOL_REQUEST_PATTERN = re.compile(
+    r"(?i)\b(?:run_command|run_validation)\b"
 )
 
 
@@ -258,10 +272,24 @@ class SubagentOrchestrator:
             )
 
         mutation_requested = _has_mutation_request(request)
-        validation_requested = (
-            browser_intent
-            or _VALIDATION_REQUEST_PATTERN.search(str(request)) is not None
+        commands_prohibited = (
+            normalized_mode == "no-command"
+            or _NO_COMMAND_REQUEST_PATTERN.search(str(request)) is not None
         )
+        command_execution_requested = (
+            (
+                _EXPLICIT_COMMAND_TOOL_REQUEST_PATTERN.search(str(request))
+                is not None
+                or (
+                    _STRICT_INSPECTION_REQUEST_PATTERN.search(str(request))
+                    is None
+                    and _VALIDATION_REQUEST_PATTERN.search(str(request))
+                    is not None
+                )
+            )
+            and not commands_prohibited
+        )
+        validation_requested = browser_intent or command_execution_requested
         review_requested = _REVIEW_REQUEST_PATTERN.search(str(request)) is not None
 
         if (
@@ -411,6 +439,7 @@ def task_profile_for_role(
         TaskProfile.EXPLICIT_READONLY,
         TaskProfile.PLAN_ONLY,
         TaskProfile.REVIEW_ONLY,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
     }:
         return resolved_base
     if normalized_role == "planner":

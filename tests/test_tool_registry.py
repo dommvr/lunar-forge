@@ -221,6 +221,15 @@ def test_task_profile_selection_is_deterministic():
             ("read_json",),
         ),
         (
+            (
+                "Use read_json to inspect package.json. "
+                "Do not edit files."
+            ),
+            {},
+            TaskProfile.EXPLICIT_READONLY,
+            ("read_json",),
+        ),
+        (
             "Plan how to update the parser.",
             {"mode": "plan"},
             TaskProfile.PLAN_ONLY,
@@ -241,7 +250,22 @@ def test_task_profile_selection_is_deterministic():
         (
             "Use web_design.review_files to review index.html. Do not edit files.",
             {},
-            TaskProfile.REVIEW_ONLY,
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+            (),
+        ),
+        (
+            "Use run_command to run python --version. Do not edit files.",
+            {},
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+            ("run_command",),
+        ),
+        (
+            (
+                "Capture a browser screenshot and report console errors. "
+                "Do not edit files."
+            ),
+            {"browser_intent": True},
+            TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
             (),
         ),
         (
@@ -268,6 +292,52 @@ def test_task_profile_selection_is_deterministic():
         selection = select_task_profile(request, **kwargs)
         assert selection.profile is expected_profile
         assert selection.requested_tools == expected_tools
+
+
+def test_no_edit_profile_distinguishes_execution_from_command_prohibition():
+    allowed = select_task_profile(
+        "Use run_command to run python --version. Do not edit files."
+    )
+    prohibited = select_task_profile(
+        (
+            "Use run_command to run python --version. Do not edit files "
+            "and do not run commands."
+        )
+    )
+    plan = select_task_profile(
+        "Use run_command to run python --version. Do not edit files.",
+        mode="plan",
+    )
+    no_command = select_task_profile(
+        "Use run_command to run python --version. Do not edit files.",
+        mode="no-command",
+    )
+
+    assert allowed.profile is TaskProfile.NO_EDIT_EXECUTION_ALLOWED
+    assert allowed.requested_tools == ("run_command",)
+    assert allowed.blocked_tools == ()
+    assert prohibited.profile is TaskProfile.NO_EDIT_EXECUTION_ALLOWED
+    assert prohibited.requested_tools == ()
+    assert {"run_command", "run_validation"} <= set(prohibited.blocked_tools)
+    assert plan.profile is TaskProfile.PLAN_ONLY
+    assert no_command.profile is TaskProfile.NO_EDIT_EXECUTION_ALLOWED
+    assert "run_command" in no_command.blocked_tools
+
+
+def test_strict_inspection_needs_an_explicit_execution_tool():
+    natural_test_request = select_task_profile(
+        "Only inspect the project and run tests."
+    )
+    explicit_tool_request = select_task_profile(
+        "This is read-only. Use run_validation and report the result."
+    )
+
+    assert natural_test_request.profile is TaskProfile.REVIEW_ONLY
+    assert natural_test_request.requested_tools == ()
+    assert explicit_tool_request.profile is (
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED
+    )
+    assert explicit_tool_request.requested_tools == ("run_validation",)
 
 
 def test_explicit_readonly_exposes_requested_and_minimal_support_only(tmp_path):
@@ -324,6 +394,78 @@ def test_plan_review_edit_and_new_project_profiles_have_bounded_sets(tmp_path):
         "run_validation",
     }
     assert BROWSER_TOOL_NAMES.isdisjoint(edit_tools)
+
+
+def test_no_edit_profile_exposes_only_requested_non_edit_execution(tmp_path):
+    registry = create_tool_registry(tmp_path, mode="default")
+
+    command_tools = _profile_schema_names(
+        registry,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        requested_tools=("run_command",),
+    )
+    validation_tools = _profile_schema_names(
+        registry,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        requested_tools=("run_validation",),
+    )
+    browser_tools = _profile_schema_names(
+        registry,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        browser_intent=True,
+    )
+    prohibited_tools = _profile_schema_names(
+        registry,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        requested_tools=("run_command",),
+        blocked_tools=("run_command",),
+    )
+
+    assert "run_command" in command_tools
+    assert "run_validation" not in command_tools
+    assert "run_validation" in validation_tools
+    assert "run_command" not in validation_tools
+    assert BROWSER_TOOL_NAMES <= browser_tools
+    assert "run_command" not in prohibited_tools
+    for names in (
+        command_tools,
+        validation_tools,
+        browser_tools,
+        prohibited_tools,
+    ):
+        assert WRITE_TOOL_NAMES.isdisjoint(names)
+        assert "git_commit" not in names
+
+
+def test_no_edit_profile_allows_requested_read_only_extensions_only():
+    registry = ToolRegistry(
+        (
+            _tool("read_file"),
+            Tool(
+                name="web_design.review_files",
+                description="Review source files.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.EXECUTE,
+                read_only_extension=True,
+            ),
+            Tool(
+                name="example.write",
+                description="Write through an extension.",
+                parameters={"type": "object"},
+                handler=lambda **arguments: {"ok": True},
+                permission=PermissionLevel.WRITE,
+            ),
+        )
+    )
+
+    names = _profile_schema_names(
+        registry,
+        TaskProfile.NO_EDIT_EXECUTION_ALLOWED,
+        requested_tools=("web_design.review_files", "example.write"),
+    )
+
+    assert names == {"read_file", "web_design.review_files"}
 
 
 def test_browser_commit_and_no_command_gates_are_explicit(tmp_path):

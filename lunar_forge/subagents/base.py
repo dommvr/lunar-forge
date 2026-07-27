@@ -176,6 +176,7 @@ class RestrictedToolRegistry:
         requested_tools: Iterable[str] = (),
         browser_intent: bool = False,
         commit_requested: bool = False,
+        blocked_tools: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         allowed_names = set(self.names())
         return [
@@ -187,6 +188,7 @@ class RestrictedToolRegistry:
                 requested_tools=requested_tools,
                 browser_intent=browser_intent,
                 commit_requested=commit_requested,
+                blocked_tools=blocked_tools,
             )
             if self._registry.internal_name_for(_schema_tool_name(schema) or "")
             in allowed_names
