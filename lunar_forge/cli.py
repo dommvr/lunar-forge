@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +12,7 @@ import typer
 from typer.core import TyperGroup
 
 from lunar_forge.agent import run_agent
+from lunar_forge.approvals import CliApprovalProvider
 from lunar_forge.config import load_config
 from lunar_forge.mcp.client import build_mcp_diagnostic
 from lunar_forge.plugins.registry import build_plugin_diagnostic
@@ -45,6 +47,11 @@ from lunar_forge.workflows.browser_validation import (
     run_managed_browser_validation,
 )
 
+TEXTUAL_INSTALL_MESSAGE = (
+    "Textual UI is not installed. Install it with: "
+    'python -m pip install -e ".[tui]"'
+)
+
 
 class DefaultCommandGroup(TyperGroup):
     """Route legacy root invocations to ``run`` while supporting subcommands."""
@@ -52,6 +59,7 @@ class DefaultCommandGroup(TyperGroup):
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         commands = {
             "run",
+            "chat",
             "new",
             "checkpoints",
             "rollback",
@@ -181,6 +189,7 @@ def run(
             project_root,
             config=config,
             mode=config.permissions.mode,
+            approval_provider=CliApprovalProvider(),
             offer_commit=commit,
             commit_message=commit_message,
             show_usage=show_usage,
@@ -190,6 +199,44 @@ def run(
         raise typer.Exit(code=1) from exc
 
     typer.echo(response)
+
+
+@app.command("chat")
+def chat_command(
+    project: Annotated[
+        Path,
+        typer.Option("--project", "-p", help="Target project directory."),
+    ] = Path("."),
+    resume: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            help="Resume a session ID, filename, path, or 'latest'.",
+        ),
+    ] = None,
+) -> None:
+    """Start the optional continuous Textual terminal chat UI."""
+    launcher = _load_textual_chat_launcher()
+    if launcher is None:
+        typer.echo(TEXTUAL_INSTALL_MESSAGE)
+        return
+
+    project_root = project.expanduser().resolve()
+    try:
+        config = load_config(project_root)
+        previous_session = (
+            load_session(project_root, resume)
+            if resume is not None
+            else None
+        )
+        launcher(
+            project_root,
+            config,
+            previous_session=previous_session,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @git_app.command("status")
@@ -241,6 +288,7 @@ def git_commit_command(
                 config.permissions.mode,
                 config.runtime.mode,
             ),
+            approval_provider=CliApprovalProvider(),
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -274,6 +322,7 @@ def browser_setup_command(
             project_root,
             permission_mode=config.permissions.mode,
             runtime_mode=config.runtime.mode,
+            approval_provider=CliApprovalProvider(),
         )
     except (OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -390,6 +439,7 @@ def browser_validate_command(
             height=height,
             startup_timeout_ms=startup_timeout_ms,
             project_root=project_root,
+            approval_provider=CliApprovalProvider(),
         )
     output = dict(result)
     output.setdefault("status", "passed" if output.get("ok") is True else "failed")
@@ -529,6 +579,7 @@ def new_project(
             prompt,
             project_root,
             mode=config.permissions.mode,
+            approval_provider=CliApprovalProvider(),
             template=template,
             runtime_mode=config.runtime.mode,
             allow_network=config.runtime.allow_network,
@@ -721,6 +772,7 @@ def resume_command(
             project_root,
             config=config,
             mode=config.permissions.mode,
+            approval_provider=CliApprovalProvider(),
             resume_messages=previous_session.messages,
             resumed_from=previous_session.relative_path,
             show_usage=show_usage,
@@ -773,6 +825,17 @@ def _git_execution_mode(permission_mode: str, runtime_mode: str) -> str:
     if runtime_mode.strip().lower() == "no-command":
         return "no-command"
     return permission_mode.strip().lower() or "default"
+
+
+def _load_textual_chat_launcher() -> Callable[..., None] | None:
+    try:
+        from lunar_forge.ui.textual_app import run_textual_chat
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if missing == "textual" or missing.startswith("textual."):
+            return None
+        raise
+    return run_textual_chat
 
 
 def main() -> None:

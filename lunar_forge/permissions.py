@@ -10,6 +10,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from lunar_forge.approvals import (
+    ApprovalDecision as ProviderApprovalDecision,
+    ApprovalProvider,
+    ApprovalRequest as ProviderApprovalRequest,
+    AutoApprovalProvider,
+    CliApprovalProvider,
+    DenyApprovalProvider,
+)
+from lunar_forge.events import sanitize_event_payload
+
 
 class PermissionLevel(str, Enum):
     READ = "read"
@@ -37,6 +47,7 @@ ApprovalCallback = Callable[
     [PermissionRequest],
     bool | PermissionDecision,
 ]
+ApprovalEventCallback = Callable[[str, Mapping[str, Any]], None]
 
 
 _DANGEROUS_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -205,6 +216,8 @@ class PermissionManager:
     approval_callback: ApprovalCallback | None = None
     runtime_mode: str = "local"
     project_trust: str = "trusted"
+    approval_provider: ApprovalProvider | None = None
+    approval_event_callback: ApprovalEventCallback | None = None
     _local_command_warning_shown: bool = field(
         default=False,
         init=False,
@@ -272,27 +285,151 @@ class PermissionManager:
                 allowed=False,
                 reason="No-command mode blocks command execution.",
             )
-        if normalized_mode == "yes" and permission is PermissionLevel.WRITE:
-            return PermissionDecision(allowed=True, reason="Auto-approved by yes mode.")
-
-        request = PermissionRequest(
+        legacy_request = PermissionRequest(
             tool_name=tool_name,
             permission=permission,
             description=self._describe_request(tool_name, arguments),
         )
-        callback = self.approval_callback or prompt_for_approval
+        request = self._structured_request(
+            legacy_request,
+            arguments,
+            normalized_mode=normalized_mode,
+        )
+        provider = self._approval_provider(legacy_request)
+        if normalized_mode == "yes":
+            provider = AutoApprovalProvider(fallback=provider)
+        self._emit_approval_event("permission.requested", request.to_dict())
         try:
-            response = callback(request)
+            response = provider.request_approval(request)
+            if not isinstance(response, ProviderApprovalDecision):
+                raise TypeError(
+                    "Approval providers must return ApprovalDecision."
+                )
+            if response.request_id != request.id:
+                raise ValueError(
+                    "Approval decision request_id did not match the request."
+                )
         except Exception:
-            return PermissionDecision(
-                allowed=False,
+            response = ProviderApprovalDecision.create(
+                request.id,
+                approved=False,
                 reason="Permission prompt failed; the action was not run.",
+                source="deny",
             )
-        if isinstance(response, PermissionDecision):
-            return response
-        if response is True:
-            return PermissionDecision(allowed=True, reason="Approved by user.")
-        return PermissionDecision(allowed=False, reason="Denied by user.")
+        decision_payload = response.to_dict()
+        decision_payload.update(
+            {
+                "kind": request.kind,
+                "tool_name": request.tool_name,
+                "risk": request.risk,
+                "mode": request.mode,
+            }
+        )
+        self._emit_approval_event(
+            "permission.resolved",
+            decision_payload,
+        )
+        return PermissionDecision(
+            allowed=response.approved,
+            reason=response.reason,
+        )
+
+    def _approval_provider(
+        self,
+        legacy_request: PermissionRequest,
+    ) -> ApprovalProvider:
+        if self.approval_provider is not None:
+            return self.approval_provider
+        if self.approval_callback is not None:
+            return _LegacyCallbackApprovalProvider(
+                callback=self.approval_callback,
+                request=legacy_request,
+            )
+        return DenyApprovalProvider()
+
+    def _structured_request(
+        self,
+        legacy_request: PermissionRequest,
+        arguments: Mapping[str, Any],
+        *,
+        normalized_mode: str,
+    ) -> ProviderApprovalRequest:
+        tool_name = legacy_request.tool_name
+        command = arguments.get("command")
+        command_preview = (
+            _command_preview(command) if isinstance(command, str) else None
+        )
+        file_path = _request_file_path(arguments)
+        kind = _approval_kind(tool_name, legacy_request.permission)
+        mode = _approval_mode(
+            kind,
+            normalized_mode,
+            self.runtime_mode,
+        )
+        risk = _approval_risk(
+            kind,
+            command if isinstance(command, str) else None,
+            legacy_request.permission,
+        )
+        title = _approval_title(kind)
+        summary = _approval_summary(
+            kind,
+            legacy_request.description,
+            command_preview=command_preview,
+            file_path=file_path,
+            tool_name=tool_name,
+            message=arguments.get("message"),
+        )
+        metadata: dict[str, Any] = {
+            "permission": legacy_request.permission.value,
+            "permission_mode": normalized_mode,
+            "runtime_mode": self.runtime_mode.strip().lower(),
+            "dependency_install": (
+                isinstance(command, str)
+                and is_dependency_install_command(command)
+            ),
+            "risky_command": (
+                isinstance(command, str)
+                and is_risky_allowed_command(command)
+            ),
+        }
+        proposed_files = arguments.get("proposed_files")
+        if isinstance(proposed_files, (list, tuple)):
+            metadata["proposed_files"] = [
+                str(path) for path in proposed_files[:100]
+            ]
+        message = arguments.get("message")
+        if isinstance(message, str):
+            metadata["message"] = message[:500]
+        return ProviderApprovalRequest.create(
+            kind=kind,
+            title=title,
+            summary=summary,
+            details=legacy_request.description,
+            risk=risk,
+            mode=mode,
+            default=False,
+            command=command_preview,
+            tool_name=tool_name,
+            file_path=file_path,
+            metadata=metadata,
+        )
+
+    def _emit_approval_event(
+        self,
+        event: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self.approval_event_callback is None:
+            return
+        try:
+            self.approval_event_callback(
+                event,
+                sanitize_event_payload(payload),
+            )
+        except Exception:
+            # Approval telemetry must not alter the safety decision.
+            return
 
     def _describe_request(
         self,
@@ -339,23 +476,135 @@ class PermissionManager:
 
 
 def prompt_for_approval(request: PermissionRequest) -> PermissionDecision:
-    """Ask for interactive approval without echoing file contents."""
-    description = request.description.rstrip()
-    separator = "\n\n" if "\n\n" in description else (
-        "\n" if "\n" in description else " "
+    """Compatibility adapter for callers that still use PermissionRequest."""
+    provider_request = ProviderApprovalRequest.create(
+        kind=_approval_kind(request.tool_name, request.permission),
+        title=_approval_title(
+            _approval_kind(request.tool_name, request.permission)
+        ),
+        summary=request.description.splitlines()[0].rstrip("."),
+        details=request.description,
+        risk="medium",
+        mode="default",
+        tool_name=request.tool_name,
     )
-    try:
-        answer = input(
-            f"{description}{separator}Allow? [y/N] "
-        ).strip().lower()
-    except (EOFError, OSError, KeyboardInterrupt):
-        return PermissionDecision(
-            allowed=False,
-            reason="Approval was unavailable or cancelled.",
+    decision = CliApprovalProvider().request_approval(provider_request)
+    return PermissionDecision(
+        allowed=decision.approved,
+        reason=decision.reason,
+    )
+
+
+@dataclass(slots=True)
+class _LegacyCallbackApprovalProvider:
+    callback: ApprovalCallback
+    request: PermissionRequest
+
+    def request_approval(
+        self,
+        structured_request: ProviderApprovalRequest,
+    ) -> ProviderApprovalDecision:
+        response = self.callback(self.request)
+        if isinstance(response, PermissionDecision):
+            approved = response.allowed
+            reason = response.reason
+        else:
+            approved = response is True
+            reason = "Approved by user." if approved else "Denied by user."
+        return ProviderApprovalDecision.create(
+            structured_request.id,
+            approved=approved,
+            reason=reason,
+            source="cli",
         )
-    if answer in {"y", "yes"}:
-        return PermissionDecision(allowed=True, reason="Approved by user.")
-    return PermissionDecision(allowed=False, reason="Denied by user.")
+
+
+def _approval_kind(
+    tool_name: str,
+    permission: PermissionLevel,
+) -> str:
+    if tool_name == "git_commit":
+        return "git_commit"
+    if tool_name == "run_managed_browser_validation":
+        return "browser_server"
+    if tool_name.startswith("mcp."):
+        return "mcp_tool"
+    if "." in tool_name:
+        return "plugin_tool"
+    if permission is PermissionLevel.WRITE:
+        return "write"
+    return "command"
+
+
+def _approval_mode(
+    kind: str,
+    permission_mode: str,
+    runtime_mode: str,
+) -> str:
+    if permission_mode in {"plan", "no-command"}:
+        return permission_mode
+    normalized_runtime = runtime_mode.strip().lower()
+    if kind in {"command", "browser_server"} and normalized_runtime in {
+        "local",
+        "docker",
+    }:
+        return normalized_runtime
+    return "default"
+
+
+def _approval_risk(
+    kind: str,
+    command: str | None,
+    permission: PermissionLevel,
+) -> str:
+    if command is not None and is_dependency_install_command(command):
+        return "high"
+    if kind in {"git_commit", "browser_server", "mcp_tool", "plugin_tool"}:
+        return "high" if permission is PermissionLevel.EXECUTE else "medium"
+    if command is not None and is_risky_allowed_command(command):
+        return "high"
+    if kind == "write":
+        return "low"
+    return "medium"
+
+
+def _approval_title(kind: str) -> str:
+    return {
+        "command": "Run command",
+        "write": "Change project files",
+        "git_commit": "Create Git commit",
+        "browser_server": "Start browser validation server",
+        "mcp_tool": "Run MCP tool",
+        "plugin_tool": "Run plugin tool",
+    }[kind]
+
+
+def _approval_summary(
+    kind: str,
+    description: str,
+    *,
+    command_preview: str | None,
+    file_path: str | None,
+    tool_name: str,
+    message: Any,
+) -> str:
+    if kind == "git_commit" and isinstance(message, str) and message.strip():
+        return f"Commit: {message.strip()[:500]}"
+    if command_preview is not None:
+        return command_preview
+    if kind == "write" and file_path is not None:
+        return f"{tool_name}: {file_path}"
+    if kind in {"mcp_tool", "plugin_tool"}:
+        return tool_name
+    return description.splitlines()[0].rstrip(".")
+
+
+def _request_file_path(arguments: Mapping[str, Any]) -> str | None:
+    for key in ("path", "destination", "file_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value[:4_000]
+    return None
 
 
 def is_subpath(path: str | Path, root: str | Path) -> bool:

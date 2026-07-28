@@ -22,6 +22,9 @@ dev = [
 browser = [
   "playwright>=1.40.0",
 ]
+tui = [
+  "textual",
+]
 
 [project.scripts]
 lunar-forge = "lunar_forge.cli:main"

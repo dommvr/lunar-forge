@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from lunar_forge.approvals import ApprovalProvider, CliApprovalProvider
 from lunar_forge.config import AppConfig, load_config
+from lunar_forge.events import (
+    AgentEvent,
+    EventFactory,
+    EventType,
+    events_from_session_record,
+)
 from lunar_forge.instructions import load_project_instructions
 from lunar_forge.mcp.client import MCPClient, TransportFactory
 from lunar_forge.mcp.config import load_mcp_config
@@ -25,6 +32,7 @@ from lunar_forge.model_clients import (
 )
 from lunar_forge.permissions import (
     ApprovalCallback,
+    ApprovalEventCallback,
     PermissionLevel,
     PermissionManager,
 )
@@ -53,6 +61,7 @@ from lunar_forge.runtime.git import (
     list_changed_files as list_git_changed_files,
 )
 from lunar_forge.runtime.sessions import (
+    SessionEventCallback,
     SessionLogger,
     create_session_logger,
     format_model_usage_totals,
@@ -76,6 +85,7 @@ from lunar_forge.tools.registry import (
     parse_explicit_readonly_tool_request,
     select_task_profile,
 )
+from lunar_forge.ui.console_renderer import ConsoleRenderer
 
 
 MAX_STEPS = 30
@@ -410,6 +420,7 @@ class CodeAgent:
     approval_callback: ApprovalCallback | None = None
     mcp_transport_factory: TransportFactory | None = None
     plugin_resolver: EntrypointResolver | None = None
+    approval_provider: ApprovalProvider | None = None
 
     def plan(self, request: str) -> Plan:
         """Preserve the original lightweight planning compatibility helper."""
@@ -428,11 +439,27 @@ class CodeAgent:
         offer_commit: bool = False,
         commit_message: str | None = None,
         show_usage: bool = False,
+        event_callback: SessionEventCallback | None = None,
+        session_logger: SessionLogger | None = None,
     ) -> str:
         """Run the permission-gated model/tool loop until final text."""
         root = Path(project_root).expanduser().resolve()
         normalized_mode = mode.strip().lower()
-        session = _start_session(root, normalized_mode)
+        if session_logger is not None and session_logger.project_root != root:
+            raise ValueError(
+                "The supplied session logger belongs to another project."
+            )
+        if normalized_mode == "plan":
+            session = None
+        elif session_logger is not None:
+            session = session_logger
+            session.set_event_callback(event_callback)
+        else:
+            session = _start_session(
+                root,
+                normalized_mode,
+                event_callback=event_callback,
+            )
         in_memory_usage_totals = (
             _RunUsageTotals()
             if show_usage and session is None
@@ -445,6 +472,7 @@ class CodeAgent:
                 source_session=resumed_from,
             )
         _log_session(session, "user_prompt", prompt=request)
+        approval_event_callback = _session_approval_event_callback(session)
 
         mcp_client: MCPClient | None = None
         try:
@@ -459,7 +487,9 @@ class CodeAgent:
             instructions = load_project_instructions(root)
             permission_manager = PermissionManager(
                 mode=mode,
+                approval_provider=self.approval_provider,
                 approval_callback=self.approval_callback,
+                approval_event_callback=approval_event_callback,
                 runtime_mode=self.config.runtime.mode,
                 project_trust=project_trust,
             )
@@ -485,7 +515,9 @@ class CodeAgent:
                     readonly_tools = create_tool_registry(
                         root,
                         mode=mode,
+                        approval_provider=self.approval_provider,
                         approval_callback=self.approval_callback,
+                        approval_event_callback=approval_event_callback,
                         runtime_mode=self.config.runtime.mode,
                         project_trust=project_trust,
                         allow_network=self.config.runtime.allow_network,
@@ -526,7 +558,9 @@ class CodeAgent:
                 tools = create_tool_registry(
                     root,
                     mode=mode,
+                    approval_provider=self.approval_provider,
                     approval_callback=self.approval_callback,
+                    approval_event_callback=approval_event_callback,
                     runtime_mode=self.config.runtime.mode,
                     project_trust=project_trust,
                     allow_network=self.config.runtime.allow_network,
@@ -1134,7 +1168,9 @@ class CodeAgent:
             commit_message or derive_commit_message(request),
             session_files=commit_files,
             mode=git_mode,
+            approval_provider=self.approval_provider,
             approval_callback=self.approval_callback,
+            approval_event_callback=_session_approval_event_callback(session),
             proposed_files_label=proposed_files_label,
             approval_context=_format_commit_validation_context(
                 validation_evidence,
@@ -2060,6 +2096,159 @@ def _run_subagent_model_loop(
     )
 
 
+def run_agent_events(
+    prompt: str,
+    project_root: str | Path,
+    *,
+    config: AppConfig | None = None,
+    mode: str = "default",
+    max_steps: int = MAX_STEPS,
+    model_client: ModelClient | None = None,
+    approval_provider: ApprovalProvider | None = None,
+    approval_callback: ApprovalCallback | None = None,
+    resume_messages: Sequence[Mapping[str, Any]] = (),
+    resumed_from: str | None = None,
+    use_subagents: bool | None = None,
+    mcp_transport_factory: TransportFactory | None = None,
+    plugin_resolver: EntrypointResolver | None = None,
+    offer_commit: bool = False,
+    commit_message: str | None = None,
+    show_usage: bool = False,
+    event_factory: EventFactory | None = None,
+    session_logger: SessionLogger | None = None,
+    emit_session_started: bool = True,
+) -> Iterator[AgentEvent]:
+    """Run one synchronous agent turn as a public event stream."""
+    root = Path(project_root).expanduser().resolve()
+    resolved_config = config or load_config(root)
+    factory = event_factory or EventFactory()
+    buffered_events: list[AgentEvent] = []
+    buffer_lock = Lock()
+    approval_parent_events: dict[str, str] = {}
+
+    def buffer_event(event: AgentEvent) -> None:
+        with buffer_lock:
+            buffered_events.append(event)
+
+    def observe_session_event(
+        legacy_event: str,
+        data: Mapping[str, Any],
+    ) -> None:
+        request_id = data.get("request_id") or data.get("id")
+        parent_event_id = (
+            approval_parent_events.get(str(request_id))
+            if legacy_event == "permission.resolved" and request_id
+            else None
+        )
+        for event in events_from_session_record(
+            factory,
+            legacy_event,
+            data,
+            parent_event_id=parent_event_id,
+        ):
+            buffer_event(event)
+            if (
+                legacy_event == "permission.requested"
+                and request_id
+            ):
+                approval_parent_events[str(request_id)] = event.event_id
+
+    selected_approval_provider = approval_provider
+    if selected_approval_provider is None and approval_callback is None:
+        selected_approval_provider = CliApprovalProvider()
+    agent = CodeAgent(
+        config=resolved_config,
+        model_client=model_client,
+        max_steps=max_steps,
+        approval_provider=selected_approval_provider,
+        approval_callback=approval_callback,
+        mcp_transport_factory=mcp_transport_factory,
+        plugin_resolver=plugin_resolver,
+    )
+
+    session_event: AgentEvent | None = None
+    if emit_session_started:
+        session_event = factory.create(
+            EventType.SESSION_STARTED,
+            {
+                "project_root": str(root),
+                "mode": mode,
+                "resumed": resumed_from is not None,
+            },
+        )
+        yield session_event
+    if resumed_from is not None and emit_session_started:
+        yield factory.create(
+            EventType.SESSION_RESUMED,
+            {"source_session": resumed_from},
+            parent_event_id=(
+                session_event.event_id if session_event is not None else None
+            ),
+        )
+    turn_event = factory.create(
+        EventType.TURN_STARTED,
+        {"request": prompt},
+        parent_event_id=(
+            session_event.event_id if session_event is not None else None
+        ),
+    )
+    yield turn_event
+    yield factory.create(
+        EventType.STATUS_UPDATED,
+        {"state": "running", "message": "Working..."},
+        parent_event_id=turn_event.event_id,
+    )
+
+    try:
+        final_text = agent.run(
+            prompt,
+            root,
+            mode=mode,
+            resume_messages=resume_messages,
+            resumed_from=resumed_from,
+            use_subagents=use_subagents,
+            offer_commit=offer_commit,
+            commit_message=commit_message,
+            show_usage=show_usage,
+            event_callback=observe_session_event,
+            session_logger=session_logger,
+        )
+    except Exception as exc:
+        yield from _drain_event_buffer(buffered_events, buffer_lock)
+        error_event = factory.create(
+            EventType.ERROR,
+            {
+                "source": "agent",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+            parent_event_id=turn_event.event_id,
+        )
+        yield error_event
+        yield factory.create(
+            EventType.TURN_FINISHED,
+            {"status": "failed", "error_event_id": error_event.event_id},
+            parent_event_id=turn_event.event_id,
+        )
+        raise
+
+    yield from _drain_event_buffer(buffered_events, buffer_lock)
+    final_event = factory.create(
+        EventType.ASSISTANT_MESSAGE_COMPLETED,
+        {"text": final_text, "final": True},
+        parent_event_id=turn_event.event_id,
+    )
+    yield final_event
+    yield factory.create(
+        EventType.TURN_FINISHED,
+        {
+            "status": "completed",
+            "final_event_id": final_event.event_id,
+        },
+        parent_event_id=turn_event.event_id,
+    )
+
+
 def run_agent(
     prompt: str,
     project_root: str | Path,
@@ -2068,6 +2257,7 @@ def run_agent(
     mode: str = "default",
     max_steps: int = MAX_STEPS,
     model_client: ModelClient | None = None,
+    approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
     resume_messages: Sequence[Mapping[str, Any]] = (),
     resumed_from: str | None = None,
@@ -2078,36 +2268,50 @@ def run_agent(
     commit_message: str | None = None,
     show_usage: bool = False,
 ) -> str:
-    """Convenience entry point used by the CLI."""
-    root = Path(project_root).expanduser().resolve()
-    resolved_config = config or load_config(root)
-    agent = CodeAgent(
-        config=resolved_config,
-        model_client=model_client,
-        max_steps=max_steps,
-        approval_callback=approval_callback,
-        mcp_transport_factory=mcp_transport_factory,
-        plugin_resolver=plugin_resolver,
-    )
-    return agent.run(
-        prompt,
-        root,
-        mode=mode,
-        resume_messages=resume_messages,
-        resumed_from=resumed_from,
-        use_subagents=use_subagents,
-        offer_commit=offer_commit,
-        commit_message=commit_message,
-        show_usage=show_usage,
+    """Run the existing one-shot interface through the event renderer."""
+    return ConsoleRenderer.one_shot().consume(
+        run_agent_events(
+            prompt,
+            project_root,
+            config=config,
+            mode=mode,
+            max_steps=max_steps,
+            model_client=model_client,
+            approval_provider=approval_provider,
+            approval_callback=approval_callback,
+            resume_messages=resume_messages,
+            resumed_from=resumed_from,
+            use_subagents=use_subagents,
+            mcp_transport_factory=mcp_transport_factory,
+            plugin_resolver=plugin_resolver,
+            offer_commit=offer_commit,
+            commit_message=commit_message,
+            show_usage=show_usage,
+        )
     )
 
 
-def _start_session(root: Path, mode: str) -> SessionLogger | None:
+def _drain_event_buffer(
+    events: list[AgentEvent],
+    lock: Lock,
+) -> tuple[AgentEvent, ...]:
+    with lock:
+        drained = tuple(events)
+        events.clear()
+    return drained
+
+
+def _start_session(
+    root: Path,
+    mode: str,
+    *,
+    event_callback: SessionEventCallback | None = None,
+) -> SessionLogger | None:
     # Plan mode remains strictly read-only, including LunarForge runtime files.
     if mode == "plan":
         return None
     try:
-        return create_session_logger(root)
+        return create_session_logger(root, event_callback=event_callback)
     except Exception:
         return None
 
@@ -2124,6 +2328,18 @@ def _log_session(
     except Exception:
         # Session telemetry must never interrupt the coding-agent workflow.
         return
+
+
+def _session_approval_event_callback(
+    session: SessionLogger | None,
+) -> ApprovalEventCallback:
+    def log_approval_event(
+        event: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        _log_session(session, event, **dict(payload))
+
+    return log_approval_event
 
 
 def _log_tool_schema_selection(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +57,8 @@ _API_KEY_PATTERN = re.compile(
     r"(?i)\b(?:sk-(?:ant-)?|gh[pousr]_|github_pat_)[a-z0-9_-]{8,}\b"
 )
 
+SessionEventCallback = Callable[[str, Mapping[str, Any]], None]
+
 
 @dataclass
 class SessionLogger:
@@ -72,6 +74,11 @@ class SessionLogger:
         repr=False,
         compare=False,
     )
+    _event_callback: SessionEventCallback | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     last_error: str | None = field(default=None, init=False)
 
     @property
@@ -83,6 +90,14 @@ class SessionLogger:
         """Return a thread-safe snapshot of model usage accumulated this run."""
         with self._write_lock:
             return dict(self._usage_totals)
+
+    def set_event_callback(
+        self,
+        callback: SessionEventCallback | None,
+    ) -> None:
+        """Replace the public-event observer between synchronous chat turns."""
+        with self._write_lock:
+            self._event_callback = callback
 
     def log(self, event: str, **data: Any) -> bool:
         """Append one redacted event, returning false instead of raising on failure."""
@@ -129,6 +144,16 @@ class SessionLogger:
                     Mapping,
                 ):
                     _accumulate_usage(self._usage_totals, record["data"])
+                if self._event_callback is not None:
+                    try:
+                        self._event_callback(
+                            str(record["event"]),
+                            dict(record["data"]),
+                        )
+                    except Exception:
+                        # Public event adapters are telemetry and must not
+                        # interrupt the existing session or agent workflow.
+                        pass
         except Exception:
             self.last_error = SESSION_ERROR
             return False
@@ -155,6 +180,8 @@ class LoadedSession:
 def create_session_logger(
     project_root: str | Path,
     environ: Mapping[str, str] | None = None,
+    *,
+    event_callback: SessionEventCallback | None = None,
 ) -> SessionLogger:
     """Create a unique session file beneath ``.agent/sessions``."""
     root = Path(project_root).expanduser().resolve()
@@ -174,6 +201,7 @@ def create_session_logger(
         path=session_path,
         _environment_names=names,
         _environment_values=values,
+        _event_callback=event_callback,
     )
 
 
@@ -250,6 +278,25 @@ def resolve_session_file(
     identifier = str(session_id_or_file).strip()
     if not identifier:
         raise ValueError("Session ID or filename must not be empty.")
+    if identifier.casefold() == "latest":
+        candidates = sorted(
+            (
+                safe_path(root, entry)
+                for entry in sessions_directory.iterdir()
+                if entry.is_file() and entry.suffix.lower() == ".jsonl"
+            ),
+            key=lambda entry: entry.name,
+            reverse=True,
+        )
+        if not candidates:
+            raise FileNotFoundError(
+                "No sessions were found under .agent/sessions."
+            )
+        return _validate_session_file(
+            root,
+            sessions_directory,
+            candidates[0],
+        )
     requested = Path(identifier).expanduser()
 
     if requested.is_absolute() or requested.parent != Path("."):
@@ -753,6 +800,7 @@ __all__ = [
     "MAX_LOG_STRING_CHARACTERS",
     "LoadedSession",
     "Session",
+    "SessionEventCallback",
     "SessionLogger",
     "create_session",
     "create_session_logger",

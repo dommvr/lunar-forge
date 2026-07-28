@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lunar_forge.permissions import ApprovalCallback
+from lunar_forge.approvals import ApprovalProvider
+from lunar_forge.permissions import ApprovalCallback, ApprovalEventCallback
 from lunar_forge.project_detection import detect_project
 from lunar_forge.runtime.sessions import SessionLogger, create_session_logger
 from lunar_forge.subagents import (
@@ -227,7 +228,9 @@ def run_new_project(
     project_root: str | Path,
     *,
     mode: str = "default",
+    approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
+    approval_event_callback: ApprovalEventCallback | None = None,
     template: TemplateName | None = None,
     runtime_mode: str = "local",
     allow_network: bool = False,
@@ -311,10 +314,17 @@ def run_new_project(
     _log(session, "user_prompt", prompt=prompt)
     _log(session, "template_selected", template=selected_template, plan=plan)
 
+    def observe_approval(event: str, data: Mapping[str, Any]) -> None:
+        _log(session, event, **data)
+        if approval_event_callback is not None:
+            approval_event_callback(event, data)
+
     registry = create_tool_registry(
         root,
         mode=normalized_mode,
+        approval_provider=approval_provider,
         approval_callback=approval_callback,
+        approval_event_callback=observe_approval,
         runtime_mode=runtime_mode,
         allow_network=allow_network,
     )

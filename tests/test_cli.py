@@ -663,6 +663,10 @@ def test_browser_validate_managed_server_mode_is_model_free_and_routed(
     assert result.exit_code == 0
     output = json.loads(result.stdout)
     assert output["managed_server"]["stopped"] is True
+    assert isinstance(
+        captured.pop("approval_provider"),
+        cli_module.CliApprovalProvider,
+    )
     assert captured == {
         "command": "npm run dev",
         "url": "http://localhost:5173",

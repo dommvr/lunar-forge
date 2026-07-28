@@ -11,8 +11,10 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lunar_forge.approvals import ApprovalProvider
 from lunar_forge.permissions import (
     ApprovalCallback,
+    ApprovalEventCallback,
     PermissionLevel,
     PermissionManager,
 )
@@ -1238,6 +1240,8 @@ def create_tool_registry(
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
     *,
+    approval_provider: ApprovalProvider | None = None,
+    approval_event_callback: ApprovalEventCallback | None = None,
     runtime_mode: str = "local",
     project_trust: str = "auto",
     allow_network: bool = False,
@@ -1283,7 +1287,9 @@ def create_tool_registry(
         tools,
         permission_manager=PermissionManager(
             mode=mode,
+            approval_provider=approval_provider,
             approval_callback=approval_callback,
+            approval_event_callback=approval_event_callback,
             runtime_mode=runtime_mode,
             project_trust=resolved_project_trust,
         ),

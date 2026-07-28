@@ -19,7 +19,11 @@ The agent should be able to:
 * coordinate specialist subagents for planning, coding, reviewing, testing, security, and scaffolding,
 * connect to external tools through MCP,
 * run optional UI/browser validation,
-* support a safe plugin system.
+* support a safe plugin system,
+* emit structured agent events that can be rendered by multiple UIs,
+* support an optional Textual terminal chat UI with continuous conversation state,
+* compact long-running chat history safely when token limits are approached,
+* and keep the event protocol compatible with a future web demo and cloud-sandbox agent runtime.
 
 The project is intentionally built as a small, understandable agent framework. Prefer boring, reliable architecture over clever abstractions. Cleverness is where maintainability goes to die wearing sunglasses.
 
@@ -143,13 +147,31 @@ Completed configurable model reasoning effort:
 * Send effective effort to OpenAI Responses API calls through LiteLLM.
 * Record effective effort in session usage events and `--show-usage`.
 
-Next feature wave, in order:
+Completed local/Docker execution-safety hardening:
 
 64. Document local execution safety clearly: local mode is useful, but it is not OS-level isolation.
 65. Add targeted local command approval warnings without making every approval prompt long and tedious.
 66. Keep Docker approval wording distinct and clear.
 67. Add manual tests for local warnings, Docker approval text, no-edit command routing, plan mode, no-command mode, and dangerous-command blocking.
 68. Clean up final-summary formatting so security-review findings do not appear under reviewer headings or duplicate empty sections.
+69. Harden command safety and commit gating so validation results are visible before commit approval.
+70. Preserve explicit `run_command` requests without silently rewriting them into validation commands.
+
+Completed first event-stream phase:
+
+71. Add a structured, versioned, bounded, and redacted agent event stream that separates agent logic from terminal rendering.
+72. Add a renderer abstraction and make the existing one-shot CLI consume events through `ConsoleRenderer` while preserving the existing session JSONL format and one-shot output.
+
+Completed first optional Textual chat phase:
+
+73. Add an approval-provider abstraction so CLI, Textual, and future web UIs can all answer permission requests without `input()` buried inside business logic.
+74. Add an optional Textual chat app for continuous in-terminal conversation.
+75. Persist interactive chat turns to the existing JSONL session format and support resumable chat sessions.
+
+Next feature wave, in order:
+
+76. Add working-memory compaction/summarization when context limits are approached.
+77. Document and test the event protocol so it remains compatible with a future web demo and cloud-sandbox runtime.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -161,7 +183,8 @@ Use:
 
 * Python 3.11+
 * Typer for CLI
-* Rich for terminal output
+* Rich for existing one-shot terminal output
+* Textual as an optional extra for the interactive terminal UI
 * LiteLLM for model provider abstraction
 * PyYAML for YAML config
 * pytest for tests
@@ -179,6 +202,17 @@ dependencies = [
   "pyyaml>=6.0.0",
 ]
 ```
+
+Textual must be optional, not a core dependency, until the interactive UI is stable:
+
+```toml
+[project.optional-dependencies]
+tui = [
+  "textual",
+]
+```
+
+The core one-shot CLI must continue to work without installing the `tui` extra.
 
 ---
 
@@ -219,9 +253,11 @@ lunar-forge/
     cli.py
     config.py
     agent.py
+    events.py
     prompts.py
     planning.py
     permissions.py
+    approvals.py
     instructions.py
     project_detection.py
 
@@ -250,6 +286,8 @@ lunar-forge/
       docker_runner.py
       checkpoints.py
       sessions.py
+      conversation.py
+      compaction.py
       diffs.py
       git.py
 
@@ -260,6 +298,13 @@ lunar-forge/
       new_project.py
       validation.py
       browser_validation.py
+
+    ui/
+      __init__.py
+      renderers.py
+      console_renderer.py
+      textual_app.py
+      textual_widgets.py
 
     subagents/
       __init__.py
@@ -313,7 +358,9 @@ target-project/
   .agent/
     config.yaml
     sessions/
+    summaries/
     checkpoints/
+    artifacts/browser/
 ```
 
 ---
@@ -334,6 +381,8 @@ lunar-forge --plan "Add pricing page with navbar link"
 lunar-forge --docker "Run tests and fix failures"
 lunar-forge --docker --allow-network "Create Vite portfolio site"
 lunar-forge --reasoning-effort high --show-usage "Explain this project"
+lunar-forge chat --project ~/dev/my-app
+lunar-forge chat --resume latest --project ~/dev/my-app
 lunar-forge new "Build a calculator app in Python with UI"
 ```
 
@@ -344,6 +393,8 @@ Default behavior:
 * `--plan` mode must never write files or run mutating commands.
 * Shell commands require approval unless permission mode says otherwise.
 * Dependency installation always requires approval.
+* `lunar-forge chat` starts the optional Textual continuous chat UI when the `tui` extra is installed.
+* The one-shot CLI and Textual UI must use the same agent engine and event stream.
 
 ---
 
@@ -375,6 +426,13 @@ runtime:
 
 permissions:
   mode: default
+
+ui:
+  chat:
+    auto_resume: false
+    compact_at_tokens: 120000
+    compact_to_tokens: 12000
+    show_tool_details: true
 ```
 
 Do not store raw API keys in project files. Use environment variables.
@@ -405,6 +463,8 @@ else:
 ```
 
 Do not scatter provider-specific code through the project. That is how clean architecture becomes soup.
+
+The model/tool loop should report public progress through structured events instead of printing directly from deep runtime code. The one-shot CLI, Textual UI, and future web UI should all consume the same event stream.
 
 ---
 
@@ -1614,17 +1674,14 @@ Store:
 
 Do not store API keys or secrets.
 
-Implemented utility command:
+Implemented utility commands:
 
 ```bash
 lunar-forge sessions
-```
-
-Next implement:
-
-```bash
 lunar-forge resume <session-id>
 ```
+
+Event-stream and Textual work must keep using this session system instead of creating a separate memory universe. A single project should not need one history for CLI, another for Textual, and a third one lurking behind the fridge.
 
 Session resume requirements:
 
@@ -1636,9 +1693,421 @@ Session resume requirements:
 * Resume must clearly distinguish historical tool results from new actions.
 * Resume must keep plan mode no-write.
 * Resume must continue logging into a new session file that references the resumed session.
+* Textual chat resume should load prior safe conversation context and compacted summaries without replaying old tool calls.
+* `lunar-forge chat --resume latest` should resume the latest compatible session for the selected project.
+* Interactive turns should continue appending safe events to session logs.
+
 
 ---
 
+## Agent event stream
+
+The next architecture step is to separate agent logic from display.
+
+Current one-shot behavior should be preserved, but the internal engine should emit structured events that can be consumed by:
+
+* the existing CLI console renderer,
+* the upcoming Textual chat UI,
+* session JSONL logs,
+* and a future web demo or cloud-sandbox UI.
+
+Do not build Textual by parsing terminal text. Terminal-output parsing is how software develops raccoon energy.
+
+Initial files:
+
+```text
+lunar_forge/events.py
+lunar_forge/ui/renderers.py
+lunar_forge/ui/console_renderer.py
+```
+
+Recommended public API:
+
+```python
+for event in run_agent_events(request):
+    renderer.handle(event)
+```
+
+Keep the existing one-shot API as a wrapper:
+
+```python
+def run_agent(...):
+    events = run_agent_events(...)
+    return ConsoleRenderer(...).consume(events)
+```
+
+### Event schema
+
+Use one versioned envelope for every public runtime event:
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "evt_...",
+  "session_id": "session_...",
+  "turn_id": "turn_...",
+  "sequence": 42,
+  "timestamp": "2026-01-01T12:00:00Z",
+  "type": "tool.finished",
+  "parent_event_id": "evt_...",
+  "payload": {}
+}
+```
+
+Event rules:
+
+* Events must be JSON-serializable.
+* Events must be stable enough for both terminal and web renderers.
+* Every event should include:
+  * `schema_version`,
+  * `event_id`,
+  * `session_id`,
+  * `turn_id`,
+  * a monotonic per-session `sequence`,
+  * `timestamp`,
+  * `type`,
+  * `payload`,
+  * optional `parent_event_id`.
+* Use UTC ISO-8601 timestamps.
+* Treat `type` plus `schema_version` as the public protocol contract.
+* Put event-specific data inside `payload`; do not add renderer-only fields to the envelope.
+* Keep event payloads bounded.
+* Redact secrets before events are logged or rendered.
+* Never emit hidden chain-of-thought or private model reasoning.
+* Do not expose raw provider responses unless they are already normalized and safe.
+* Event names should describe public runtime facts, not internal implementation gossip.
+
+### Event types
+
+Initial event types:
+
+```text
+session.started
+session.resumed
+turn.started
+turn.finished
+status.updated
+assistant.message.delta
+assistant.message.completed
+model.call.started
+model.call.finished
+model.usage
+tool.started
+tool.finished
+tool.failed
+permission.requested
+permission.resolved
+validation.started
+validation.finished
+browser.started
+browser.finished
+checkpoint.created
+git.proposal
+git.commit.created
+git.commit.skipped
+memory.compaction.started
+memory.compaction.finished
+error
+```
+
+Tool events should include:
+
+```json
+{
+  "tool_name": "run_command",
+  "provider_tool_name": "run_command",
+  "args_preview": {"command": "python -B -m compileall ."},
+  "permission_level": "execute"
+}
+```
+
+Tool results should include bounded, redacted summaries. Large stdout, diffs, screenshots, and logs should be referenced by artifact path or truncated preview instead of dumped into every event.
+
+### Event compatibility with future web/cloud runtime
+
+The event stream must not assume a terminal.
+
+Rules:
+
+* Do not include Rich/Textual objects in core events.
+* Do not include terminal color markup in core events.
+* Use plain dictionaries, dataclasses, or Pydantic-style serializable structures.
+* Keep UI-specific formatting in renderers.
+* Design approval events so they can be answered by a CLI prompt, Textual modal, or future web button.
+* Design artifact references so local paths can later become URLs or cloud artifact IDs.
+* Keep cloud sandbox execution out of scope for this wave, but do not make event payloads impossible to transport over WebSocket/SSE later.
+
+---
+
+## Renderer abstraction
+
+Rendering should consume events, not agent internals.
+
+Initial renderers:
+
+```text
+ConsoleRenderer
+JsonlSessionRenderer
+```
+
+Later renderer:
+
+```text
+TextualRenderer
+```
+
+Renderer rules:
+
+* The existing CLI output should remain mostly unchanged after the event refactor.
+* Console rendering may use Rich.
+* Session rendering should write the same safe JSONL logs already used by LunarForge.
+* Renderers must not make agent decisions.
+* Renderers must not bypass permissions.
+* Renderers must not mutate project files.
+* Renderers should be deterministic so tests can assert event order and output shape.
+
+The console renderer should handle:
+
+* status updates,
+* streamed assistant text,
+* tool start/finish,
+* permission prompts through an approval provider,
+* validation summaries,
+* Git proposals,
+* final summaries,
+* usage output when `--show-usage` is enabled.
+
+Do not delete the current concise final-summary format. Wrap it around events.
+
+---
+
+## Approval providers
+
+Permission handling must become UI-independent.
+
+Do not bury `input()` calls inside low-level permission or runtime helpers. That works for one-shot CLI mode and then immediately becomes a brick when Textual appears.
+
+Initial interface:
+
+```python
+class ApprovalProvider:
+    def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        ...
+```
+
+Initial implementations:
+
+```text
+CliApprovalProvider
+AutoApprovalProvider
+DenyApprovalProvider
+TextualApprovalProvider
+```
+
+Approval request fields should include:
+
+```json
+{
+  "id": "approval_...",
+  "kind": "command|write|git_commit|browser_server|mcp_tool|plugin_tool",
+  "title": "Run Docker command",
+  "summary": "python -B -m compileall .",
+  "details": "...",
+  "risk": "low|medium|high",
+  "mode": "local|docker|plan|no-command",
+  "default": false
+}
+```
+
+Rules:
+
+* Existing permission modes must keep their behavior.
+* `--plan` must still deny writes and command execution.
+* `no-command` must still deny command execution and Git commit execution.
+* Dependency install commands must still require approval.
+* Dangerous commands must remain blocked before approval.
+* Local full-warning behavior must stay targeted.
+* Docker approval wording must stay distinct.
+* The Textual UI must pause the current turn while approval is pending and resume with the decision.
+* Approval decisions must be logged to the session JSONL.
+
+---
+
+## Textual chat UI
+
+Add Textual only after the event stream and approval-provider abstraction are working.
+
+Command:
+
+```bash
+lunar-forge chat --project ~/dev/my-app
+lunar-forge chat --project ~/dev/my-app --resume latest
+```
+
+Textual must be optional:
+
+```bash
+python -m pip install -e ".[tui]"
+```
+
+If Textual is missing and the user runs `lunar-forge chat`, show a clear setup message instead of crashing.
+
+Minimum layout:
+
+```text
+╭──────────────── LunarForge ────────────────╮
+│ Project: C:\...\my-app                     │
+│ Model: openai/gpt-5.6-sol  Effort: medium │
+│ Mode: default/docker/no-command            │
+├────────────────────────────────────────────┤
+│ Chat transcript                            │
+│                                            │
+│ User: Add homepage                         │
+│ Agent: Reading project structure...        │
+│ Tool: read_file src/App.jsx                │
+│ Tool: replace_lines src/App.jsx            │
+│ Validation: npm run build passed           │
+├────────────────────────────────────────────┤
+│ Activity / approvals / tool details        │
+├────────────────────────────────────────────┤
+│ > input                                    │
+╰────────────────────────────────────────────╯
+```
+
+Minimum panels:
+
+* chat transcript,
+* live activity/status,
+* approval prompt area,
+* compact tool log,
+* input box,
+* footer with project/model/reasoning effort/mode/session.
+
+Do not add complex tabs in the first Textual wave. Tabs breed in captivity and then someone has to maintain them.
+
+Initial slash commands:
+
+```text
+/help
+/status
+/clear
+/exit
+```
+
+Later slash commands:
+
+```text
+/compact
+/sessions
+/resume latest
+/checkpoints
+/mcp
+/plugins
+/diff
+/validation
+```
+
+Textual UI rules:
+
+* The Textual app should submit user turns to the same event-driven agent engine used by the one-shot CLI.
+* The app keeps live conversation state in memory while open.
+* Each user message becomes a new turn in the same session.
+* Tool approvals should appear as UI prompts, not raw terminal `input()`.
+* The UI must keep rendering status while long operations run.
+* The UI must not parse console text to infer state.
+* The UI must not expose hidden reasoning.
+* The UI should gracefully show errors and let the user continue chatting when safe.
+* The one-shot CLI must keep working without Textual installed.
+
+---
+
+## Conversation memory and compaction
+
+Continuous chat needs two memory levels:
+
+```text
+live memory:
+  current in-process conversation for the open Textual app
+
+persistent memory:
+  session JSONL plus compacted summaries under .agent/summaries/
+```
+
+Do not build memory compaction before the event stream and Textual MVP work. First make continuous chat real; then teach it to forget responsibly, an ability humans still market as wisdom.
+
+Memory rules:
+
+* Live chat should preserve prior user and assistant turns while the app remains open.
+* Session logs remain the source of truth for recovery.
+* Resuming a session must not replay old tool calls.
+* Historical tool results must be clearly marked as historical context.
+* Compaction should summarize older safe conversation context when token budgets are approached.
+* Compaction must preserve:
+  * current task goal,
+  * user constraints,
+  * selected project root,
+  * permission/runtime mode,
+  * files changed,
+  * validation results,
+  * open TODOs,
+  * important tool results,
+  * approval decisions,
+  * relevant AGENTS.md instructions,
+  * unresolved errors.
+* Compaction must not preserve:
+  * secrets,
+  * hidden reasoning,
+  * raw huge command output,
+  * stale file contents that may have changed,
+  * unrelated old discussion.
+
+Suggested compaction files:
+
+```text
+.agent/summaries/<session-id>.summary.json
+```
+
+Suggested structure:
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "...",
+  "source_events_through": "...",
+  "created_at": "...",
+  "summary": "...",
+  "facts": {
+    "project_root": "...",
+    "runtime_mode": "docker",
+    "permission_mode": "default",
+    "changed_files": [],
+    "validation": [],
+    "open_items": []
+  }
+}
+```
+
+Compaction trigger:
+
+* estimate tokens for live conversation plus current AGENTS/tool context,
+* when approaching configured threshold, emit `memory.compaction.started`,
+* call the model with a summarization prompt that forbids hidden reasoning,
+* save the summary,
+* replace older conversation turns with the compacted summary plus recent turns,
+* emit `memory.compaction.finished`.
+
+Config:
+
+```yaml
+ui:
+  chat:
+    compact_at_tokens: 120000
+    compact_to_tokens: 12000
+```
+
+If token estimation is uncertain, err on the side of compacting earlier. Context windows are not a moral challenge.
+
+---
 
 ## Subagents
 
@@ -2253,6 +2722,11 @@ Manual testing docs should include:
 * Docker execution safety and sandbox-image setup,
 * local execution safety warnings,
 * no-edit command-routing semantics,
+* agent event stream and renderer abstraction,
+* Textual chat UI setup and manual smoke tests,
+* interactive approvals,
+* resumable chat sessions,
+* memory compaction and summary files,
 * project intelligence tools: `project_health`, `dependency_summary`, `git_status`, `git_diff`, and `list_changed_files`.
 * structured context tools: `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, and `ci_summary`.
 
@@ -2341,6 +2815,13 @@ Test expectations:
 * OpenAI Responses requests include the effective reasoning effort without changing the model name or removing tools.
 * Unsupported providers or API modes warn and continue without crashing.
 * Session usage events and `--show-usage` include the effective reasoning effort.
+* Agent runtime events are JSON-serializable, bounded, redacted, and schema-versioned.
+* Existing one-shot CLI output can be produced by consuming events.
+* Approval providers preserve CLI/default/yes/no-command/plan/docker behavior.
+* Textual chat can run multiple turns in one process using shared conversation state.
+* Textual approval prompts resolve permission requests without direct `input()` calls in runtime helpers.
+* Chat resume loads previous safe context without replaying old tool calls.
+* Memory compaction preserves task state while removing stale or oversized details.
 
 Run tests with:
 
@@ -2366,6 +2847,7 @@ Required tests:
 * explicit `read_json`, `read_yaml`, `read_many_files`, `list_symbols`, `ci_summary`, `git_status`, `git_diff`, and `list_changed_files` prompts use compact read-only routing,
 * browser paths such as `browser-demo/package.json` do not trigger browser routing by themselves,
 * explicit browser/screenshot/console/UI prompts still trigger browser routing,
+* event-driven one-shot CLI preserves task-profile routing and final summaries,
 * final summaries report actual subagents run and do not invent skipped roles,
 * final summaries render security-review findings under `Security review:` without duplicate empty sections or misleading reviewer headings.
 
@@ -2389,7 +2871,7 @@ Avoid:
 * global mutable state,
 * provider-specific logic outside model clients,
 * huge abstractions,
-* async until there is a real need,
+* async in core agent logic until there is a real need; Textual UI may use Textual's async/message model at the UI boundary,
 * hidden filesystem writes,
 * unbounded command output,
 * silent failures.
@@ -2487,13 +2969,19 @@ These are the defaults unless changed deliberately:
 
 * Use Python 3.11+.
 * Use Typer for CLI.
-* Use Rich for terminal output.
+* Use Rich only in the existing one-shot console renderer, not in core events.
 * Use LiteLLM as the first model provider layer.
-* Use sync code for the MVP.
+* Emit a versioned, bounded, redacted event stream before adding another UI.
+* Make the one-shot CLI consume events through a renderer and preserve its current behavior.
+* Route permission decisions through approval providers instead of low-level `input()` calls.
+* Keep Textual optional and add it only after the event and approval seams work; do not build a prompt_toolkit UI first.
+* Keep core agent logic mostly sync for now; isolate Textual async behavior at the UI boundary.
 * Use exact-replacement editing plus line-based edits before advanced patching.
 * Use local command runner before Docker runner.
 * Use YAML for config.
-* Use JSONL for sessions.
+* Keep JSONL event/session logs as the persistent source of truth for one-shot and resumable chat sessions.
+* Add working-memory compaction only after continuous chat works.
+* Keep web UI, cloud execution, and cloud sandbox implementation out of this wave while making the event protocol transport-neutral.
 * Use pytest for testing.
 * Use Docker as the recommended execution mode for untrusted projects; local mode remains convenient but is not OS-level isolation.
 * Use `AGENTS.md` as the project instruction file for this agent.
@@ -2503,16 +2991,19 @@ These are the defaults unless changed deliberately:
 
 ## Still do not build yet
 
-These remain out of scope until the local/Docker execution-safety wave is stable:
+These remain out of scope until the event-stream and Textual-chat wave is stable:
 
-* GUI,
 * background daemon,
 * vector database,
 * semantic code index,
 * multi-repo workspace mode,
 * cloud execution,
-* real OS-level local sandboxing.
+* browser-based web demo,
+* cloud sandbox orchestration,
+* real OS-level local sandboxing,
+* full plugin marketplace,
+* prompt_toolkit REPL as a competing intermediate UI.
 
 Reason:
 
-The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, parallel subagent phases, structured context tools, token/cost controls, Git support, and Docker-mode execution. Keep the next work focused on clear safety semantics, targeted local warnings, Docker/local manual tests, and final-summary cleanup. Do not turn lunar-forge into a distributed systems dissertation wearing a CLI hat.
+The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, parallel subagent phases, structured context tools, token/cost controls, Git support, Docker-mode execution, local execution warnings, and configurable reasoning effort. The next work should focus on one architectural seam: a stable event stream that both the current CLI and future UIs can consume. Do not turn lunar-forge into three frontends arguing over a pile of duplicated state.

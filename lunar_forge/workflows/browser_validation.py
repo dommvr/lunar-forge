@@ -17,8 +17,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
+from lunar_forge.approvals import ApprovalProvider
 from lunar_forge.permissions import (
     ApprovalCallback,
+    ApprovalEventCallback,
     PermissionLevel,
     PermissionManager,
     dangerous_command_reason,
@@ -93,7 +95,9 @@ def run_browser_setup(
     *,
     permission_mode: str = "default",
     runtime_mode: str = "local",
+    approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
+    approval_event_callback: ApprovalEventCallback | None = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     _command_runner: SetupCommandRunner | None = None,
 ) -> dict[str, Any]:
@@ -119,7 +123,9 @@ def run_browser_setup(
         effective_permission_mode = "no-command"
     permissions = PermissionManager(
         mode=effective_permission_mode,
+        approval_provider=approval_provider,
         approval_callback=approval_callback,
+        approval_event_callback=approval_event_callback,
         runtime_mode="local",
     )
     command_runner = _command_runner or run_command
@@ -336,7 +342,9 @@ def run_managed_browser_validation(
     height: int = DEFAULT_VIEWPORT_HEIGHT,
     startup_timeout_ms: int = DEFAULT_SERVER_STARTUP_TIMEOUT_MS,
     project_root: str | Path = ".",
+    approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
+    approval_event_callback: ApprovalEventCallback | None = None,
     _playwright_factory: PlaywrightFactory | None = None,
     _popen_factory: PopenFactory | None = None,
     _url_probe: URLProbe | None = None,
@@ -368,7 +376,9 @@ def run_managed_browser_validation(
 
     decision = PermissionManager(
         mode="default",
+        approval_provider=approval_provider,
         approval_callback=approval_callback,
+        approval_event_callback=approval_event_callback,
     ).authorize(
         PermissionLevel.EXECUTE,
         "run_managed_browser_validation",

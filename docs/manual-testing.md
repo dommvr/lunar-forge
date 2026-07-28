@@ -62,6 +62,12 @@ are all current pass/fail checks.
 - [ ] Parallel subagents
 - [ ] No-command mode
 - [ ] Guarded Git status and commit
+- [x] Event-driven one-shot CLI parity
+- [x] Approval provider behavior
+- [x] Textual missing-dependency message
+- [x] Textual multi-turn chat smoke test
+- [x] Textual session resume
+- [ ] Working-memory compaction (later wave)
 - [ ] Repository validation after documentation changes
 
 ## 1. Install and CLI availability
@@ -2397,6 +2403,137 @@ approval appears, and Python is not executed.
 ```powershell
 Remove-Item -Recurse -Force -LiteralPath $ExecutionProject
 ```
+
+## Event-driven chat: manual tests and later placeholders
+
+The event, renderer, approval-provider, and first Textual chat cases are current.
+Working-memory compaction remains a later placeholder. Run the current checks in
+the order below; the existing CLI, permission, local/Docker, session, and Git
+tests above remain the regression suite throughout the refactor.
+
+Disposable-project setup:
+
+```powershell
+$ChatProject = Join-Path $ManualRoot "chat-wave-project"
+New-Item -ItemType Directory -Force -Path $ChatProject | Out-Null
+Set-Content -LiteralPath (Join-Path $ChatProject "marker.txt") -Value "moon-marker"
+```
+
+### Event-driven one-shot CLI parity
+
+**Current check**
+
+Run the same deterministic one-shot request before and after routing the agent
+through `run_agent_events(...)` and `ConsoleRenderer`. Exercise a read-only
+request, an edit request with a denied approval, an approved validation, a
+Docker command, and `--show-usage`.
+
+**Expected result**
+
+The console keeps its current concise output, exit behavior, task-profile
+routing, safety decisions, and final-summary content. Events are ordered,
+versioned, JSON-serializable, bounded, and redacted; each has session and turn
+identity. The console consumes events directly rather than parsing previously
+formatted terminal text, and the session JSONL remains the persistent record.
+
+### Approval provider behavior
+
+**Current check**
+
+Repeat the existing default, yes, plan, no-command, dependency-install,
+dangerous-command, local-warning, Docker-warning, Git, MCP, plugin, and browser
+approval cases through `CliApprovalProvider`. Repeat representative allow and
+deny cases through `TextualApprovalProvider`.
+
+**Expected result**
+
+Low-level tools and runners do not call `input()` directly. Each pending
+approval emits `permission.requested`, pauses the action, and resolves exactly
+once with a matching `permission.resolved` event. Existing permission modes,
+targeted local warnings, Docker wording, hard denials, and dependency-install
+gating remain unchanged. Decisions are redacted and appended to the session
+JSONL.
+
+### Textual missing-dependency message
+
+**Current check**
+
+In a fresh environment that has LunarForge but not the `tui` extra, run:
+
+```powershell
+lunar-forge chat --project $ChatProject
+```
+
+**Expected result**
+
+The command exits cleanly with a short message that Textual is optional and
+includes `python -m pip install -e ".[tui]"`. It does not show an import
+traceback, install anything automatically, or affect the existing one-shot CLI.
+
+### Textual multi-turn chat smoke test
+
+**Current check**
+
+```powershell
+python -m pip install -e ".[tui]"
+lunar-forge chat --project $ChatProject
+```
+
+Submit two turns in the same app:
+
+```text
+Read marker.txt and remember its value. Do not edit files or run commands.
+What value did you read in the previous turn? Do not call tools.
+```
+
+Then run `/status` and `/exit`.
+
+**Expected result**
+
+The second turn answers `moon-marker` from live conversation memory. The
+transcript, status, tool activity, and any approval UI are driven by the shared
+event stream. Both turns are appended to one project-local JSONL session, no
+hidden reasoning appears, and closing the app does not break one-shot mode.
+
+### Textual session resume
+
+**Current check**
+
+Start a chat, establish a harmless fact, exit, and resume it:
+
+```powershell
+lunar-forge chat --project $ChatProject
+lunar-forge chat --resume latest --project $ChatProject
+```
+
+Ask for the fact from the earlier chat without allowing new tool calls.
+
+**Expected result**
+
+The resumed UI loads bounded, redacted conversation context from the latest
+compatible project session and identifies the prior session in the new JSONL
+record. Historical tool calls remain inert and are not replayed. New turns and
+approval decisions continue to be persisted through the same session system
+used by one-shot mode.
+
+### Working-memory compaction
+
+**Status: later, after continuous chat works**
+
+Configure deliberately low supported test thresholds for
+`ui.chat.compact_at_tokens` and `ui.chat.compact_to_tokens`, then continue a
+multi-turn chat until compaction triggers.
+
+**Expected result**
+
+The event stream emits one ordered `memory.compaction.started` /
+`memory.compaction.finished` pair. A bounded, redacted summary is written under
+`.agent/summaries/` and references the source event through which it was built.
+The live context retains the current goal, user constraints, project and
+permission modes, changed files, validation state, approvals, and open work
+while dropping stale bulk output. The original session JSONL remains the source
+of truth, no historical actions are replayed, and secrets or hidden reasoning
+are absent from both events and summaries.
 
 ## Repository validation after documentation changes
 

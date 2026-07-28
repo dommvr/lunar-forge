@@ -148,6 +148,41 @@ The effective precedence is CLI flag, project `.agent/config.yaml`, user
 clear warning and continue without sending reasoning effort. LunarForge does
 not request reasoning summaries and never exposes hidden reasoning content.
 
+### Event-driven Textual chat
+
+The event, renderer, approval-provider, and first Textual chat phases are
+implemented. `run_agent_events(...)` emits versioned, bounded, redacted events;
+the one-shot CLI consumes them through `ConsoleRenderer`; and the optional
+Textual UI keeps multiple turns in one live conversation and one project-local
+JSONL session. `--resume latest` loads bounded, inert conversation context from
+the newest compatible session and writes new activity to a new session that
+references it.
+
+Textual remains an optional extra. Install and start it with:
+
+```bash
+python -m pip install -e ".[tui]"
+lunar-forge chat --project <path>
+lunar-forge chat --resume latest --project <path>
+```
+
+The current chat UI provides a transcript, activity status, compact tool log,
+interactive approvals, an input box, a runtime footer, and `/help`, `/status`,
+`/clear`, and `/exit`. The planned later chat configuration is:
+
+```yaml
+ui:
+  chat:
+    auto_resume: false
+    compact_at_tokens: 120000
+    compact_to_tokens: 12000
+    show_tool_details: true
+```
+
+The one-shot CLI continues to work without the `tui` extra. Working-memory
+compaction follows in a later wave. A web demo and cloud sandbox are not
+implemented here.
+
 ### Experimental MCP integration
 
 MCP support is experimental and disabled by default. It uses two explicit

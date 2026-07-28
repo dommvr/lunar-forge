@@ -3,6 +3,7 @@ from importlib import import_module
 
 import pytest
 
+from lunar_forge.approvals import CliApprovalProvider
 from lunar_forge.permissions import (
     PermissionDecision,
     PermissionLevel,
@@ -138,6 +139,7 @@ def test_first_local_prompt_is_full_and_second_ordinary_prompt_is_short(
     )
     manager = PermissionManager(
         mode="default",
+        approval_provider=CliApprovalProvider(),
         runtime_mode="local",
         project_trust="trusted",
     )
@@ -319,7 +321,10 @@ def test_docker_approval_uses_container_wording_without_local_warning(
         "builtins.input",
         lambda prompt: prompts.append(prompt) or "n",
     )
-    manager = PermissionManager(runtime_mode="docker")
+    manager = PermissionManager(
+        approval_provider=CliApprovalProvider(),
+        runtime_mode="docker",
+    )
 
     manager.authorize(
         PermissionLevel.EXECUTE,
