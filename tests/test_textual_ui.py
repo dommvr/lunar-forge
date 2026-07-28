@@ -16,7 +16,7 @@ from lunar_forge.approvals import (
     TextualApprovalProvider,
 )
 from lunar_forge.cli import TEXTUAL_INSTALL_MESSAGE, app
-from lunar_forge.config import AppConfig
+from lunar_forge.config import AppConfig, PermissionConfig, RuntimeConfig
 from lunar_forge.events import EventFactory, EventType
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.runtime.sessions import create_session_logger, load_session
@@ -418,26 +418,160 @@ def test_chat_controller_resumes_history_into_a_new_linked_session(tmp_path):
     previous = load_session(tmp_path, "latest")
     model = _SequenceModel((ModelResponse(text="Copernicus."),))
 
+    current_config = AppConfig(
+        runtime=RuntimeConfig(mode="docker"),
+        permissions=PermissionConfig(mode="no-command"),
+    )
+    rendered_events = []
     controller = TextualChatController(
         tmp_path,
-        AppConfig(),
+        current_config,
         DenyApprovalProvider(),
         previous_session=previous,
         model_client=model,
     )
-    result = controller.send_turn("What name did I ask you to remember?")
+    result = controller.send_turn(
+        "What name did I ask you to remember?",
+        event_callback=rendered_events.append,
+    )
 
     assert result.final_text == "Copernicus."
     assert controller.session_path != previous.relative_path
+    assert controller.resumed_session_id == previous.session_id
+    assert previous.session_id in (controller.resume_notice or "")
+    status = controller.status_text()
+    assert f"Resumed from session: {previous.session_id}" in status
+    assert "Runtime mode: docker" in status
+    assert "Permission mode: no-command" in status
     assert any(
         "Remember Copernicus." in str(message.get("content"))
         for message in model.calls[0]["messages"]
     )
-    new_session_text = controller.session_logger.path.read_text(
-        encoding="utf-8"
-    )
+    resumed_events = [
+        event
+        for event in rendered_events
+        if event.type == EventType.SESSION_RESUMED.value
+    ]
+    assert len(resumed_events) == 1
+    assert resumed_events[0].payload["source_session_id"] == previous.session_id
+    assert resumed_events[0].payload["tool_calls_replayed"] is False
+    assert resumed_events[0].payload["approvals_reused"] is False
+    new_session_text = controller.session_logger.path.read_text(encoding="utf-8")
+    new_records = [
+        json.loads(line)
+        for line in new_session_text.splitlines()
+        if line.strip()
+    ]
     assert '"event":"session_resumed"' in new_session_text
     assert previous.relative_path in new_session_text
+    assert previous.session_id in new_session_text
+    assert new_records[0]["event"] == "session_started"
+    assert new_records[0]["data"]["runtime_mode"] == "docker"
+    assert new_records[0]["data"]["permission_mode"] == "no-command"
+
+
+def test_textual_resume_requires_fresh_approval_after_historical_grant(tmp_path):
+    class RecordingDenyProvider(DenyApprovalProvider):
+        def __init__(self):
+            self.requests = []
+
+        def request_approval(self, request):
+            self.requests.append(request)
+            return super().request_approval(request)
+
+    previous_logger = create_session_logger(tmp_path)
+    previous_logger.log(
+        "user_prompt",
+        prompt="Run python --version after approval.",
+    )
+    previous_logger.log(
+        "permission.resolved",
+        request_id="old_request",
+        approved=True,
+        source="cli",
+    )
+    previous_logger.log(
+        "assistant_message",
+        text="The old request was approved.",
+    )
+    previous = load_session(
+        tmp_path,
+        previous_logger.path.name,
+        require_resumable=True,
+    )
+    provider = RecordingDenyProvider()
+    model = _SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="call_fresh_approval",
+                        name="run_command",
+                        arguments={"command": "python --version"},
+                    ),
+                )
+            ),
+            ModelResponse(text="The fresh request was denied."),
+        )
+    )
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        provider,
+        previous_session=previous,
+        model_client=model,
+    )
+
+    result = controller.send_turn(
+        "Use run_command to run python --version. Do not edit files."
+    )
+
+    assert result.final_text == "The fresh request was denied."
+    assert len(provider.requests) == 1
+    assert provider.requests[0].id != "old_request"
+    assert all(
+        "old_request" not in message["content"]
+        for message in previous.messages
+    )
+    new_records = [
+        json.loads(line)
+        for line in controller.session_logger.path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    decisions = [
+        record
+        for record in new_records
+        if record["event"] == "permission.resolved"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0]["data"]["approved"] is False
+
+
+def test_textual_controller_refuses_loaded_session_from_another_project(
+    tmp_path,
+):
+    first_project = tmp_path / "first"
+    second_project = tmp_path / "second"
+    first_project.mkdir()
+    second_project.mkdir()
+    previous_logger = create_session_logger(first_project)
+    previous_logger.log("user_prompt", prompt="First project context.")
+    previous = load_session(
+        first_project,
+        previous_logger.path.name,
+        require_resumable=True,
+    )
+
+    with pytest.raises(ValueError, match="belongs to another project"):
+        TextualChatController(
+            second_project,
+            AppConfig(),
+            DenyApprovalProvider(),
+            previous_session=previous,
+        )
 
 
 def test_textual_approval_provider_approves_and_denies():

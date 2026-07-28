@@ -22,6 +22,7 @@ from lunar_forge.runtime.sessions import (
     LoadedSession,
     SessionLogger,
     create_session_logger,
+    project_fingerprint,
 )
 
 
@@ -53,7 +54,21 @@ class TextualEventRenderer:
         if event.type == EventType.SESSION_STARTED.value:
             return TextualRenderUpdate(status="Session started")
         if event.type == EventType.SESSION_RESUMED.value:
-            return TextualRenderUpdate(status="Session resumed")
+            source_session_id = _first_text(
+                payload,
+                "source_session_id",
+                "source_session",
+            )
+            return TextualRenderUpdate(
+                status=_bounded_text(
+                    (
+                        f"Session resumed from {source_session_id}"
+                        if source_session_id
+                        else "Session resumed"
+                    ),
+                    MAX_TEXTUAL_STATUS_CHARACTERS,
+                )
+            )
         if event.type == EventType.TURN_STARTED.value:
             return TextualRenderUpdate(status="Working...")
         if event.type == EventType.STATUS_UPDATED.value:
@@ -256,6 +271,19 @@ class TextualChatController:
             raise NotADirectoryError(
                 f"Project root is not a directory: {self.project_root}"
             )
+        if (
+            previous_session is not None
+            and previous_session.project_root.resolve() != self.project_root
+        ):
+            raise ValueError(
+                "Resumed session belongs to another project and cannot be "
+                "opened in this chat."
+            )
+        if previous_session is not None and len(previous_session.messages) <= 1:
+            raise ValueError(
+                "Session is incompatible with chat resume: it contains no "
+                "safe conversation context."
+            )
         self.config = config
         self.approval_provider = approval_provider
         self.model_client = model_client
@@ -266,10 +294,20 @@ class TextualChatController:
                 previous_session.messages if previous_session is not None else ()
             )
         ]
-        self._resumed_from = (
+        self._resumed_from_path = (
             previous_session.relative_path
             if previous_session is not None
             else None
+        )
+        self._resumed_from_session_id = (
+            previous_session.session_id
+            if previous_session is not None
+            else None
+        )
+        self._resumed_context_messages = (
+            len(previous_session.messages)
+            if previous_session is not None
+            else 0
         )
         self._session_started = False
         self.turn_count = 0
@@ -282,9 +320,26 @@ class TextualChatController:
                 else create_session_logger(self.project_root)
             )
         )
+        if (
+            self.session_logger is not None
+            and self.session_logger.project_root.resolve() != self.project_root
+        ):
+            raise ValueError(
+                "Chat session logger belongs to another project."
+            )
         self.event_factory = EventFactory(
             session_id=_chat_session_id(self.session_logger),
         )
+        if self.session_logger is not None:
+            self.session_logger.log(
+                "session_started",
+                session_id=self.session_id,
+                project_fingerprint=project_fingerprint(self.project_root),
+                runtime_mode=self.config.runtime.mode,
+                permission_mode=self.config.permissions.mode,
+                resumed_session_id=self._resumed_from_session_id,
+                resumed_session=self._resumed_from_path,
+            )
 
     @property
     def session_id(self) -> str:
@@ -295,6 +350,24 @@ class TextualChatController:
         if self.session_logger is None:
             return "disabled in plan mode"
         return self.session_logger.relative_path
+
+    @property
+    def resumed_session_id(self) -> str | None:
+        return self._resumed_from_session_id
+
+    @property
+    def resumed_session_path(self) -> str | None:
+        return self._resumed_from_path
+
+    @property
+    def resume_notice(self) -> str | None:
+        if self._resumed_from_session_id is None:
+            return None
+        return (
+            f"Resumed safe conversation context from "
+            f"{self._resumed_from_session_id}. Historical tool calls were not "
+            "replayed, and prior approvals were not reused."
+        )
 
     @property
     def conversation_messages(self) -> tuple[dict[str, str], ...]:
@@ -312,16 +385,28 @@ class TextualChatController:
         )
 
     def status_text(self) -> str:
-        return (
-            f"Project: {self.project_root}\n"
-            f"Model: {self.config.model.model}\n"
-            f"Reasoning effort: {self.config.model.reasoning.effort}\n"
-            f"Runtime mode: {self.config.runtime.mode}\n"
-            f"Permission mode: {self.config.permissions.mode}\n"
-            f"Session: {self.session_id}\n"
-            f"Session log: {self.session_path}\n"
-            f"Completed turns: {self.turn_count}"
-        )
+        lines = [
+            f"Project: {self.project_root}",
+            f"Model: {self.config.model.model}",
+            f"Reasoning effort: {self.config.model.reasoning.effort}",
+            f"Runtime mode: {self.config.runtime.mode}",
+            f"Permission mode: {self.config.permissions.mode}",
+            f"Session: {self.session_id}",
+            f"Session log: {self.session_path}",
+            f"Completed turns: {self.turn_count}",
+        ]
+        if self._resumed_from_session_id is not None:
+            lines.extend(
+                (
+                    f"Resumed from session: {self._resumed_from_session_id}",
+                    f"Resumed source log: {self._resumed_from_path}",
+                    (
+                        "Historical context messages: "
+                        f"{self._resumed_context_messages}"
+                    ),
+                )
+            )
+        return "\n".join(lines)
 
     def handle_slash_command(self, value: str) -> SlashCommandResult:
         command = value.strip().casefold()
@@ -379,7 +464,7 @@ class TextualChatController:
                     approval_provider=self.approval_provider,
                     resume_messages=prior_messages,
                     resumed_from=(
-                        self._resumed_from
+                        self._resumed_from_path
                         if not self._session_started
                         else None
                     ),
@@ -403,7 +488,6 @@ class TextualChatController:
                     {"role": "user", "content": normalized_prompt}
                 )
                 self._session_started = True
-                self._resumed_from = None
                 raise
 
             if final_text is None:
@@ -411,7 +495,6 @@ class TextualChatController:
                     {"role": "user", "content": normalized_prompt}
                 )
                 self._session_started = True
-                self._resumed_from = None
                 raise RuntimeError(
                     "Agent turn completed without a final assistant event."
                 )
@@ -423,7 +506,6 @@ class TextualChatController:
                 )
             )
             self._session_started = True
-            self._resumed_from = None
             self.turn_count += 1
             return ChatTurnResult(
                 final_text=final_text,

@@ -19,6 +19,8 @@ from lunar_forge.runtime.sessions import (
     format_session_summary,
     load_session,
     list_session_files,
+    project_fingerprint,
+    resolve_session_file,
     summarize_session,
 )
 
@@ -404,6 +406,185 @@ def test_load_session_redacts_and_reconstructs_inert_history(tmp_path):
     assert environment_secret not in formatted
     assert filename_secret not in formatted
     assert "never replayed" in formatted
+
+
+def test_resume_latest_selects_latest_session_for_selected_project(tmp_path):
+    older = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": "Older discussion"},
+            }
+        ],
+        name="20260720T100000000000Z-11111111.jsonl",
+    )
+    newer = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-21T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": "Newest discussion"},
+            }
+        ],
+        name="20260721T100000000000Z-22222222.jsonl",
+    )
+
+    loaded = load_session(tmp_path, "latest", require_resumable=True)
+
+    assert loaded.path == newer
+    assert loaded.path != older
+    assert any(
+        "Newest discussion" in message["content"]
+        for message in loaded.messages
+    )
+
+
+def test_resume_latest_fails_for_ambiguous_or_incompatible_session(tmp_path):
+    events = [
+        {
+            "timestamp": "2026-07-21T10:00:00Z",
+            "event": "user_prompt",
+            "data": {"prompt": "A discussion"},
+        }
+    ]
+    _write_previous_session(
+        tmp_path,
+        events,
+        name="20260721T100000000000Z-11111111.jsonl",
+    )
+    _write_previous_session(
+        tmp_path,
+        events,
+        name="20260721T100000000000Z-22222222.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="Latest session is ambiguous"):
+        resolve_session_file(tmp_path, "latest")
+
+    for path in (tmp_path / ".agent" / "sessions").glob("*.jsonl"):
+        path.unlink()
+    _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-22T10:00:00Z",
+                "event": "model_usage",
+                "data": {"input_tokens": 1, "output_tokens": 1},
+            }
+        ],
+        name="20260722T100000000000Z-33333333.jsonl",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Latest session is incompatible with chat resume",
+    ):
+        load_session(tmp_path, "latest", require_resumable=True)
+
+
+def test_resume_refuses_session_bound_to_another_project(tmp_path):
+    first_project = tmp_path / "first"
+    second_project = tmp_path / "second"
+    first_project.mkdir()
+    second_project.mkdir()
+    logger = create_session_logger(first_project, environ={})
+    logger.log(
+        "session_started",
+        project_fingerprint=project_fingerprint(first_project),
+    )
+    logger.log("user_prompt", prompt="First-project discussion")
+
+    copied_directory = second_project / ".agent" / "sessions"
+    copied_directory.mkdir(parents=True)
+    copied = copied_directory / logger.path.name
+    copied.write_text(logger.path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="belongs to another project"):
+        load_session(second_project, copied.name, require_resumable=True)
+
+
+def test_resume_loads_bounded_compacted_summary_as_inert_context(tmp_path):
+    secret = "resume-summary-secret-value"
+    hidden_reasoning = "private scratchpad must not be resumed"
+    logger = create_session_logger(tmp_path, environ={})
+    logger.log("user_prompt", prompt="Discuss the crater map.")
+    summaries_directory = tmp_path / ".agent" / "summaries"
+    summaries_directory.mkdir(parents=True)
+    summary_path = summaries_directory / f"{logger.path.stem}.summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": logger.path.stem,
+                "source_events_through": "evt_previous",
+                "created_at": "2026-07-22T10:00:00Z",
+                "summary": f"Mapped Tycho. token={secret}",
+                "facts": {
+                    "project_fingerprint": project_fingerprint(tmp_path),
+                    "runtime_mode": "docker",
+                    "permission_mode": "yes",
+                    "approval_decisions": [
+                        {"request_id": "old_request", "approved": True}
+                    ],
+                    "hidden_reasoning": hidden_reasoning,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_session(
+        tmp_path,
+        logger.path.name,
+        environ={"OLD_SECRET": secret},
+        require_resumable=True,
+    )
+    serialized = json.dumps(loaded.messages)
+
+    assert len(loaded.compacted_summaries) == 1
+    assert "Historical compacted summary; context only" in serialized
+    assert "does not authorize a new action" in serialized
+    assert secret not in serialized
+    assert hidden_reasoning not in serialized
+    assert REDACTED in serialized
+
+
+def test_resume_ignores_historical_approval_grants(tmp_path):
+    session_file = _write_previous_session(
+        tmp_path,
+        [
+            {
+                "timestamp": "2026-07-20T10:00:00Z",
+                "event": "user_prompt",
+                "data": {"prompt": "Run a safe command."},
+            },
+            {
+                "timestamp": "2026-07-20T10:00:01Z",
+                "event": "permission.resolved",
+                "data": {
+                    "request_id": "old_request",
+                    "approved": True,
+                    "source": "cli",
+                },
+            },
+        ],
+    )
+
+    loaded = load_session(
+        tmp_path,
+        session_file.name,
+        environ={},
+        require_resumable=True,
+    )
+    serialized = json.dumps(loaded.messages)
+
+    assert "old_request" not in serialized
+    assert "Historical approvals and permission decisions do not authorize" in (
+        serialized
+    )
 
 
 def test_load_session_blocks_paths_outside_session_directory(tmp_path):

@@ -225,7 +225,11 @@ def chat_command(
     try:
         config = load_config(project_root)
         previous_session = (
-            load_session(project_root, resume)
+            load_session(
+                project_root,
+                resume,
+                require_resumable=True,
+            )
             if resume is not None
             else None
         )

@@ -470,6 +470,7 @@ class CodeAgent:
                 session,
                 "session_resumed",
                 source_session=resumed_from,
+                source_session_id=_resumed_session_id(resumed_from),
             )
         _log_session(session, "user_prompt", prompt=request)
         approval_event_callback = _session_approval_event_callback(session)
@@ -2173,6 +2174,8 @@ def run_agent_events(
             {
                 "project_root": str(root),
                 "mode": mode,
+                "runtime_mode": resolved_config.runtime.mode,
+                "permission_mode": mode,
                 "resumed": resumed_from is not None,
             },
         )
@@ -2180,7 +2183,13 @@ def run_agent_events(
     if resumed_from is not None and emit_session_started:
         yield factory.create(
             EventType.SESSION_RESUMED,
-            {"source_session": resumed_from},
+            {
+                "source_session": resumed_from,
+                "source_session_id": _resumed_session_id(resumed_from),
+                "historical_context_messages": len(resume_messages),
+                "approvals_reused": False,
+                "tool_calls_replayed": False,
+            },
             parent_event_id=(
                 session_event.event_id if session_event is not None else None
             ),
@@ -3111,6 +3120,11 @@ def _resume_history_messages(
             continue
         historical_messages.append({"role": role, "content": content})
     return historical_messages
+
+
+def _resumed_session_id(resumed_from: str) -> str:
+    stem = Path(resumed_from).stem
+    return stem if stem.startswith("session_") else f"session_{stem}"
 
 
 def _assistant_tool_message(

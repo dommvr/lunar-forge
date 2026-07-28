@@ -169,6 +169,11 @@ class LunarForgeTextualApp(App[None]):
             "system",
             "Ready. Type /help for chat commands.",
         )
+        if self.controller.resume_notice is not None:
+            self._write_transcript(
+                "system",
+                self.controller.resume_notice,
+            )
         self.query_one("#chat-input", Input).focus()
 
     @on(Input.Submitted, "#chat-input")
