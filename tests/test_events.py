@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -15,6 +16,7 @@ from lunar_forge.events import (
     REDACTED,
     SCHEMA_VERSION,
     deserialize_event,
+    events_from_session_record,
     serialize_event,
 )
 from lunar_forge.model_clients import ModelResponse, ModelUsage, ToolCall
@@ -110,6 +112,8 @@ def test_initial_event_type_values_are_stable():
         "git.proposal",
         "git.commit.created",
         "git.commit.skipped",
+        "memory.compaction.started",
+        "memory.compaction.finished",
         "error",
     }
 
@@ -174,6 +178,36 @@ def test_event_payload_is_bounded_and_replaces_non_json_objects():
         "[unsupported event value: TerminalObject]"
     )
     json.loads(serialized)
+
+
+def test_browser_artifact_reference_is_a_plain_serializable_record():
+    events = events_from_session_record(
+        _factory(environment={}),
+        "tool_result",
+        {
+            "name": "run_browser_validation",
+            "id": "browser-call",
+            "result": {
+                "ok": True,
+                "screenshot_path": Path(
+                    ".agent/artifacts/browser/page.png"
+                ),
+            },
+        },
+    )
+    browser_event = next(
+        event
+        for event in events
+        if event.type == EventType.BROWSER_FINISHED.value
+    )
+
+    assert browser_event.payload["artifact_path"] == str(
+        Path(".agent/artifacts/browser/page.png")
+    )
+    assert isinstance(browser_event.payload["artifact_path"], str)
+    assert json.loads(browser_event.to_json())["payload"] == dict(
+        browser_event.payload
+    )
 
 
 def test_run_agent_events_wraps_existing_one_shot_result(tmp_path):

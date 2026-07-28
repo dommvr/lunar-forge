@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from lunar_forge.events import sanitize_event_payload
+
 
 APPROVAL_KINDS = frozenset(
     {
@@ -97,22 +99,24 @@ class ApprovalRequest:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a detached, JSON-compatible event payload."""
-        return {
-            "id": self.id,
-            "request_id": self.id,
-            "kind": self.kind,
-            "title": self.title,
-            "summary": self.summary,
-            "details": self.details,
-            "risk": self.risk,
-            "mode": self.mode,
-            "default": self.default,
-            "command": self.command,
-            "tool_name": self.tool_name,
-            "file_path": self.file_path,
-            "metadata": dict(self.metadata),
-        }
+        """Return a detached, bounded, and redacted transport payload."""
+        return sanitize_event_payload(
+            {
+                "id": self.id,
+                "request_id": self.id,
+                "kind": self.kind,
+                "title": self.title,
+                "summary": self.summary,
+                "details": self.details,
+                "risk": self.risk,
+                "mode": self.mode,
+                "default": self.default,
+                "command": self.command,
+                "tool_name": self.tool_name,
+                "file_path": self.file_path,
+                "metadata": dict(self.metadata),
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,15 +160,17 @@ class ApprovalDecision:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a plain event/session payload."""
-        return {
-            "request_id": self.request_id,
-            "approved": self.approved,
-            "allowed": self.approved,
-            "reason": self.reason,
-            "decided_at": self.decided_at,
-            "source": self.source,
-        }
+        """Return a bounded and redacted plain event/session payload."""
+        return sanitize_event_payload(
+            {
+                "request_id": self.request_id,
+                "approved": self.approved,
+                "allowed": self.approved,
+                "reason": self.reason,
+                "decided_at": self.decided_at,
+                "source": self.source,
+            }
+        )
 
 
 @runtime_checkable

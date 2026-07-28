@@ -1,7 +1,9 @@
 import json
+from pathlib import Path
 
 from lunar_forge.agent import run_agent_events
 from lunar_forge.approvals import (
+    ApprovalDecision,
     ApprovalRequest,
     AutoApprovalProvider,
     CliApprovalProvider,
@@ -154,6 +156,44 @@ def test_deny_provider_denies_requested_operation():
     assert decision.request_id == request.id
     assert decision.approved is False
     assert decision.source == "deny"
+
+
+def test_approval_transport_payloads_are_plain_bounded_and_redacted():
+    secret = "sk-approval-transport-secret-12345678"
+    request = _request(
+        command=f"tool --token {secret}",
+        metadata={
+            "artifact": Path(".agent/artifacts/browser/page.png"),
+            "api_key": secret,
+            "widget": object(),
+        },
+    )
+    decision = ApprovalDecision.create(
+        request.id,
+        approved=False,
+        reason=f"Denied because token={secret}",
+        source="deny",
+    )
+
+    request_payload = request.to_dict()
+    decision_payload = decision.to_dict()
+    serialized = json.dumps(
+        {
+            "request": request_payload,
+            "decision": decision_payload,
+        }
+    )
+
+    assert secret not in serialized
+    assert request_payload["metadata"]["artifact"] == str(
+        Path(".agent/artifacts/browser/page.png")
+    )
+    assert request_payload["metadata"]["api_key"] == "[REDACTED]"
+    assert request_payload["metadata"]["widget"] == (
+        "[unsupported event value: object]"
+    )
+    assert decision_payload["approved"] is False
+    assert len(json.dumps(request_payload)) <= MAX_EVENT_PAYLOAD_CHARACTERS
 
 
 def test_dangerous_command_is_blocked_before_provider():

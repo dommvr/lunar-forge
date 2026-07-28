@@ -67,7 +67,8 @@ are all current pass/fail checks.
 - [x] Textual missing-dependency message
 - [x] Textual multi-turn chat smoke test
 - [x] Textual session resume
-- [ ] Working-memory compaction (later wave)
+- [x] Working-memory compaction
+- [x] Event/web-cloud transport hardening
 - [ ] Repository validation after documentation changes
 
 ## 1. Install and CLI availability
@@ -2404,151 +2405,343 @@ approval appears, and Python is not executed.
 Remove-Item -Recurse -Force -LiteralPath $ExecutionProject
 ```
 
-## Event-driven chat: manual tests and later placeholders
+## Event, Textual, resume, and compaction hardening
 
-The event, renderer, approval-provider, and first Textual chat cases are current.
-Working-memory compaction remains a later placeholder. Run the current checks in
-the order below; the existing CLI, permission, local/Docker, session, and Git
-tests above remain the regression suite throughout the refactor.
+This wave is implemented. Use the commands below to check the shared event
+protocol, one-shot parity, UI-independent approvals, optional Textual UI,
+resumable chat, and working-memory compaction without creating runtime files in
+the LunarForge repository.
 
-Disposable-project setup:
+Create a unique disposable project outside the repository:
 
 ```powershell
-$ChatProject = Join-Path $ManualRoot "chat-wave-project"
-New-Item -ItemType Directory -Force -Path $ChatProject | Out-Null
-Set-Content -LiteralPath (Join-Path $ChatProject "marker.txt") -Value "moon-marker"
+$ChatProject = Join-Path $ManualRoot ("chat-wave-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path (Join-Path $ChatProject ".agent") | Out-Null
+Set-Content -LiteralPath (Join-Path $ChatProject "marker.txt") -Value "moon-marker" -Encoding utf8
+Set-Content -LiteralPath (Join-Path $ChatProject "probe.py") -Value 'print("probe-ok")' -Encoding utf8
+git -C $ChatProject init
+git -C $ChatProject config user.name "LunarForge Manual Test"
+git -C $ChatProject config user.email "lunar-forge@example.invalid"
+git -C $ChatProject add marker.txt probe.py
+git -C $ChatProject commit -m "Initial fixture"
 ```
+
+### Deterministic hardening smoke matrix
+
+Run the model-free regression matrix from the LunarForge repository root. These
+tests use pytest temporary projects and fake model clients; they do not use an
+API key or replay historical actions.
+
+```powershell
+python -m pytest -q `
+  tests/test_events.py `
+  tests/test_approvals.py `
+  tests/test_textual_ui.py `
+  tests/test_sessions.py `
+  tests/test_compaction.py `
+  tests/test_readonly_fast_path.py `
+  tests/test_validation.py `
+  tests/test_no_edit_routing.py `
+  tests/test_git.py `
+  tests/test_docker_runner.py
+```
+
+Expected: pytest exits `0`. All selected tests pass; Textual pilot tests may be
+reported as skipped when the optional dependency is absent. The matrix covers:
+
+- read-only, edit, validation, Docker-command, Git-gating, and usage parity;
+- stable schema version `1`, JSON round trips, payload limits, secret and
+  hidden-reasoning redaction, and plain artifact references;
+- CLI full/short local warnings, Docker wording, dangerous-command pre-denial,
+  plan/no-command denial, and transport-neutral approval records;
+- missing Textual, basic mount, two turns, command approval, and slash commands;
+- latest-session selection, project binding, inert historical tools, and fresh
+  approvals; and
+- low-threshold compaction, persistent summaries, and summary-aware resume.
+
+### Event protocol and future transport check
+
+Run this direct protocol probe:
+
+```powershell
+@'
+import json
+from pathlib import Path
+from lunar_forge.events import EventFactory, EventType, MAX_EVENT_PAYLOAD_CHARACTERS
+
+event = EventFactory(
+    session_id="session_manual",
+    turn_id="turn_manual",
+    environment={"OPENAI_API_KEY": "sk-event-manual-secret-12345678"},
+).create(
+    EventType.BROWSER_FINISHED,
+    {
+        "artifact": {
+            "kind": "browser.screenshot",
+            "path": Path(".agent/artifacts/browser/page.png"),
+        },
+        "api_key": "sk-event-manual-secret-12345678",
+        "hidden_reasoning": "private scratchpad",
+        "output": "x" * (MAX_EVENT_PAYLOAD_CHARACTERS + 1000),
+    },
+)
+record = json.loads(event.to_json())
+serialized = json.dumps(record)
+print(record["schema_version"], record["type"])
+print(type(record["payload"].get("artifact", {}).get("path")).__name__)
+print("secret-present", "sk-event-manual-secret" in serialized)
+print("reasoning-present", "private scratchpad" in serialized)
+print("bounded", len(json.dumps(record["payload"])) <= MAX_EVENT_PAYLOAD_CHARACTERS)
+'@ | python -
+```
+
+Expected output:
+
+```text
+1 browser.finished
+str
+secret-present False
+reasoning-present False
+bounded True
+```
+
+The large output is truncated while the normally sized artifact path remains a
+plain string. Core event modules must not import Rich or Textual, and approval
+payloads must remain ordinary JSON dictionaries suitable for a future
+WebSocket or SSE adapter.
 
 ### Event-driven one-shot CLI parity
 
-**Current check**
+These commands require a configured model. Run them in order:
 
-Run the same deterministic one-shot request before and after routing the agent
-through `run_agent_events(...)` and `ConsoleRenderer`. Exercise a read-only
-request, an edit request with a denied approval, an approved validation, a
-Docker command, and `--show-usage`.
+```powershell
+lunar-forge --project $ChatProject "Read marker.txt and report its value. Do not edit files or run commands."
+lunar-forge --project $ChatProject "Use write_file to create edit-result.txt containing event-parity. Do not run commands."
+lunar-forge --project $ChatProject "Use run_validation to validate this Python project. Do not edit files."
+lunar-forge --reasoning-effort high --show-usage --project $ChatProject "Explain marker.txt in one sentence. Do not edit files or run commands."
+lunar-forge --docker --project $ChatProject "Use run_command to run pwd. Include stdout. Do not edit files."
+lunar-forge --project $ChatProject --commit --commit-message "Add commit parity result" "Use write_file to create commit-result.txt containing commit-parity. Do not run commands."
+```
 
-**Expected result**
+Expected:
 
-The console keeps its current concise output, exit behavior, task-profile
-routing, safety decisions, and final-summary content. Events are ordered,
-versioned, JSON-serializable, bounded, and redacted; each has session and turn
-identity. The console consumes events directly rather than parsing previously
-formatted terminal text, and the session JSONL remains the persistent record.
+- read-only output reports `moon-marker` without edit or command approval;
+- the edit asks approval once, creates `edit-result.txt` only after `y`, and
+  reports its changed-file state in the existing concise final shape;
+- validation displays its approval and result before any later Git proposal;
+- usage includes `Reasoning effort: high`;
+- Docker wording says `Run Docker command`, mentions
+  `lunar-forge-sandbox` and `/workspace`, and approved `pwd` reports
+  `/workspace`; and
+- the commit proposal excludes `.agent/`, requires separate approval, and an
+  approved result commits `commit-result.txt` and ends with `Git:` and
+  `Commit created: <hash>`.
 
-### Approval provider behavior
+Each non-plan run writes its project-local JSONL session. The public event
+stream adds no `Working...` or tool chatter to the quiet one-shot final answer.
 
-**Current check**
+### Approval-provider behavior
 
-Repeat the existing default, yes, plan, no-command, dependency-install,
-dangerous-command, local-warning, Docker-warning, Git, MCP, plugin, and browser
-approval cases through `CliApprovalProvider`. Repeat representative allow and
-deny cases through `TextualApprovalProvider`.
+Use one turn for the first/second local-warning state:
 
-**Expected result**
+```powershell
+lunar-forge --project $ChatProject "Use run_command to run python --version, then use run_command to run git --version. Do not edit files."
+lunar-forge --project $ChatProject "Use run_command to run sudo python --version. Do not edit files."
+lunar-forge --plan --project $ChatProject "Use run_command to run python --version and write blocked.txt. Do not edit any other files."
+@'
+runtime:
+  mode: no-command
+permissions:
+  mode: no-command
+'@ | Set-Content -LiteralPath (Join-Path $ChatProject ".agent\config.yaml") -Encoding utf8
+lunar-forge --project $ChatProject "Use run_command to run python --version. Do not edit files."
+```
 
-Low-level tools and runners do not call `input()` directly. Each pending
-approval emits `permission.requested`, pauses the action, and resolves exactly
-once with a matching `permission.resolved` event. Existing permission modes,
-targeted local warnings, Docker wording, hard denials, and dependency-install
-gating remain unchanged. Decisions are redacted and appended to the session
-JSONL.
+Expected:
+
+- the first ordinary local command includes `not OS-level isolation`;
+- the second ordinary local command uses the single-line short prompt;
+- `sudo` is blocked before any approval provider is called;
+- plan mode emits no approval and performs neither command nor write; and
+- no-command mode emits no command approval and runs no subprocess.
+
+The session log for approved or denied interactive requests contains one
+bounded `permission.requested` and one correlated `permission.resolved`.
+Dependency installs, risky allowed commands, Docker commands, and Git commits
+retain the dedicated wording and gating documented in the preceding safety and
+Git sections.
+
+Restore the ordinary local/default config before continuing:
+
+```powershell
+@'
+runtime:
+  mode: local
+  project_trust: trusted
+permissions:
+  mode: default
+'@ | Set-Content -LiteralPath (Join-Path $ChatProject ".agent\config.yaml") -Encoding utf8
+```
 
 ### Textual missing-dependency message
 
-**Current check**
-
-In a fresh environment that has LunarForge but not the `tui` extra, run:
+Create a core-only virtual environment and run chat without installing `tui`:
 
 ```powershell
-lunar-forge chat --project $ChatProject
+$CoreOnlyVenv = Join-Path $ManualRoot "lf-core-only"
+python -m venv $CoreOnlyVenv
+$CoreOnlyPython = Join-Path $CoreOnlyVenv "Scripts\python.exe"
+& $CoreOnlyPython -m pip install -e .
+& $CoreOnlyPython -m lunar_forge.cli chat --project $ChatProject
 ```
 
-**Expected result**
+Expected exact message and a clean exit without a traceback:
 
-The command exits cleanly with a short message that Textual is optional and
-includes `python -m pip install -e ".[tui]"`. It does not show an import
-traceback, install anything automatically, or affect the existing one-shot CLI.
+```text
+Textual UI is not installed. Install it with: python -m pip install -e ".[tui]"
+```
 
-### Textual multi-turn chat smoke test
+Also run:
 
-**Current check**
+```powershell
+& $CoreOnlyPython -m lunar_forge.cli chat --help
+```
+
+Expected: help lists `--project` and `--resume` without importing Textual at
+CLI module-import time.
+
+### Textual startup, two turns, approval, and slash commands
+
+Install the optional extra in the development environment and start chat:
 
 ```powershell
 python -m pip install -e ".[tui]"
 lunar-forge chat --project $ChatProject
 ```
 
-Submit two turns in the same app:
+Enter:
 
 ```text
+/help
+/status
 Read marker.txt and remember its value. Do not edit files or run commands.
 What value did you read in the previous turn? Do not call tools.
+/clear
+Use run_command to run python --version. Do not edit files.
+/exit
 ```
 
-Then run `/status` and `/exit`.
+Expected:
 
-**Expected result**
+- the transcript, activity area, approval area, compact tool log, input, and
+  metadata footer mount without tabs;
+- the second turn answers `moon-marker` from the same in-process conversation;
+- `/help` lists the four slash commands, `/status` reports the current project,
+  model, reasoning effort, runtime/permission mode, and session, `/clear`
+  clears visible transcript state, and `/exit` closes cleanly;
+- `python --version` remains paused until the Textual approval is approved or
+  denied; and
+- hidden reasoning and unbounded tool output never appear.
 
-The second turn answers `moon-marker` from live conversation memory. The
-transcript, status, tool activity, and any approval UI are driven by the shared
-event stream. Both turns are appended to one project-local JSONL session, no
-hidden reasoning appears, and closing the app does not break one-shot mode.
+### Resumable Textual chat
 
-### Textual session resume
-
-**Current check**
-
-Start a chat, establish a harmless fact, exit, and resume it:
+After exiting the preceding chat, run:
 
 ```powershell
-lunar-forge chat --project $ChatProject
 lunar-forge chat --resume latest --project $ChatProject
 ```
 
-Ask for the fact from the earlier chat without allowing new tool calls.
+Enter:
 
-**Expected result**
+```text
+What harmless marker value did we discuss? Do not call tools.
+/status
+/exit
+```
 
-The resumed UI loads bounded, redacted conversation context from the latest
-compatible project session and identifies the prior session in the new JSONL
-record. Historical tool calls remain inert and are not replayed. New turns and
-approval decisions continue to be persisted through the same session system
-used by one-shot mode.
+Expected: the UI identifies the source session ID, answers `moon-marker` from
+bounded historical context, and `/status` includes the resumed-session
+metadata. The new session header references the source session. Historical tool
+calls are marked context-only and are never replayed; historical approval
+decisions never authorize a new action. Repeating the command with another
+project or an ambiguous partial ID fails clearly before chat starts.
 
-### Working-memory compaction
+### Working-memory compaction and resume
 
-**Current check**
+Set an intentionally low disposable-project threshold:
 
-In a disposable project's `.agent/config.yaml`, set:
-
-```yaml
+```powershell
+@'
+runtime:
+  mode: local
+  project_trust: trusted
+permissions:
+  mode: default
 ui:
   chat:
     compact_at_tokens: 200
     compact_to_tokens: 50
+'@ | Set-Content -LiteralPath (Join-Path $ChatProject ".agent\config.yaml") -Encoding utf8
+lunar-forge chat --project $ChatProject
 ```
 
-Start `lunar-forge chat --project $ChatProject`, send several harmless
-read-only messages, and watch the activity panel. After compaction, verify:
+Send several harmless read-only messages until activity reports compaction,
+then run `/status` and `/exit`. Inspect and resume:
 
 ```powershell
-Get-ChildItem -File -LiteralPath (Join-Path $ChatProject ".agent\summaries")
+$SummaryFile = Get-ChildItem -File -LiteralPath (Join-Path $ChatProject ".agent\summaries") |
+  Sort-Object LastWriteTimeUtc -Descending |
+  Select-Object -First 1
+$Summary = Get-Content -Raw -LiteralPath $SummaryFile.FullName | ConvertFrom-Json
+$Summary | Select-Object schema_version, session_id, source_events_through, source_event_count, summary
+$Summary.facts | Select-Object project_root, runtime_mode, permission_mode, model, reasoning_effort, changed_files, validation, open_items
+Select-String -Path $SummaryFile.FullName -Pattern "sk-|hidden_reasoning|chain.of.thought"
 lunar-forge chat --resume latest --project $ChatProject
 ```
 
-**Expected result**
+Expected:
 
-The event stream emits one ordered `memory.compaction.started` /
-`memory.compaction.finished` pair. A bounded, redacted summary is written under
-`.agent/summaries/` and references the source event through which it was built.
-The live context retains the current goal, user constraints, project and
-permission modes, changed files, validation state, approvals, and open work
-while dropping stale bulk output. The original session JSONL remains the source
-of truth, no historical actions are replayed, and secrets or hidden reasoning
-are absent from both events and summaries. `/status` reports the number of
-successful compactions and latest summary path. Resuming retains the compacted
-context plus recent turns.
+- activity receives one correlated `memory.compaction.started` /
+  `memory.compaction.finished` pair;
+- `.agent/summaries/<session-id>.summary.json` exists with schema version `1`,
+  a source-event boundary, bounded safe summary, retained facts, and recent
+  turns;
+- the secret/reasoning search returns no matches;
+- `/status` reports the compaction count and summary path; and
+- resumed chat retains the compacted goal/constraints/state plus recent turns
+  without replaying tools or approvals.
+
+If summarization fails, the activity area shows a clear warning and retains the
+uncompacted live context when safe. Plan-mode chat without a session log does
+not compact.
+
+### Runtime-artifact audit and cleanup
+
+Confirm no disposable project or generated runtime data is tracked:
+
+```powershell
+$TrackedRuntime = git -C $RepoRoot ls-files |
+  Where-Object { $_ -match '(^|/)\.agent/(sessions|summaries|checkpoints|artifacts)(/|$)' }
+if ($TrackedRuntime) {
+  throw "Tracked runtime files found: $($TrackedRuntime -join ', ')"
+}
+git -C $RepoRoot status --short --untracked-files=all
+```
+
+Expected: `$TrackedRuntime` is empty. Repository status contains only intended
+source, test, or documentation changes and no path beneath `$ManualRoot`.
+
+Before cleanup, resolve and verify that the target remains under the system
+temporary directory:
+
+```powershell
+$ResolvedManualRoot = (Resolve-Path -LiteralPath $ManualRoot).Path
+$ResolvedTemp = (Resolve-Path -LiteralPath $env:TEMP).Path
+if (-not $ResolvedManualRoot.StartsWith($ResolvedTemp, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "Refusing to remove non-temporary manual root: $ResolvedManualRoot"
+}
+Remove-Item -Recurse -Force -LiteralPath $ResolvedManualRoot
+```
 
 ## Repository validation after documentation changes
 
