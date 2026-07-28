@@ -60,6 +60,71 @@ def test_project_trust_defaults_to_auto(monkeypatch, tmp_path):
     assert load_config(project).runtime.project_trust == "auto"
 
 
+def test_chat_compaction_defaults_are_loaded(monkeypatch, tmp_path):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    chat = load_config(project).ui.chat
+
+    assert chat.compact_at_tokens == 120_000
+    assert chat.compact_to_tokens == 12_000
+
+
+def test_chat_compaction_budget_loads_from_project_config(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "ui:\n"
+        "  chat:\n"
+        "    compact_at_tokens: 2000\n"
+        "    compact_to_tokens: 500\n",
+        encoding="utf-8",
+    )
+
+    chat = load_config(project).ui.chat
+
+    assert chat.compact_at_tokens == 2_000
+    assert chat.compact_to_tokens == 500
+
+
+@pytest.mark.parametrize(
+    ("compact_at", "compact_to"),
+    (
+        (0, 1),
+        (100, 0),
+        (100, 100),
+        (100, 101),
+        ("many", 10),
+    ),
+)
+def test_chat_compaction_budget_rejects_invalid_values(
+    monkeypatch,
+    tmp_path,
+    compact_at,
+    compact_to,
+):
+    _isolate_user_config(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project_config = project / ".agent" / "config.yaml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        "ui:\n"
+        "  chat:\n"
+        f"    compact_at_tokens: {compact_at}\n"
+        f"    compact_to_tokens: {compact_to}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ui.chat"):
+        load_config(project)
+
+
 @pytest.mark.parametrize("project_trust", ("trusted", "untrusted", "unknown"))
 def test_project_trust_can_be_marked_in_project_config(
     monkeypatch,

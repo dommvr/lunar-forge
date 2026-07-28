@@ -94,6 +94,7 @@ class SessionLogger:
         repr=False,
         compare=False,
     )
+    _record_count: int = field(default=0, repr=False, compare=False)
     _event_callback: SessionEventCallback | None = field(
         default=None,
         repr=False,
@@ -110,6 +111,11 @@ class SessionLogger:
         """Return a thread-safe snapshot of model usage accumulated this run."""
         with self._write_lock:
             return dict(self._usage_totals)
+
+    @property
+    def record_count(self) -> int:
+        with self._write_lock:
+            return self._record_count
 
     def set_event_callback(
         self,
@@ -159,6 +165,7 @@ class SessionLogger:
             with self._write_lock:
                 with safe_log_path.open("a", encoding="utf-8", newline="") as handle:
                     handle.write(f"{serialized}\n")
+                self._record_count += 1
                 if event.strip() == "model_usage" and isinstance(
                     record["data"],
                     Mapping,
@@ -650,8 +657,18 @@ def _reconstruct_messages(
     *,
     compacted_summaries: tuple[dict[str, Any], ...] = (),
 ) -> list[dict[str, str]]:
+    source_event_count = 0
+    for summary in compacted_summaries:
+        raw_count = summary.get("source_event_count")
+        if (
+            isinstance(raw_count, int)
+            and not isinstance(raw_count, bool)
+            and raw_count >= 0
+        ):
+            source_event_count = max(source_event_count, raw_count)
+    effective_events = events[min(source_event_count, len(events)) :]
     candidates: list[dict[str, str]] = []
-    for event in events:
+    for event in effective_events:
         message = _historical_message(event)
         if message is not None:
             candidates.append(message)
@@ -674,6 +691,39 @@ def _reconstruct_messages(
             content = f"{content[:keep]}{_HISTORY_TRUNCATION_MARKER}"
         selected.append({"role": "user", "content": content})
         remaining_characters -= len(content)
+        raw_recent_messages = summary.get("recent_messages", [])
+        if not isinstance(raw_recent_messages, list):
+            raw_recent_messages = []
+        for raw_message in raw_recent_messages:
+            if (
+                not isinstance(raw_message, Mapping)
+                or len(selected) >= MAX_RESUME_MESSAGES
+                or remaining_characters <= 0
+            ):
+                break
+            role = str(raw_message.get("role", "")).strip().casefold()
+            raw_content = raw_message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(
+                raw_content,
+                str,
+            ):
+                continue
+            recent_content = (
+                "[Historical recent turn retained after compaction]\n"
+                f"{raw_content}"
+            )
+            if len(recent_content) > remaining_characters:
+                keep = max(
+                    0,
+                    remaining_characters - len(_HISTORY_TRUNCATION_MARKER),
+                )
+                recent_content = (
+                    f"{recent_content[:keep]}{_HISTORY_TRUNCATION_MARKER}"
+                )
+            selected.append(
+                {"role": role, "content": recent_content}
+            )
+            remaining_characters -= len(recent_content)
 
     recent: list[dict[str, str]] = []
     for message in reversed(candidates):
@@ -823,6 +873,34 @@ def _load_compacted_summaries(
         )
     if not isinstance(raw_summary.get("summary"), str):
         raise ValueError("Compacted summary must include summary text.")
+    source_event_count = raw_summary.get("source_event_count")
+    if (
+        source_event_count is not None
+        and (
+            isinstance(source_event_count, bool)
+            or not isinstance(source_event_count, int)
+            or source_event_count < 0
+        )
+    ):
+        raise ValueError(
+            "Compacted summary source_event_count must be non-negative."
+        )
+    recent_messages = raw_summary.get("recent_messages", [])
+    if not isinstance(recent_messages, list):
+        raise ValueError("Compacted summary recent_messages must be a list.")
+    for message in recent_messages:
+        if not isinstance(message, Mapping):
+            raise ValueError(
+                "Compacted summary recent_messages entries must be objects."
+            )
+        if message.get("role") not in {"user", "assistant"}:
+            raise ValueError(
+                "Compacted summary recent message has an unsupported role."
+            )
+        if not isinstance(message.get("content"), str):
+            raise ValueError(
+                "Compacted summary recent message content must be text."
+            )
     facts = raw_summary.get("facts", {})
     if not isinstance(facts, Mapping):
         raise ValueError("Compacted summary facts must be an object.")

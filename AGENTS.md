@@ -168,9 +168,12 @@ Completed first optional Textual chat phase:
 74. Add an optional Textual chat app for continuous in-terminal conversation.
 75. Persist interactive chat turns to the existing JSONL session format and support resumable chat sessions.
 
+Completed working-memory compaction phase:
+
+76. Add bounded working-memory compaction and persistent safe summaries when continuous chat approaches its configured token budget.
+
 Next feature wave, in order:
 
-76. Add working-memory compaction/summarization when context limits are approached.
 77. Document and test the event protocol so it remains compatible with a future web demo and cloud-sandbox runtime.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.

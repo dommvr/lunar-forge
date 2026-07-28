@@ -2518,11 +2518,24 @@ used by one-shot mode.
 
 ### Working-memory compaction
 
-**Status: later, after continuous chat works**
+**Current check**
 
-Configure deliberately low supported test thresholds for
-`ui.chat.compact_at_tokens` and `ui.chat.compact_to_tokens`, then continue a
-multi-turn chat until compaction triggers.
+In a disposable project's `.agent/config.yaml`, set:
+
+```yaml
+ui:
+  chat:
+    compact_at_tokens: 200
+    compact_to_tokens: 50
+```
+
+Start `lunar-forge chat --project $ChatProject`, send several harmless
+read-only messages, and watch the activity panel. After compaction, verify:
+
+```powershell
+Get-ChildItem -File -LiteralPath (Join-Path $ChatProject ".agent\summaries")
+lunar-forge chat --resume latest --project $ChatProject
+```
 
 **Expected result**
 
@@ -2533,7 +2546,9 @@ The live context retains the current goal, user constraints, project and
 permission modes, changed files, validation state, approvals, and open work
 while dropping stale bulk output. The original session JSONL remains the source
 of truth, no historical actions are replayed, and secrets or hidden reasoning
-are absent from both events and summaries.
+are absent from both events and summaries. `/status` reports the number of
+successful compactions and latest summary path. Resuming retains the compacted
+context plus recent turns.
 
 ## Repository validation after documentation changes
 

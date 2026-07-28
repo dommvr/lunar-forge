@@ -63,6 +63,17 @@ class PluginRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class ChatUIConfig:
+    compact_at_tokens: int = 120_000
+    compact_to_tokens: int = 12_000
+
+
+@dataclass(frozen=True)
+class UIConfig:
+    chat: ChatUIConfig = field(default_factory=ChatUIConfig)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -70,6 +81,7 @@ class AppConfig:
     subagents: SubagentConfig = field(default_factory=SubagentConfig)
     mcp: MCPRuntimeConfig = field(default_factory=MCPRuntimeConfig)
     plugins: PluginRuntimeConfig = field(default_factory=PluginRuntimeConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -121,10 +133,30 @@ def load_config(
     subagents_data = _section(merged, "subagents")
     mcp_data = _section(merged, "mcp")
     plugins_data = _section(merged, "plugins")
+    ui_data = _section(merged, "ui")
+    chat_data = _section(
+        ui_data,
+        "chat",
+        qualified_name="ui.chat",
+    )
 
     if "api_key" in model_data:
         raise ValueError(
             "Raw API keys are not supported in config; use model.api_key_env."
+        )
+
+    compact_at_tokens = _positive_integer(
+        chat_data["compact_at_tokens"],
+        "ui.chat.compact_at_tokens",
+    )
+    compact_to_tokens = _positive_integer(
+        chat_data["compact_to_tokens"],
+        "ui.chat.compact_to_tokens",
+    )
+    if compact_to_tokens >= compact_at_tokens:
+        raise ValueError(
+            "ui.chat.compact_to_tokens must be less than "
+            "ui.chat.compact_at_tokens."
         )
 
     return AppConfig(
@@ -171,6 +203,12 @@ def load_config(
                 "plugins.enabled",
             ),
         ),
+        ui=UIConfig(
+            chat=ChatUIConfig(
+                compact_at_tokens=compact_at_tokens,
+                compact_to_tokens=compact_to_tokens,
+            )
+        ),
     )
 
 
@@ -204,6 +242,12 @@ def _default_config() -> dict[str, Any]:
         "plugins": {
             "enabled": False,
         },
+        "ui": {
+            "chat": {
+                "compact_at_tokens": 120_000,
+                "compact_to_tokens": 12_000,
+            },
+        },
     }
 
 
@@ -224,6 +268,16 @@ def _environment_config(environ: Mapping[str, str]) -> dict[str, Any]:
         "LUNAR_FORGE_PARALLEL_SUBAGENTS": ("subagents", "parallel"),
         "LUNAR_FORGE_MCP_ENABLED": ("mcp", "enabled"),
         "LUNAR_FORGE_PLUGINS_ENABLED": ("plugins", "enabled"),
+        "LUNAR_FORGE_CHAT_COMPACT_AT_TOKENS": (
+            "ui",
+            "chat",
+            "compact_at_tokens",
+        ),
+        "LUNAR_FORGE_CHAT_COMPACT_TO_TOKENS": (
+            "ui",
+            "chat",
+            "compact_to_tokens",
+        ),
     }
 
     for variable, path in mappings.items():
@@ -304,6 +358,20 @@ def _as_bool(value: Any, name: str) -> bool:
         if normalized in {"0", "false", "no", "off"}:
             return False
     raise ValueError(f"Config value must be a boolean: {name}")
+
+
+def _positive_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Config value must be a positive integer: {name}")
+    if isinstance(value, int):
+        selected = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        selected = int(value.strip())
+    else:
+        raise ValueError(f"Config value must be a positive integer: {name}")
+    if selected < 1:
+        raise ValueError(f"Config value must be a positive integer: {name}")
+    return selected
 
 
 def deep_merge(

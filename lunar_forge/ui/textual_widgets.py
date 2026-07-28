@@ -17,7 +17,17 @@ from lunar_forge.approvals import (
 )
 from lunar_forge.config import AppConfig
 from lunar_forge.events import AgentEvent, EventFactory, EventType
-from lunar_forge.model_clients import ModelClient
+from lunar_forge.instructions import load_project_instructions
+from lunar_forge.model_clients import ModelClient, create_model_client
+from lunar_forge.runtime.compaction import (
+    CompactionError,
+    ConversationCompactor,
+    relevant_tool_results,
+)
+from lunar_forge.runtime.conversation import (
+    ConversationMemory,
+    should_compact,
+)
 from lunar_forge.runtime.sessions import (
     LoadedSession,
     SessionLogger,
@@ -29,6 +39,7 @@ from lunar_forge.runtime.sessions import (
 MAX_TEXTUAL_TOOL_LINE_CHARACTERS = 1_000
 MAX_TEXTUAL_STATUS_CHARACTERS = 500
 MAX_TEXTUAL_TRANSCRIPT_CHARACTERS = 50_000
+MAX_CHAT_COMPACTION_EVENTS = 500
 _SESSION_NOTE_PATTERN = re.compile(r"\n\nSession log: [^\n]+\Z")
 
 AgentEventCallback = Callable[[AgentEvent], None]
@@ -109,6 +120,23 @@ class TextualEventRenderer:
             return TextualRenderUpdate(
                 status="Approval granted" if approved else "Approval denied"
             )
+        if event.type == EventType.MEMORY_COMPACTION_STARTED.value:
+            return TextualRenderUpdate(status="Compacting conversation...")
+        if event.type == EventType.MEMORY_COMPACTION_FINISHED.value:
+            if payload.get("status") == "failed":
+                warning = _first_text(payload, "warning", "message")
+                return TextualRenderUpdate(
+                    transcript_role="system",
+                    transcript_text=_bounded_text(
+                        warning or (
+                            "Working-memory compaction failed; continuing "
+                            "with the existing safe context."
+                        ),
+                        MAX_TEXTUAL_TRANSCRIPT_CHARACTERS,
+                    ),
+                    status="Compaction warning",
+                )
+            return TextualRenderUpdate(status="Conversation compacted")
         if event.type == EventType.ASSISTANT_MESSAGE_COMPLETED.value:
             text = _first_text(payload, "text", "message") or ""
             return TextualRenderUpdate(
@@ -289,11 +317,9 @@ class TextualChatController:
         self.model_client = model_client
         self._event_runner = event_runner
         self._turn_lock = Lock()
-        self._messages: list[dict[str, str]] = [
-            dict(message) for message in (
-                previous_session.messages if previous_session is not None else ()
-            )
-        ]
+        self._memory = ConversationMemory(
+            previous_session.messages if previous_session is not None else ()
+        )
         self._resumed_from_path = (
             previous_session.relative_path
             if previous_session is not None
@@ -310,6 +336,25 @@ class TextualChatController:
             else 0
         )
         self._session_started = False
+        self._session_events: list[AgentEvent] = []
+        self._active_tool_calls: set[str] = set()
+        self._pending_approvals: set[str] = set()
+        self._compactor: ConversationCompactor | None = None
+        self._compaction_count = 0
+        self._last_compaction_summary_path: str | None = None
+        self._last_compaction_warning: str | None = None
+        self._seed_compaction_facts = (
+            dict(previous_session.compacted_summaries[-1].get("facts", {}))
+            if (
+                previous_session is not None
+                and previous_session.compacted_summaries
+                and isinstance(
+                    previous_session.compacted_summaries[-1].get("facts"),
+                    Mapping,
+                )
+            )
+            else {}
+        )
         self.turn_count = 0
         self.session_logger = (
             None
@@ -371,7 +416,7 @@ class TextualChatController:
 
     @property
     def conversation_messages(self) -> tuple[dict[str, str], ...]:
-        return tuple(dict(message) for message in self._messages)
+        return self._memory.messages
 
     @property
     def footer_text(self) -> str:
@@ -394,7 +439,17 @@ class TextualChatController:
             f"Session: {self.session_id}",
             f"Session log: {self.session_path}",
             f"Completed turns: {self.turn_count}",
+            f"Compactions: {self._compaction_count}",
         ]
+        if self._last_compaction_summary_path is not None:
+            lines.append(
+                f"Latest compacted summary: "
+                f"{self._last_compaction_summary_path}"
+            )
+        if self._last_compaction_warning is not None:
+            lines.append(
+                f"Compaction warning: {self._last_compaction_warning}"
+            )
         if self._resumed_from_session_id is not None:
             lines.extend(
                 (
@@ -451,10 +506,15 @@ class TextualChatController:
 
         with self._turn_lock:
             turn_id = self.event_factory.begin_turn()
-            prior_messages = tuple(self._messages)
             collected: list[AgentEvent] = []
             final_text: str | None = None
             try:
+                self._maybe_compact(
+                    normalized_prompt,
+                    collected=collected,
+                    event_callback=event_callback,
+                )
+                prior_messages = self._memory.messages
                 events = self._event_runner(
                     normalized_prompt,
                     self.project_root,
@@ -472,39 +532,35 @@ class TextualChatController:
                     session_logger=self.session_logger,
                     emit_session_started=not self._session_started,
                 )
-                for event in events:
-                    collected.append(event)
-                    if event_callback is not None:
-                        event_callback(event)
-                    if (
-                        event.type
-                        == EventType.ASSISTANT_MESSAGE_COMPLETED.value
-                    ):
-                        text = event.payload.get("text")
-                        if isinstance(text, str):
-                            final_text = _conversation_text(text)
+                try:
+                    for event in events:
+                        self._record_public_event(event)
+                        collected.append(event)
+                        if event_callback is not None:
+                            event_callback(event)
+                        if (
+                            event.type
+                            == EventType.ASSISTANT_MESSAGE_COMPLETED.value
+                        ):
+                            text = event.payload.get("text")
+                            if isinstance(text, str):
+                                final_text = _conversation_text(text)
+                finally:
+                    if self.session_logger is not None:
+                        self.session_logger.set_event_callback(None)
             except Exception:
-                self._messages.append(
-                    {"role": "user", "content": normalized_prompt}
-                )
+                self._memory.append_user_after_error(normalized_prompt)
                 self._session_started = True
                 raise
 
             if final_text is None:
-                self._messages.append(
-                    {"role": "user", "content": normalized_prompt}
-                )
+                self._memory.append_user_after_error(normalized_prompt)
                 self._session_started = True
                 raise RuntimeError(
                     "Agent turn completed without a final assistant event."
                 )
 
-            self._messages.extend(
-                (
-                    {"role": "user", "content": normalized_prompt},
-                    {"role": "assistant", "content": final_text},
-                )
-            )
+            self._memory.append_turn(normalized_prompt, final_text)
             self._session_started = True
             self.turn_count += 1
             return ChatTurnResult(
@@ -513,6 +569,185 @@ class TextualChatController:
                 session_id=self.session_id,
                 turn_id=turn_id,
             )
+
+    def _maybe_compact(
+        self,
+        incoming_prompt: str,
+        *,
+        collected: list[AgentEvent],
+        event_callback: AgentEventCallback | None,
+    ) -> None:
+        if self.session_logger is None:
+            return
+        try:
+            instruction_context = load_project_instructions(self.project_root)
+        except Exception as exc:
+            instruction_context = (
+                "Current project instructions could not be loaded for "
+                f"compaction: {exc}"
+            )
+        pressure = self._memory.estimate_pressure(
+            instruction_context=instruction_context,
+            relevant_tool_results=relevant_tool_results(
+                self._session_events
+            ),
+            incoming_user_text=incoming_prompt,
+        )
+        if not should_compact(
+            pressure,
+            self.config.ui.chat.compact_at_tokens,
+        ):
+            return
+        if not self._memory.can_compact():
+            return
+        if self._active_tool_calls or self._pending_approvals:
+            return
+
+        started = self.event_factory.create(
+            EventType.MEMORY_COMPACTION_STARTED,
+            {
+                **pressure.to_dict(),
+                "compact_at_tokens": (
+                    self.config.ui.chat.compact_at_tokens
+                ),
+                "compact_to_tokens": (
+                    self.config.ui.chat.compact_to_tokens
+                ),
+                "messages_before": self._memory.message_count,
+            },
+        )
+        self._publish_controller_event(
+            started,
+            collected=collected,
+            event_callback=event_callback,
+        )
+        self.session_logger.log(
+            EventType.MEMORY_COMPACTION_STARTED.value,
+            **dict(started.payload),
+        )
+        source_event_count = self.session_logger.record_count - 1
+
+        try:
+            result = self._get_compactor().maybe_compact(
+                self._memory,
+                incoming_user_text=incoming_prompt,
+                instruction_context=instruction_context,
+                events=self._session_events,
+                source_session_event_count=source_event_count,
+            )
+            if not result.compacted or result.summary_path is None:
+                raise CompactionError(result.reason)
+        except Exception as exc:
+            warning = (
+                "Working-memory compaction failed; continuing with the "
+                f"existing safe context. {exc}"
+            )
+            self._last_compaction_warning = warning
+            finished = self.event_factory.create(
+                EventType.MEMORY_COMPACTION_FINISHED,
+                {
+                    "status": "failed",
+                    "warning": warning,
+                    "messages_before": self._memory.message_count,
+                    "messages_after": self._memory.message_count,
+                },
+                parent_event_id=started.event_id,
+            )
+            self.session_logger.log(
+                EventType.MEMORY_COMPACTION_FINISHED.value,
+                **dict(finished.payload),
+            )
+            self._publish_controller_event(
+                finished,
+                collected=collected,
+                event_callback=event_callback,
+            )
+            return
+
+        if result.model_usage is not None:
+            self.session_logger.log(
+                "model_usage",
+                **dict(result.model_usage),
+            )
+        self._compaction_count += 1
+        self._last_compaction_summary_path = result.summary_path
+        self._last_compaction_warning = None
+        # Older public events are now represented by the persisted summary.
+        # Keep only events observed after this boundary so their tool-result
+        # pressure is not counted again on every subsequent turn.
+        self._session_events.clear()
+        finished = self.event_factory.create(
+            EventType.MEMORY_COMPACTION_FINISHED,
+            {
+                "status": "completed",
+                "summary_path": result.summary_path,
+                "messages_before": result.messages_before,
+                "messages_after": result.messages_after,
+                "estimated_tokens_before": (
+                    result.pressure.total_tokens
+                ),
+                "compact_to_tokens": (
+                    self.config.ui.chat.compact_to_tokens
+                ),
+            },
+            parent_event_id=started.event_id,
+        )
+        self.session_logger.log(
+            EventType.MEMORY_COMPACTION_FINISHED.value,
+            **dict(finished.payload),
+        )
+        self._publish_controller_event(
+            finished,
+            collected=collected,
+            event_callback=event_callback,
+        )
+
+    def _get_compactor(self) -> ConversationCompactor:
+        if self._compactor is None:
+            selected_model = (
+                self.model_client
+                if self.model_client is not None
+                else create_model_client(self.config.model)
+            )
+            self._compactor = ConversationCompactor(
+                self.project_root,
+                self.session_id,
+                self.config,
+                selected_model,
+                seed_facts=self._seed_compaction_facts,
+            )
+        return self._compactor
+
+    def _publish_controller_event(
+        self,
+        event: AgentEvent,
+        *,
+        collected: list[AgentEvent],
+        event_callback: AgentEventCallback | None,
+    ) -> None:
+        self._record_public_event(event)
+        collected.append(event)
+        if event_callback is not None:
+            event_callback(event)
+
+    def _record_public_event(self, event: AgentEvent) -> None:
+        self._session_events.append(event)
+        if len(self._session_events) > MAX_CHAT_COMPACTION_EVENTS:
+            del self._session_events[
+                : len(self._session_events) - MAX_CHAT_COMPACTION_EVENTS
+            ]
+        identifier = _operation_identifier(event)
+        if event.type == EventType.TOOL_STARTED.value:
+            self._active_tool_calls.add(identifier)
+        elif event.type in {
+            EventType.TOOL_FINISHED.value,
+            EventType.TOOL_FAILED.value,
+        }:
+            self._active_tool_calls.discard(identifier)
+        elif event.type == EventType.PERMISSION_REQUESTED.value:
+            self._pending_approvals.add(identifier)
+        elif event.type == EventType.PERMISSION_RESOLVED.value:
+            self._pending_approvals.discard(identifier)
 
 
 def _chat_session_id(session: SessionLogger | None) -> str:
@@ -540,6 +775,14 @@ def _first_text(payload: Mapping[str, Any], *keys: str) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _operation_identifier(event: AgentEvent) -> str:
+    for key in ("call_id", "request_id", "id"):
+        value = event.payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return event.event_id
 
 
 def _bounded_text(value: str, maximum: int) -> str:

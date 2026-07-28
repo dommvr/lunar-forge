@@ -168,20 +168,25 @@ lunar-forge chat --resume latest --project <path>
 
 The current chat UI provides a transcript, activity status, compact tool log,
 interactive approvals, an input box, a runtime footer, and `/help`, `/status`,
-`/clear`, and `/exit`. The planned later chat configuration is:
+`/clear`, and `/exit`. Working-memory compaction uses:
 
 ```yaml
 ui:
   chat:
-    auto_resume: false
     compact_at_tokens: 120000
     compact_to_tokens: 12000
-    show_tool_details: true
 ```
 
-The one-shot CLI continues to work without the `tui` extra. Working-memory
-compaction follows in a later wave. A web demo and cloud sandbox are not
-implemented here.
+Before a new turn, chat estimates pressure from live conversation, current
+project instructions, recent turns, and bounded tool-result context. When the
+threshold is reached, older turns are summarized with the configured model,
+recent turns remain verbatim, and a bounded redacted summary is written to
+`.agent/summaries/<session-id>.summary.json`. Compaction never runs while an
+approval or tool call is pending. Resume loads the compacted summary without
+replaying historical actions.
+
+The one-shot CLI continues to work without the `tui` extra. A web demo and
+cloud sandbox are not implemented here.
 
 ### Experimental MCP integration
 
