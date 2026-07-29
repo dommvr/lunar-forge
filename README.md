@@ -150,8 +150,9 @@ not request reasoning summaries and never exposes hidden reasoning content.
 
 ### Event-driven Textual chat
 
-The event, renderer, approval-provider, and first Textual chat phases are
-implemented. `run_agent_events(...)` emits versioned, bounded, redacted events;
+The event, renderer, approval-provider, Textual chat, resume, compaction,
+layout, and slash-command phases are implemented. `run_agent_events(...)`
+emits versioned, bounded, redacted events;
 the one-shot CLI consumes them through `ConsoleRenderer`; and the optional
 Textual UI keeps multiple turns in one live conversation and one project-local
 JSONL session. `--resume latest` loads bounded, inert conversation context from
@@ -166,9 +167,93 @@ lunar-forge chat --project <path>
 lunar-forge chat --resume latest --project <path>
 ```
 
-The current chat UI provides a transcript, activity status, compact tool log,
-interactive approvals, an input box, a runtime footer, and `/help`, `/status`,
-`/clear`, and `/exit`. Working-memory compaction uses:
+The current UI provides continuous chat, interactive approvals, safe resume,
+working-memory compaction, the simplified transcript layout, multiline input,
+temporary event-driven progress, and the slash-command surface below. It
+reuses the event stream, approval providers, session JSONL, resume, and
+compaction systems rather than creating UI-specific copies.
+
+The layout is deliberately small:
+
+- a top card whose border title is `LunarForge v0.x`, without a duplicate
+  version in the card body;
+- `What are we building today?` for a new session or
+  `Let’s get back to building.` for a resumed session;
+- project, model, reasoning effort, and mode metadata;
+- a readable chat transcript with blank lines between messages and turns; and
+- a bottom input that supports normal and multiline paste, `Enter` to send,
+  and `Shift+Enter` for a newline.
+
+Permanent recent-activity, last-session, changed-file, tips/status, shortcut,
+Docker-status, tool-log, and activity panels are not part of this layout.
+While a turn runs, public status/tool information appears in one temporary
+progress block inside the transcript. The block disappears or is replaced by
+the final assistant response, which includes elapsed time such as
+`Done in 1 minute 12 seconds.`
+
+The slash-command surface mirrors existing LunarForge workflows:
+
+```text
+/help
+/status
+/clear
+/exit
+/project
+/plan
+/docker
+/allow-network
+/subagents
+/parallel-subagents
+/commit
+/commit-message
+/show-usage
+/reasoning-effort
+/runtime
+/permissions
+/mcp
+/plugins
+/sessions
+/resume
+/resume latest
+/new
+/browser-setup
+/browser-validate
+/checkpoints
+/rollback
+/git status
+/git commit
+/mcp list
+/plugins list
+```
+
+Commands accept typed arguments and popup forms. A command that needs missing
+arguments opens its form instead of starting a broken turn. `/resume` opens a
+picker, while `/resume latest` keeps the direct shortcut. `/project` validates
+and switches the active project, reloads that project’s instructions/config,
+and starts fresh conversation context. `/new` asks for a natural-language
+prompt and delegates to the existing new-project workflow.
+
+`/browser-validate` supports `url`, `serve`, `screenshot`,
+`no-screenshot`, `full-page`, `width`, `height`, `startup-timeout-ms`, and
+repeatable `check` values.
+
+Config-backed commands show their current value and choices. Users may apply a
+value to the active chat only or explicitly save it to
+`.agent/config.yaml`. Typed values default to session scope; `scope=project`
+is the explicit save choice:
+
+```text
+/reasoning-effort high
+/reasoning-effort xhigh scope=project
+/runtime docker scope=session
+```
+
+Session-only values affect future turns until changed or until chat exits.
+Saving project config updates the active session immediately. LunarForge must
+not silently persist session-only settings or store secrets in project config.
+All guarded slash-command actions still resolve through approval providers.
+
+Working-memory compaction continues to use:
 
 ```yaml
 ui:
@@ -185,8 +270,10 @@ recent turns remain verbatim, and a bounded redacted summary is written to
 approval or tool call is pending. Resume loads the compacted summary without
 replaying historical actions.
 
-The one-shot CLI continues to work without the `tui` extra. A web demo and
-cloud sandbox are not implemented here.
+The one-shot CLI continues to work without the `tui` extra. Core events remain
+plain, bounded, redacted, and transport-neutral for a future UI. A
+prompt-toolkit REPL, web UI, cloud sandbox, and duplicate chat/session system
+are not part of this wave.
 
 ### Experimental MCP integration
 

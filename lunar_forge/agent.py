@@ -2118,8 +2118,14 @@ def run_agent_events(
     event_factory: EventFactory | None = None,
     session_logger: SessionLogger | None = None,
     emit_session_started: bool = True,
+    live_event_callback: Callable[[AgentEvent], None] | None = None,
 ) -> Iterator[AgentEvent]:
-    """Run one synchronous agent turn as a public event stream."""
+    """Run one synchronous agent turn as a public event stream.
+
+    ``live_event_callback`` observes session-derived events while the
+    synchronous agent call is still active. The same events remain in the
+    yielded stream afterward, preserving existing consumers and ordering.
+    """
     root = Path(project_root).expanduser().resolve()
     resolved_config = config or load_config(root)
     factory = event_factory or EventFactory()
@@ -2148,6 +2154,12 @@ def run_agent_events(
             parent_event_id=parent_event_id,
         ):
             buffer_event(event)
+            if live_event_callback is not None:
+                try:
+                    live_event_callback(event)
+                except Exception:
+                    # Rendering observers must not interrupt the agent.
+                    pass
             if (
                 legacy_event == "permission.requested"
                 and request_id

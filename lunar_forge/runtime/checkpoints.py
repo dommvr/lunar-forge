@@ -103,27 +103,25 @@ def list_checkpoint_directories(project_root: str | Path) -> dict[str, object]:
 def rollback_file(
     project_root: str | Path,
     path: str | Path,
+    *,
+    checkpoint_id: str | None = None,
 ) -> dict[str, object]:
-    """Restore the latest checkpoint for one project-local file."""
+    """Restore an exact or latest checkpoint for one project-local file."""
     try:
+        preview = preview_rollback_file(
+            project_root,
+            path,
+            checkpoint_id=checkpoint_id,
+        )
+        if preview.get("ok") is not True:
+            return preview
         root = _project_root(project_root)
-        target = safe_path(root, path)
-        relative_target = target.relative_to(root)
-        if not relative_target.parts:
-            raise ValueError("Rollback path must identify a file.")
-        if target.exists() and not target.is_file():
-            raise IsADirectoryError("Rollback path is not a file.")
-
-        checkpoint_source = _latest_checkpoint_for(root, relative_target)
-        if checkpoint_source is None:
-            return {
-                "ok": False,
-                "path": relative_target.as_posix(),
-                "error": (
-                    "No checkpoint exists for "
-                    f"{relative_target.as_posix()}."
-                ),
-            }
+        relative_target = Path(str(preview["path"]))
+        target = safe_path(root, relative_target)
+        checkpoint_source = safe_path(
+            root,
+            str(preview["checkpoint_path"]),
+        )
 
         previous_state_checkpoint: str | None = None
         restored_existing = target.exists()
@@ -138,6 +136,9 @@ def rollback_file(
             "ok": True,
             "path": relative_target.as_posix(),
             "checkpoint_path": checkpoint_source.relative_to(root).as_posix(),
+            "checkpoint_id": checkpoint_source.parent.relative_to(
+                safe_path(root, ".agent/checkpoints")
+            ).parts[0],
             "previous_state_checkpoint": previous_state_checkpoint,
             "restored_existing": restored_existing,
         }
@@ -145,17 +146,85 @@ def rollback_file(
         return {"ok": False, "error": str(exc)}
 
 
+def preview_rollback_file(
+    project_root: str | Path,
+    path: str | Path,
+    *,
+    checkpoint_id: str | None = None,
+) -> dict[str, object]:
+    """Resolve a rollback source without modifying the target project."""
+
+    try:
+        root = _project_root(project_root)
+        target = safe_path(root, path)
+        relative_target = target.relative_to(root)
+        if not relative_target.parts:
+            raise ValueError("Rollback path must identify a file.")
+        if target.exists() and not target.is_file():
+            raise IsADirectoryError("Rollback path is not a file.")
+        checkpoint_source = _checkpoint_for(
+            root,
+            relative_target,
+            checkpoint_id=checkpoint_id,
+        )
+        if checkpoint_source is None:
+            qualifier = (
+                f" in checkpoint {checkpoint_id}"
+                if checkpoint_id is not None
+                else ""
+            )
+            return {
+                "ok": False,
+                "path": relative_target.as_posix(),
+                "error": (
+                    "No checkpoint exists for "
+                    f"{relative_target.as_posix()}{qualifier}."
+                ),
+            }
+        return {
+            "ok": True,
+            "path": relative_target.as_posix(),
+            "checkpoint_path": checkpoint_source.relative_to(root).as_posix(),
+            "restored_existing": target.exists(),
+        }
+    except (OSError, PermissionError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def _latest_checkpoint_for(root: Path, relative_path: Path) -> Path | None:
+    return _checkpoint_for(root, relative_path, checkpoint_id=None)
+
+
+def _checkpoint_for(
+    root: Path,
+    relative_path: Path,
+    *,
+    checkpoint_id: str | None,
+) -> Path | None:
     checkpoints_root = safe_path(root, ".agent/checkpoints")
     if not checkpoints_root.exists():
         return None
     if not checkpoints_root.is_dir():
         raise NotADirectoryError(".agent/checkpoints is not a directory.")
-    for checkpoint_directory in sorted(
-        checkpoints_root.iterdir(),
-        key=lambda item: item.name,
-        reverse=True,
-    ):
+    if checkpoint_id is None:
+        candidates = sorted(
+            checkpoints_root.iterdir(),
+            key=lambda item: item.name,
+            reverse=True,
+        )
+    else:
+        normalized_id = checkpoint_id.strip()
+        identifier = Path(normalized_id)
+        if (
+            not normalized_id
+            or identifier.name != normalized_id
+            or identifier.parent != Path(".")
+        ):
+            raise ValueError(
+                "Checkpoint ID must be one direct checkpoint directory name."
+            )
+        candidates = [safe_path(root, checkpoints_root / normalized_id)]
+    for checkpoint_directory in candidates:
         safe_directory = safe_path(root, checkpoint_directory)
         if not safe_directory.is_dir():
             continue

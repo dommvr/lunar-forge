@@ -69,7 +69,9 @@ are all current pass/fail checks.
 - [x] Textual session resume
 - [x] Working-memory compaction
 - [x] Event/web-cloud transport hardening
-- [ ] Repository validation after documentation changes
+- [x] Textual simplified layout, temporary progress, and multiline input
+- [x] Textual slash commands, popup forms, and config persistence scopes
+- [x] Repository validation after documentation changes
 
 ## 1. Install and CLI availability
 
@@ -2437,6 +2439,9 @@ python -m pytest -q `
   tests/test_events.py `
   tests/test_approvals.py `
   tests/test_textual_ui.py `
+  tests/test_slash_commands.py `
+  tests/test_textual_project_commands.py `
+  tests/test_textual_action_commands.py `
   tests/test_sessions.py `
   tests/test_compaction.py `
   tests/test_readonly_fast_path.py `
@@ -2610,7 +2615,7 @@ Also run:
 Expected: help lists `--project` and `--resume` without importing Textual at
 CLI module-import time.
 
-### Textual startup, two turns, approval, and slash commands
+### Textual startup, layout, and clean exit
 
 Install the optional extra in the development environment and start chat:
 
@@ -2633,12 +2638,15 @@ Use run_command to run python --version. Do not edit files.
 
 Expected:
 
-- the transcript, activity area, approval area, compact tool log, input, and
-  metadata footer mount without tabs;
+- the top card border reads `LunarForge v0.x`, the body shows
+  `What are we building today?`, and the version is not repeated in the body;
+- the top card shows project, model, reasoning effort, and current mode;
+- only the transcript, temporary approval/popup surfaces, and bottom input are
+  present—there are no permanent activity, tool-log, or metadata panels;
 - the second turn answers `moon-marker` from the same in-process conversation;
-- `/help` lists the four slash commands, `/status` reports the current project,
-  model, reasoning effort, runtime/permission mode, and session, `/clear`
-  clears visible transcript state, and `/exit` closes cleanly;
+- the two turns have blank-line spacing, `/help` lists the complete supported
+  slash surface, `/status` reports the active state, `/clear` clears only the
+  visible transcript, and `/exit` closes cleanly;
 - `python --version` remains paused until the Textual approval is approved or
   denied; and
 - hidden reasoning and unbounded tool output never appear.
@@ -2711,9 +2719,437 @@ Expected:
 - resumed chat retains the compacted goal/constraints/state plus recent turns
   without replaying tools or approvals.
 
-If summarization fails, the activity area shows a clear warning and retains the
+If summarization fails, the transcript shows a clear warning and retains the
 uncompacted live context when safe. Plan-mode chat without a session log does
 not compact.
+
+## Textual UI wave acceptance tests
+
+The layout, input behavior, slash router, popup selectors, project/session
+commands, and action wrappers are implemented. Run these acceptance checks as a
+final interactive hardening pass. The existing event stream, approval
+providers, session JSONL, resume, and compaction tests remain mandatory
+regressions.
+
+### Final hardening smoke sequence
+
+Use the detailed procedures in the following subsections for setup, approvals,
+and cleanup. This is the final 20-check execution order and expected result:
+
+1. Run `python -m lunar_forge.cli chat --help`.
+   Expected: exit `0`, `--project` and `--resume` are listed, and the Textual
+   app module is not imported just to render help.
+2. Run chat from the core-only environment with
+   `& $CoreOnlyPython -m lunar_forge.cli chat --project $ChatProject`.
+   Expected: the exact `Textual UI is not installed...` setup guidance and a
+   clean exit without a traceback.
+3. Run `lunar-forge chat --project $ChatProject`.
+   Expected: the border title is `LunarForge v0.x`; no duplicate version or
+   permanent activity/tool/status panel appears.
+4. Inspect the new-session card.
+   Expected: `What are we building today?`.
+5. Exit, then run
+   `lunar-forge chat --resume latest --project $ChatProject`.
+   Expected: `Let’s get back to building.` and the source session ID.
+6. Send the two read-only turns from
+   [Textual startup, layout, and clean exit](#textual-startup-layout-and-clean-exit).
+   Expected: a blank line separates messages and turns.
+7. Send
+   `Use run_command to run python --version. Do not edit files.`
+   Expected: one temporary progress block shows public work, the bounded
+   command, and a changing elapsed timer while approval is pending.
+8. Approve or deny that request.
+   Expected: temporary progress is removed and the final result includes
+   `Done in <duration>.`.
+9. Paste the two-line prompt in
+   [Input, normal paste, and multiline paste](#input-normal-paste-and-multiline-paste).
+   Expected: its newline is preserved.
+10. Press `Shift+Enter`, then `Enter`.
+    Expected: the first key inserts a newline and the second submits once.
+11. Run `/status`.
+    Expected: current project, model, effort, runtime, permissions, network,
+    subagents, commit, MCP, plugins, session, resume, and compaction values.
+12. Run `/reasoning-effort`.
+    Expected: a selector shows the current value and all allowed choices.
+13. Apply `high` to this chat only, exit, and compare `$ConfigBefore` with
+    `$ConfigAfterSession`.
+    Expected: `/status` changes immediately and the comparison returns `True`.
+14. Run `/reasoning-effort xhigh scope=project`, approve the write, and inspect
+    `$ConfigPath`.
+    Expected: the file is safely created or updated, unrelated keys are
+    retained when practical, and the live session changes immediately.
+15. Run the generated `/project "<second-project-path>"` command.
+    Expected: project-scoped config/instructions/integrations reload and a
+    fresh conversation/session context starts without old file facts.
+16. Run `/resume`, then `/resume latest`.
+    Expected: the picker and direct path load compatible safe history without
+    replaying tools or reusing approvals.
+17. Run `/browser-validate`, then
+    `/browser-validate url=http://127.0.0.1:5173 no-screenshot=true check="#root"`.
+    Expected: the first opens the validated form and the second delegates to
+    the existing browser workflow.
+18. Run `/git status` and `/git commit message="Manual Textual command test"`.
+    Expected: status is model-free; validation remains visible before commit
+    approval; failed validation blocks a normal commit.
+19. Run `/mcp list` and `/plugins list`.
+    Expected: bounded diagnostics appear without auto-enabling either
+    integration.
+20. Run the six commands under
+    [Event-driven one-shot CLI parity](#event-driven-one-shot-cli-parity).
+    Expected: read, edit, validation, usage, Docker, and Git behavior retains
+    the existing one-shot output and safety gates.
+
+### Simplified new-session layout
+
+Start a new chat in the disposable project:
+
+```powershell
+lunar-forge chat --project $ChatProject
+```
+
+Expected:
+
+- the top card border title is exactly `LunarForge v0.x`;
+- the card body does not repeat the version;
+- the new-session greeting is `What are we building today?`;
+- project, model, reasoning effort, and mode are visible;
+- the main body contains the chat transcript and bottom input;
+- there is readable blank space between messages and between turns; and
+- there are no permanent recent-activity, last-session, changed-file,
+  tips/status, shortcut, Docker-status, tool-log, or activity panels.
+
+The UI may show approvals in a popup or temporary inline block. It must not
+restore a permanent approval/activity dashboard.
+
+### Resumed-session layout
+
+Exit the new chat after one harmless turn, then run:
+
+```powershell
+lunar-forge chat --resume latest --project $ChatProject
+```
+
+Expected:
+
+- the top card says `Let’s get back to building.`;
+- its border still contains `LunarForge v0.x` exactly once;
+- the selected project and resumed session metadata are correct;
+- safe historical turns appear with blank-line spacing; and
+- no historical tool call or approval is replayed.
+
+### Temporary progress and elapsed time
+
+In chat, submit:
+
+```text
+Read marker.txt and explain its value. Do not edit files or run commands.
+```
+
+While the turn runs, expected temporary transcript content resembles:
+
+```text
+Working: reading the requested project file.
+Tool: read_file marker.txt
+Elapsed: 00:04
+```
+
+Expected after completion:
+
+- the progress block was driven by structured public events;
+- hidden reasoning was never displayed;
+- the temporary block disappeared or was replaced by the final response;
+- only one final assistant response remains for the turn; and
+- the final response contains a human-readable duration such as
+  `Done in 12 seconds.` or `Done in 1 minute 12 seconds.`
+
+Repeat with an approved command to verify command and approval progress:
+
+```text
+Use run_command to run python --version. Do not edit files.
+```
+
+The command must stay paused until the Textual approval provider resolves it.
+The temporary block may show the bounded command preview, but approval must not
+fall back to raw terminal `input()`.
+
+### Input, normal paste, and multiline paste
+
+Test these input paths separately:
+
+1. Paste a one-line prompt and press `Enter`.
+2. Type the first line below, press `Shift+Enter`, type the second line, then
+   press `Enter`.
+3. Paste the entire multiline block and press `Enter`.
+
+```text
+Summarize marker.txt.
+Do not edit files or run commands.
+```
+
+Expected:
+
+- normal paste preserves the complete prompt;
+- `Shift+Enter` inserts a newline without sending;
+- multiline paste preserves its newline and does not submit only the first
+  line;
+- `Enter` sends exactly one message after the input is ready; and
+- oversized paste is bounded or produces a clear warning instead of freezing
+  the app.
+
+### Slash-command discovery and argument routing
+
+Run:
+
+```text
+/help
+```
+
+Expected `/help` entries:
+
+```text
+/help
+/status
+/clear
+/exit
+/project
+/plan
+/docker
+/allow-network
+/subagents
+/parallel-subagents
+/commit
+/commit-message
+/show-usage
+/reasoning-effort
+/runtime
+/permissions
+/mcp
+/plugins
+/sessions
+/resume
+/resume latest
+/new
+/browser-setup
+/browser-validate
+/checkpoints
+/rollback
+/git status
+/git commit
+/mcp list
+/plugins list
+```
+
+Expected routing rules:
+
+- typed arguments run directly after validation;
+- a command requiring omitted arguments opens its popup form;
+- quoted typed strings are preserved;
+- invalid arguments show a clear error without starting an agent turn; and
+- popup cancellation performs no action and changes no settings.
+
+Exercise representative typed and form paths:
+
+```text
+/project
+/commit-message
+/git commit
+/rollback
+/reasoning-effort
+/reasoning-effort high
+/git commit message="Manual Textual command test"
+```
+
+The commands without required arguments open forms. The typed reasoning value
+uses session scope by default. The quoted commit message reaches the existing
+Git workflow unchanged.
+
+### Config-backed values and persistence scope
+
+Before starting chat, record the project config:
+
+```powershell
+$ConfigPath = Join-Path $ChatProject ".agent\config.yaml"
+$ConfigBefore = Get-Content -Raw -LiteralPath $ConfigPath
+lunar-forge chat --project $ChatProject
+```
+
+In chat, run:
+
+```text
+/reasoning-effort
+```
+
+Expected popup:
+
+- it shows the current effective reasoning effort;
+- it lists `low`, `medium`, `high`, `xhigh`, and `max`; and
+- it offers `this chat session only` and
+  `save to project .agent/config.yaml`.
+
+Choose `high` for this chat session only, then run:
+
+```text
+/status
+/runtime docker scope=session
+/allow-network true scope=session
+/subagents true scope=session
+/parallel-subagents true scope=session
+/mcp false scope=session
+/plugins false scope=session
+/status
+/exit
+```
+
+Verify:
+
+```powershell
+$ConfigAfterSession = Get-Content -Raw -LiteralPath $ConfigPath
+$ConfigAfterSession -ceq $ConfigBefore
+```
+
+Expected: both `/status` calls reflect the active session values, future turns
+use them, and the PowerShell comparison returns `True`. No session-only value
+was written to project config.
+
+Start chat again and explicitly save a safe project value:
+
+```text
+/reasoning-effort xhigh scope=project
+/status
+/exit
+```
+
+Verify:
+
+```powershell
+Get-Content -Raw -LiteralPath $ConfigPath
+```
+
+Expected: only the relevant `model.reasoning.effort` value is updated, unrelated
+YAML remains intact when practical, and the active chat used `xhigh`
+immediately. Repeat representative popup checks for `/plan`, `/docker`,
+`/allow-network`, `/subagents`, `/parallel-subagents`, `/runtime`,
+`/permissions`, `/mcp`, and `/plugins`.
+
+Project-scope saves must use normal file safety, contain no raw API key or other
+secret, and require an explicit save choice. `/commit`, `/commit-message`, and
+`/show-usage` remain session controls in this wave.
+
+### Project switching, resume picker, and new-project workflow
+
+Create another disposable project:
+
+```powershell
+$SecondChatProject = Join-Path $ManualRoot ("chat-wave-second-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $SecondChatProject | Out-Null
+Set-Content -LiteralPath (Join-Path $SecondChatProject "other.txt") -Value "second-project" -Encoding utf8
+$ProjectSwitchCommand = '/project "{0}"' -f $SecondChatProject
+Write-Output $ProjectSwitchCommand
+```
+
+In the first project’s chat, run:
+
+```text
+/project
+```
+
+Expected: a project picker/form opens. Cancel it and verify nothing changes.
+Then paste the command printed by PowerShell, which has this shape:
+
+```text
+/project "C:\...\chat-wave-second-..."
+```
+
+Expected:
+
+- the active project switches only after path validation;
+- project config, instructions, MCP, and plugins reload;
+- a fresh conversation/session context starts for the second project;
+- first-project messages, changed files, approvals, and compaction facts are
+  not carried into the new context; and
+- the transcript confirms the new project.
+
+Run:
+
+```text
+/sessions
+/resume
+/resume latest
+/new
+```
+
+Expected: `/sessions` and `/resume` open project-scoped pickers;
+`/resume latest` uses the latest compatible session without replaying tools;
+and `/new` asks for a natural-language prompt before delegating to the existing
+new-project workflow. It must not introduce another scaffolding or session
+implementation.
+
+### Existing workflow slash commands
+
+Run or open each form in a disposable project:
+
+```text
+/browser-setup
+/browser-validate
+/browser-validate url=http://127.0.0.1:5173 no-screenshot=true check="#root"
+/browser-validate url=http://127.0.0.1:5173 serve="npm run dev" screenshot=true full-page=true width=1440 height=900 startup-timeout-ms=30000 check="#root" check="title"
+/checkpoints
+/rollback
+/git status
+/git commit
+/mcp list
+/plugins list
+```
+
+The `/browser-validate` form and parser expose:
+
+```text
+url
+serve
+screenshot
+no-screenshot
+full-page
+width
+height
+startup-timeout-ms
+check
+```
+
+Expected:
+
+- repeatable `check` values are retained;
+- `screenshot` and `no-screenshot` are mutually clear;
+- existing browser, checkpoint, rollback, Git, MCP, and plugin helpers perform
+  the work;
+- dangerous commands remain blocked before approval;
+- all guarded actions use approval providers;
+- plan/no-command restrictions still apply; and
+- outputs enter the transcript as bounded plain event data, not Rich/Textual
+  objects embedded in core events.
+
+### Regression and architecture checks for the UI wave
+
+After implementation, run:
+
+```powershell
+python -m pytest -q
+python -B -m compileall lunar_forge
+python -B -m compileall examples/plugins/web-design-review
+git diff --check
+```
+
+Expected:
+
+- one-shot CLI output and flags remain unchanged;
+- `python -m pip install -e .` still works without Textual;
+- `lunar-forge chat` still prints the documented install message when the
+  optional dependency is missing;
+- one-shot and Textual consume the same transport-neutral event protocol;
+- approval providers are the only approval mechanism;
+- JSONL sessions and compacted summaries remain the persistent source of truth;
+- no session-only setting is silently persisted; and
+- no web/cloud UI, cloud sandbox, prompt-toolkit REPL, or duplicate compaction
+  system was introduced.
 
 ### Runtime-artifact audit and cleanup
 

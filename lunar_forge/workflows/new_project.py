@@ -236,9 +236,17 @@ def run_new_project(
     allow_network: bool = False,
     subagents_enabled: bool = False,
     subagents_parallel: bool = False,
+    session_logger: SessionLogger | None = None,
 ) -> dict[str, Any]:
     """Plan or create a starter project without overwriting existing work."""
     root = Path(project_root).expanduser().resolve()
+    if (
+        session_logger is not None
+        and session_logger.project_root.resolve() != root
+    ):
+        raise ValueError(
+            "New-project session logger belongs to another project."
+        )
     selected_template = template or select_template(prompt)
     _validate_template(selected_template)
     spec = TEMPLATE_SPECS[selected_template]
@@ -308,7 +316,11 @@ def run_new_project(
             **base_result,
         }
 
-    session = _start_session(root)
+    session = (
+        session_logger
+        if session_logger is not None
+        else _start_session(root)
+    )
     if session is not None:
         base_result["session_log"] = session.relative_path
     _log(session, "user_prompt", prompt=prompt)

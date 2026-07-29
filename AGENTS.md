@@ -172,9 +172,21 @@ Completed working-memory compaction phase:
 
 76. Add bounded working-memory compaction and persistent safe summaries when continuous chat approaches its configured token budget.
 
-Next feature wave, in order:
+Completed event protocol hardening phase:
 
 77. Document and test the event protocol so it remains compatible with a future web demo and cloud-sandbox runtime.
+78. Harden event and approval payloads so they are bounded, redacted, JSON-safe, and free of Rich/Textual objects.
+79. Verify one-shot CLI, Textual, and future web renderers can consume the same event protocol without parsing terminal text.
+
+Completed Textual layout and slash-command wave:
+
+80. Redesign the Textual chat layout into a simpler Claude Code-style interface: top project card, chat transcript, temporary progress block, and input area.
+81. Add reliable paste and multiline input behavior for the Textual input box.
+82. Add temporary in-chat progress rendering with current work, active tool/command, and final elapsed-time reporting.
+83. Add a central Textual slash-command router with typed arguments and popup forms.
+84. Add popup selectors for config-backed settings with current-value previews and an explicit choice between session-only and saving to project config.
+85. Add Textual project switching, session resume, new-project workflow, browser validation, Git, MCP, plugin, checkpoint, and rollback slash commands.
+86. Run hardening and manual smoke tests for Textual layout, slash commands, config persistence, resume safety, event compatibility, and one-shot CLI parity.
 
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
@@ -306,8 +318,10 @@ lunar-forge/
       __init__.py
       renderers.py
       console_renderer.py
+      slash_commands.py
       textual_app.py
       textual_widgets.py
+      textual_state.py
 
     subagents/
       __init__.py
@@ -1938,9 +1952,11 @@ Rules:
 
 ## Textual chat UI
 
-Add Textual only after the event stream and approval-provider abstraction are working.
+Textual is the interactive terminal UI for continuous LunarForge chat. It must remain optional and must consume the same event-driven agent engine used by the one-shot CLI.
 
-Command:
+This wave is a UI and command-surface refinement. Reuse the existing event stream, renderer seam, approval providers, JSONL session/resume system, and working-memory compaction implementation. Do not create parallel event, approval, session, or memory systems for slash commands.
+
+Commands:
 
 ```bash
 lunar-forge chat --project ~/dev/my-app
@@ -1953,74 +1969,372 @@ Textual must be optional:
 python -m pip install -e ".[tui]"
 ```
 
-If Textual is missing and the user runs `lunar-forge chat`, show a clear setup message instead of crashing.
+If Textual is missing and the user runs `lunar-forge chat`, show a clear setup message instead of crashing. The one-shot CLI must keep working without Textual installed.
 
-Minimum layout:
+### Textual layout
+
+The Textual UI should use a simple Claude Code-style layout, not a dashboard full of panels that nobody asked for.
+
+Top card:
 
 ```text
-╭──────────────── LunarForge ────────────────╮
-│ Project: C:\...\my-app                     │
-│ Model: openai/gpt-5.6-sol  Effort: medium │
-│ Mode: default/docker/no-command            │
-├────────────────────────────────────────────┤
-│ Chat transcript                            │
-│                                            │
-│ User: Add homepage                         │
-│ Agent: Reading project structure...        │
-│ Tool: read_file src/App.jsx                │
-│ Tool: replace_lines src/App.jsx            │
-│ Validation: npm run build passed           │
-├────────────────────────────────────────────┤
-│ Activity / approvals / tool details        │
-├────────────────────────────────────────────┤
-│ > input                                    │
-╰────────────────────────────────────────────╯
+╭──────────── LunarForge v0.x ─────────────╮
+│ What are we building today?              │   new session
+│ Let’s get back to building.              │   resumed session
+│                                          │
+│ Project: C:\...\my-app                  │
+│ Model: openai/gpt-5.6-sol               │
+│ Effort: medium                           │
+│ Mode: default / docker / no-command      │
+╰──────────────────────────────────────────╯
 ```
 
-Minimum panels:
+Rules:
 
-* chat transcript,
-* live activity/status,
-* approval prompt area,
-* compact tool log,
-* input box,
-* footer with project/model/reasoning effort/mode/session.
+* Put `LunarForge v0.x` in the card border/title and do not duplicate the version below it.
+* Show `What are we building today?` for a new chat session.
+* Show `Let’s get back to building.` for a resumed chat session.
+* Show project root, model, reasoning effort, and runtime/permission mode.
+* Do not add permanent panels for recent activity, last sessions, changed files, tips/status, shortcuts, Docker status, tool log, or activity.
+* Keep tool/activity information as temporary progress content while a turn is running.
 
-Do not add complex tabs in the first Textual wave. Tabs breed in captivity and then someone has to maintain them.
+Main body:
 
-Initial slash commands:
+```text
+╭──────────── LunarForge v0.x ─────────────╮
+│ What are we building today?              │
+│ Project: C:\...\my-app                  │
+│ Model: openai/gpt-5.6-sol               │
+│ Effort: high                             │
+│ Mode: docker                             │
+╰──────────────────────────────────────────╯
+
+User
+Add a pricing page.
+
+Assistant
+I’ll inspect the routing and navbar, then make the smallest change.
+
+[temporary while running]
+Working: inspecting the project structure.
+Tool: list_dir .
+Elapsed: 00:08
+[/temporary]
+
+Assistant
+Done in 1 minute 12 seconds.
+
+Changed files:
+- app/pricing/page.tsx
+- components/Navbar.tsx
+
+Validation:
+- pnpm build passed
+
+› input
+```
+
+Layout rules:
+
+* The chat transcript is the primary area.
+* Add a blank line between user and assistant messages and between turns.
+* The input area stays at the bottom.
+* The progress block appears inside the chat transcript while the agent is working.
+* The progress block is temporary and must disappear or be replaced when the final assistant message for that turn is shown.
+* The final assistant message should include elapsed time, for example `Done in 2 minutes 4 seconds.`
+* Approval prompts may appear as modal/popup UI or as an inline temporary approval block, but must not use raw `input()`.
+* Do not add complex tabs in this wave. Tabs breed in captivity and then someone has to maintain them.
+
+### Progress display
+
+During an active turn, show a short temporary progress block in the chat transcript.
+
+The progress block should include:
+
+* one short sentence describing current public work,
+* the currently active tool or command when applicable,
+* an elapsed timer while the turn is running.
+
+Examples:
+
+```text
+Working: reading project instructions.
+Tool: read_file AGENTS.md
+Elapsed: 00:04
+```
+
+```text
+Working: running validation in Docker.
+Command: python -B -m compileall .
+Elapsed: 01:16
+```
+
+Rules:
+
+* Use public progress only. Do not show hidden reasoning or chain-of-thought.
+* Update progress from structured events such as `status.updated`, `tool.started`, `tool.finished`, `validation.started`, `validation.finished`, and `permission.requested`.
+* When the turn finishes, remove the temporary progress block and show the final assistant message.
+* The final assistant message should include total elapsed time.
+* One-shot CLI output should remain concise and should not be forced to mimic the Textual progress block.
+
+### Text input and paste behavior
+
+The input box must support real-world paste behavior, because users paste logs, code, and prompts, not tiny haiku.
+
+Rules:
+
+* Normal paste must work.
+* Multi-line paste must work.
+* `Enter` sends the current message.
+* `Shift+Enter` inserts a newline.
+* Pasted text must preserve newlines.
+* Very large pasted input should be bounded or warned about before submission rather than freezing the UI.
+* Slash commands should be recognized only when the input begins with `/` after trimming leading whitespace.
+
+### Textual slash commands
+
+Textual chat should include a slash-command router that works like the CLI command surface, adapted for continuous chat.
+
+Slash commands must support both:
+
+* typed arguments, for fast users,
+* popup forms/selectors, for discoverability.
+
+If a slash command that requires arguments is entered without arguments, show a popup form instead of failing with a cryptic error.
+
+Initial commands:
 
 ```text
 /help
 /status
 /clear
 /exit
-```
-
-Later slash commands:
-
-```text
-/compact
-/sessions
-/resume latest
-/checkpoints
+/project
+/plan
+/docker
+/allow-network
+/subagents
+/parallel-subagents
+/commit
+/commit-message
+/show-usage
+/reasoning-effort
+/runtime
+/permissions
 /mcp
 /plugins
-/diff
-/validation
+/sessions
+/resume
+/resume latest
+/new
+/browser-setup
+/browser-validate
+/checkpoints
+/rollback
+/git status
+/git commit
+/mcp list
+/plugins list
 ```
 
-Textual UI rules:
+Command behavior:
+
+* `/help` shows available commands and short usage.
+* `/status` shows current project, model, effort, runtime mode, permission mode, network setting, subagent setting, commit setting, MCP/plugin setting, session id, and compaction status.
+* `/clear` clears the visible transcript only after confirmation; it must not delete session logs.
+* `/exit` exits cleanly.
+* `/project` switches the active project root and starts a fresh conversation context for that project.
+* `/plan` toggles or sets plan mode for the active chat session.
+* `/docker` toggles Docker runtime mode for the active chat session.
+* `/allow-network` toggles network permission for Docker/browser workflows.
+* `/subagents` toggles subagent use.
+* `/parallel-subagents` toggles parallel subagent phases.
+* `/commit` toggles commit offering for future turns in the active chat session.
+* `/commit-message` sets the default commit message for the next commit flow.
+* `/show-usage` toggles usage output in final answers.
+* `/reasoning-effort` sets `model.reasoning.effort`.
+* `/runtime` sets runtime mode.
+* `/permissions` sets permission mode.
+* `/mcp` enables/disables MCP integration.
+* `/plugins` enables/disables plugin integration.
+* `/sessions` opens a session list/picker for the current project.
+* `/resume` opens a resume picker.
+* `/resume latest` resumes the latest compatible session for the current project.
+* `/new` asks for a project prompt and runs the existing new-project workflow.
+* `/browser-setup` runs the existing browser setup helper with normal approvals.
+* `/browser-validate` runs browser validation using typed args or a popup form.
+* `/checkpoints` lists available checkpoints for the current project.
+* `/rollback` rolls back a selected checkpoint/path after approval.
+* `/git status` runs the existing Git status helper.
+* `/git commit` opens a commit form or accepts a typed message argument.
+* `/mcp list` runs MCP diagnostics/listing.
+* `/plugins list` runs plugin diagnostics/listing.
+
+### Slash command arguments and forms
+
+Typed examples:
+
+```text
+/project C:\Users\tiron\Desktop\my-app
+/reasoning-effort high
+/reasoning-effort xhigh scope=project
+/runtime docker
+/runtime no-command scope=session
+/permissions no-command
+/commit-message "Add pricing page"
+/git commit message="Add pricing page"
+/browser-validate url=http://localhost:5173 full-page=true width=1440 height=1200
+/browser-validate url=http://localhost:5173 serve="npm run dev" screenshot=true check=console check=title
+/resume latest
+```
+
+`/browser-validate` options:
+
+```text
+url
+serve
+screenshot
+no-screenshot
+full-page
+width
+height
+startup-timeout-ms
+check
+```
+
+Rules:
+
+* Typed arguments should be parsed deterministically.
+* Quoted strings must be supported for messages and serve commands.
+* Boolean flags such as `full-page`, `screenshot`, and `no-screenshot` must be handled clearly.
+* Repeated `check` values should be supported.
+* If arguments are missing, show a popup form with the relevant fields.
+* Popup forms must validate input before running actions.
+* Invalid typed arguments should show a clear error and should not start an agent turn.
+* For config-backed commands, `scope=session` and `scope=project` are the typed persistence choices.
+* A typed config value without `scope` defaults to `scope=session`; it must never silently write project config.
+* `scope=project` means the user explicitly chose save-to-project-config and should update the active session immediately after a successful save.
+
+### Config-backed slash commands
+
+Some slash commands control values that also exist in config. These commands must show popup selectors with the current value and persistence choice.
+
+Config-backed commands:
+
+```text
+/plan
+/docker
+/allow-network
+/subagents
+/parallel-subagents
+/reasoning-effort
+/runtime
+/permissions
+/mcp
+/plugins
+```
+
+`/plan` is a convenience alias for the plan permission setting, and `/docker` is a convenience alias for Docker runtime mode. They follow the same session/project persistence rules as `/permissions` and `/runtime`. `/commit`, `/commit-message`, and `/show-usage` are session controls in this wave and are not persisted unless a future documented config key is introduced.
+
+Popup requirements:
+
+* Show the current effective value.
+* Show available choices.
+* Let the user choose either:
+  * apply to this chat session only,
+  * save to project `.agent/config.yaml`.
+* If saving to project config and `.agent/config.yaml` does not exist, create it safely.
+* If saving to project config and the file exists, edit only the relevant key while preserving unrelated config when practical.
+* Validate config values before writing.
+* Do not write secrets to project config.
+* Do not bypass normal file safety or checkpoint rules.
+* Route the config write through the normal approval provider and permission policy; the popup choice must not become a second approval mechanism.
+* Changes applied to the current chat session should affect future turns until changed again or until the session exits.
+* Saving to project config should also update the active session value immediately.
+
+Suggested mapping:
+
+```yaml
+runtime:
+  mode: local | docker | no-command
+  allow_network: true | false
+
+permissions:
+  mode: default | yes | no-command | plan | docker
+
+subagents:
+  enabled: true | false
+  parallel: true | false
+
+model:
+  reasoning:
+    effort: low | medium | high | xhigh | max
+
+mcp:
+  enabled: true | false
+
+plugins:
+  enabled: true | false
+```
+
+Do not silently persist session-only choices. The user must explicitly choose the save-to-config option. Surprise config mutation is how tools become haunted.
+
+### Project switching
+
+`/project` changes the active project root for continuous chat.
+
+Rules:
+
+* Validate the selected path exists and is a directory.
+* Start a fresh conversation context after switching projects.
+* Start or select a session log for the new project.
+* Reload project config, `AGENTS.md`, nested instructions, plugins, and MCP config for the new project.
+* Reset project-specific changed-file state, checkpoints view, and compaction summary context.
+* Do not carry old project file facts into the new project context.
+* Keep global UI preferences only.
+* Show a clear confirmation in the transcript.
+
+### Resume behavior
+
+`/resume` opens a picker. `/resume latest` resumes the latest compatible session for the current project.
+
+Rules:
+
+* Resuming must not replay old tool calls.
+* Historical tool results must be marked as historical context.
+* Load safe conversation turns and compacted summaries only.
+* Restore visible transcript when practical.
+* Keep project-root validation strict.
+* If the resumed session belongs to a different project, refuse or ask the user to switch projects first.
+
+### New project behavior
+
+`/new` should ask for a natural-language project prompt and run the existing new-project workflow.
+
+Rules:
+
+* Reuse existing new-project detection and scaffolding logic.
+* Do not build a complex template-picker UI in this wave.
+* Empty or near-empty project checks still apply.
+* Dependency install commands still require approval.
+* Docker/local execution rules still apply.
+
+### Textual UI rules
 
 * The Textual app should submit user turns to the same event-driven agent engine used by the one-shot CLI.
 * The app keeps live conversation state in memory while open.
-* Each user message becomes a new turn in the same session.
+* Each user message becomes a new turn in the same session unless `/project` switches to a new project context.
+* Slash-command actions must delegate to existing workflows and runtime helpers instead of duplicating their business logic.
 * Tool approvals should appear as UI prompts, not raw terminal `input()`.
+* Approval providers remain the only mechanism for resolving guarded actions triggered from chat or slash commands.
 * The UI must keep rendering status while long operations run.
 * The UI must not parse console text to infer state.
 * The UI must not expose hidden reasoning.
 * The UI should gracefully show errors and let the user continue chatting when safe.
 * The one-shot CLI must keep working without Textual installed.
+* Session-only slash settings live only in active Textual state and must not be written to JSONL as reusable authorization or persisted into project config.
+* Existing JSONL session logs and `.agent/summaries/` remain the only persistent conversation/resume sources.
+* The future web UI should be able to reuse the same events and command/action semantics without depending on terminal widgets.
 
 ---
 
@@ -2726,7 +3040,8 @@ Manual testing docs should include:
 * local execution safety warnings,
 * no-edit command-routing semantics,
 * agent event stream and renderer abstraction,
-* Textual chat UI setup and manual smoke tests,
+* Textual chat UI setup, layout, paste behavior, progress block, elapsed timer, and manual smoke tests,
+* Textual slash commands, popup selectors, session-only settings, and save-to-project-config flows,
 * interactive approvals,
 * resumable chat sessions,
 * memory compaction and summary files,
@@ -2977,7 +3292,9 @@ These are the defaults unless changed deliberately:
 * Emit a versioned, bounded, redacted event stream before adding another UI.
 * Make the one-shot CLI consume events through a renderer and preserve its current behavior.
 * Route permission decisions through approval providers instead of low-level `input()` calls.
-* Keep Textual optional and add it only after the event and approval seams work; do not build a prompt_toolkit UI first.
+* Keep Textual optional and route it through the event and approval seams; do not build a prompt_toolkit UI first.
+* Keep the Textual layout simple: top project card, chat transcript, temporary progress block, and bottom input.
+* Implement Textual slash commands through a command router, not ad-hoc widget callbacks.
 * Keep core agent logic mostly sync for now; isolate Textual async behavior at the UI boundary.
 * Use exact-replacement editing plus line-based edits before advanced patching.
 * Use local command runner before Docker runner.
@@ -2994,7 +3311,7 @@ These are the defaults unless changed deliberately:
 
 ## Still do not build yet
 
-These remain out of scope until the event-stream and Textual-chat wave is stable:
+These remain out of scope after the Textual layout, slash-command, and config-popup wave:
 
 * background daemon,
 * vector database,
@@ -3009,4 +3326,4 @@ These remain out of scope until the event-stream and Textual-chat wave is stable
 
 Reason:
 
-The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, parallel subagent phases, structured context tools, token/cost controls, Git support, Docker-mode execution, local execution warnings, and configurable reasoning effort. The next work should focus on one architectural seam: a stable event stream that both the current CLI and future UIs can consume. Do not turn lunar-forge into three frontends arguing over a pile of duplicated state.
+The project already has nested instructions, resume, stronger scaffolding, subagents, MCP, browser validation, plugins, better edit tools, parallel subagent phases, structured context tools, token/cost controls, Git support, Docker-mode execution, local execution warnings, configurable reasoning effort, and a hardened Textual experience built on the existing event seam. Future work should preserve the single event, approval, session, and compaction architecture. Do not turn lunar-forge into three frontends arguing over a pile of duplicated state.

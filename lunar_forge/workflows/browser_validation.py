@@ -342,6 +342,8 @@ def run_managed_browser_validation(
     height: int = DEFAULT_VIEWPORT_HEIGHT,
     startup_timeout_ms: int = DEFAULT_SERVER_STARTUP_TIMEOUT_MS,
     project_root: str | Path = ".",
+    permission_mode: str = "default",
+    runtime_mode: str = "local",
     approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
     approval_event_callback: ApprovalEventCallback | None = None,
@@ -375,7 +377,12 @@ def run_managed_browser_validation(
         return _managed_error_result(_PLAYWRIGHT_SETUP_ERROR)
 
     decision = PermissionManager(
-        mode="default",
+        mode=(
+            "no-command"
+            if runtime_mode.strip().lower() == "no-command"
+            else permission_mode
+        ),
+        runtime_mode=runtime_mode,
         approval_provider=approval_provider,
         approval_callback=approval_callback,
         approval_event_callback=approval_event_callback,
