@@ -7,8 +7,10 @@ from lunar_forge.config import AppConfig, PermissionConfig
 from lunar_forge.events import EventType
 from lunar_forge.model_clients import ModelResponse
 from lunar_forge.ui.slash_commands import (
+    POPULAR_SLASH_COMMANDS,
     SlashCommandParser,
     SlashCommandRouter,
+    slash_command_hints,
 )
 from lunar_forge.ui.textual_state import (
     ChatSessionState,
@@ -81,6 +83,25 @@ def test_slash_router_rejects_unknown_and_invalid_quoting(tmp_path):
     assert "quoting" in (invalid_quote.message or "").lower()
 
 
+def test_slash_command_hints_are_small_filtered_and_nested():
+    assert slash_command_hints("/") == POPULAR_SLASH_COMMANDS
+
+    session_matches = slash_command_hints("/s")
+    assert "/show-usage" in session_matches
+    assert "/subagents" in session_matches
+    assert "/sessions" in session_matches
+    assert slash_command_hints("/git") == (
+        "/git status",
+        "/git commit",
+    )
+    assert slash_command_hints("/browser") == (
+        "/browser-setup",
+        "/browser-validate",
+    )
+    assert slash_command_hints("/does-not-exist") == ()
+    assert slash_command_hints("explain /status") == ()
+
+
 def test_help_and_status_do_not_start_agent_turn(tmp_path):
     controller = TextualChatController(
         tmp_path,
@@ -93,6 +114,7 @@ def test_help_and_status_do_not_start_agent_turn(tmp_path):
 
     assert controller.turn_count == 0
     assert "/reasoning-effort" in (help_result.message or "")
+    assert "/finish" in (help_result.message or "")
     status = status_result.message or ""
     for expected in (
         f"Project: {tmp_path.resolve()}",
@@ -110,6 +132,21 @@ def test_help_and_status_do_not_start_agent_turn(tmp_path):
         "Compaction status: idle",
     ):
         assert expected in status
+
+
+def test_finish_is_central_and_only_finish_routes_during_active_turn(
+    tmp_path,
+):
+    state, router = _router(tmp_path)
+
+    finish = router.route("/finish", active_turn=True)
+    blocked = router.route("/runtime docker", active_turn=True)
+
+    assert finish.handled is True
+    assert finish.finish_task is True
+    assert blocked.error is True
+    assert "Use /finish" in (blocked.message or "")
+    assert state.config.runtime.mode == "local"
 
 
 def test_clear_requires_confirmation_and_retains_session_log(tmp_path):
@@ -222,6 +259,11 @@ def test_config_popup_model_includes_current_value_and_choices(
     assert result.form.config_backed is True
     assert result.form.current_value == current
     assert result.form.choices == choices
+    assert result.form.config_scopes == (
+        "session",
+        "project",
+        "global",
+    )
     assert f"Current: {current}" in result.form.prompt
     assert f"Choices: {', '.join(choices)}" in result.form.prompt
 
@@ -238,7 +280,9 @@ def test_popup_session_apply_changes_state_without_writing_config(tmp_path):
     assert not config_path.exists()
 
 
-def test_typed_config_scope_distinguishes_session_and_project(tmp_path):
+def test_typed_config_scope_distinguishes_session_project_and_global(
+    tmp_path,
+):
     state, router = _router(tmp_path)
 
     project = router.route(
@@ -259,10 +303,25 @@ def test_typed_config_scope_distinguishes_session_and_project(tmp_path):
     assert session.save_config_to_project is False
     assert state.config.runtime.mode == "docker"
 
+    global_result = router.route(
+        "/reasoning-effort high scope=global"
+    )
+
+    assert global_result.error is False
+    assert global_result.save_config_to_project is False
+    assert global_result.save_config_to_user is True
+    assert global_result.config_update == SessionConfigUpdate(
+        ("model", "reasoning", "effort"),
+        "high",
+    )
+    assert state.config.model.reasoning.effort == "medium"
+
     invalid = router.route("/plugins true scope=forever")
 
     assert invalid.error is True
-    assert "scope must be session or project" in (invalid.message or "")
+    assert "scope must be session, project, or global" in (
+        invalid.message or ""
+    )
     assert state.config.plugins.enabled is False
 
 
@@ -637,3 +696,80 @@ def test_project_config_save_enforces_project_safe_path(
 
     assert provider.requests == []
     assert controller.config.permissions.mode == "default"
+
+
+def test_user_config_save_requires_approval_and_updates_after_success(
+    tmp_path,
+):
+    home = tmp_path / "home"
+    provider = _RecordingApprovalProvider()
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        provider,
+        user_home=home,
+    )
+    form = controller.handle_slash_command("/runtime").form
+    selected = controller.validate_slash_form(form, "docker")
+
+    result = controller.save_user_config_update(selected.config_update)
+
+    config_path = home / ".lunar-forge" / "config.yaml"
+    assert result.path == config_path
+    assert result.created is True
+    assert len(provider.requests) == 1
+    assert provider.requests[0].kind == "write"
+    assert provider.requests[0].file_path == "~/.lunar-forge/config.yaml"
+    assert controller.config.runtime.mode == "docker"
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == {
+        "runtime": {"mode": "docker"}
+    }
+    session_text = controller.session_logger.path.read_text(encoding="utf-8")
+    assert '"event":"permission.requested"' in session_text
+    assert '"event":"permission.resolved"' in session_text
+
+
+def test_denied_user_config_save_writes_nothing_and_keeps_state(tmp_path):
+    home = tmp_path / "home"
+    provider = _RecordingApprovalProvider(approved=False)
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        provider,
+        user_home=home,
+    )
+    form = controller.handle_slash_command("/plugins").form
+    selected = controller.validate_slash_form(form, "true")
+
+    with pytest.raises(PermissionError, match="Denied by test"):
+        controller.save_user_config_update(selected.config_update)
+
+    assert len(provider.requests) == 1
+    assert controller.config.plugins.enabled is False
+    assert not (home / ".lunar-forge" / "config.yaml").exists()
+
+
+def test_user_config_save_preserves_unrelated_keys(tmp_path):
+    home = tmp_path / "home"
+    config_path = home / ".lunar-forge" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "runtime:\n  allow_network: false\nmodel:\n  model: example/model\n",
+        encoding="utf-8",
+    )
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        _RecordingApprovalProvider(),
+        user_home=home,
+    )
+    form = controller.handle_slash_command("/reasoning-effort").form
+    selected = controller.validate_slash_form(form, "high")
+
+    controller.save_user_config_update(selected.config_update)
+
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["runtime"]["allow_network"] is False
+    assert saved["model"]["model"] == "example/model"
+    assert saved["model"]["reasoning"]["effort"] == "high"
+    assert controller.config.model.reasoning.effort == "high"

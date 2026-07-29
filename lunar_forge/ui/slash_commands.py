@@ -37,6 +37,47 @@ _BOOLEAN_VALUES = {
     "disable": False,
     "disabled": False,
 }
+POPULAR_SLASH_COMMANDS = (
+    "/help",
+    "/status",
+    "/compact",
+    "/sessions",
+    "/resume",
+)
+SLASH_COMMANDS = (
+    "/help",
+    "/status",
+    "/clear",
+    "/exit",
+    "/finish",
+    "/compact",
+    "/project",
+    "/sessions",
+    "/resume",
+    "/new",
+    "/browser-setup",
+    "/browser-validate",
+    "/checkpoints",
+    "/rollback",
+    "/git status",
+    "/git commit",
+    "/plan",
+    "/docker",
+    "/allow-network",
+    "/subagents",
+    "/parallel-subagents",
+    "/commit",
+    "/commit-message",
+    "/show-usage",
+    "/reasoning-effort",
+    "/runtime",
+    "/permissions",
+    "/mcp",
+    "/mcp list",
+    "/plugins",
+    "/plugins list",
+)
+CONFIG_PERSISTENCE_SCOPES = ("session", "project", "global")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +100,7 @@ class SlashCommandForm:
     choices: tuple[str, ...] = ()
     current_value: str | None = None
     config_backed: bool = False
+    config_scopes: tuple[str, ...] = ()
     parse_arguments: bool = False
     argument_prefix: tuple[str, ...] = ()
     submit_label: str = "Apply to session"
@@ -119,9 +161,11 @@ class SlashCommandResult:
     confirmation: SlashConfirmation | None = None
     config_update: SessionConfigUpdate | None = None
     save_config_to_project: bool = False
+    save_config_to_user: bool = False
     restored_transcript: tuple[tuple[str, str], ...] = ()
     new_project_prompt: str | None = None
     action: SlashActionRequest | None = None
+    finish_task: bool = False
 
 
 class SlashCommandParser:
@@ -182,6 +226,8 @@ class SlashCommandRouter:
             "status": self._status,
             "clear": self._clear,
             "exit": self._exit,
+            "finish": self._finish,
+            "compact": self._compact,
             "project": self._project,
             "sessions": self._sessions,
             "resume": self._resume,
@@ -206,13 +252,23 @@ class SlashCommandRouter:
             "plugins": self._plugins,
         }
 
-    def route(self, value: str) -> SlashCommandResult:
+    def route(
+        self,
+        value: str,
+        *,
+        active_turn: bool = False,
+    ) -> SlashCommandResult:
         try:
             invocation = self._parser.parse(value)
         except ValueError as exc:
             return self._error(str(exc))
         if invocation is None:
             return SlashCommandResult(handled=False)
+        if active_turn and invocation.name != "finish":
+            return self._error(
+                "A turn is already running. Use /finish to cancel it, or "
+                "wait for it to complete."
+            )
         handler = self._handlers.get(invocation.name)
         if handler is None:
             return self._error(
@@ -310,6 +366,8 @@ class SlashCommandRouter:
                 "/status — show active session state\n"
                 "/clear — clear the visible transcript after confirmation\n"
                 "/exit — close chat\n"
+                "/finish — cancel the active task and revoke its changes\n"
+                "/compact — compact older safe conversation context\n"
                 "/project <path> — switch project and start fresh context\n"
                 "/sessions — choose a resumable session for this project\n"
                 "/resume [latest|session] — resume safe historical context\n"
@@ -366,6 +424,18 @@ class SlashCommandRouter:
     def _exit(self, arguments: tuple[str, ...]) -> SlashCommandResult:
         self._require_no_arguments("exit", arguments)
         return SlashCommandResult(handled=True, exit_app=True)
+
+    def _finish(self, arguments: tuple[str, ...]) -> SlashCommandResult:
+        self._require_no_arguments("finish", arguments)
+        return SlashCommandResult(handled=True, finish_task=True)
+
+    def _compact(self, arguments: tuple[str, ...]) -> SlashCommandResult:
+        self._require_no_arguments("compact", arguments)
+        return self._action(
+            "memory.compact",
+            {},
+            "/compact",
+        )
 
     def _project(self, arguments: tuple[str, ...]) -> SlashCommandResult:
         if not arguments:
@@ -914,6 +984,7 @@ class SlashCommandRouter:
                 choices=choices,
                 current_value=current,
                 config_backed=True,
+                config_scopes=CONFIG_PERSISTENCE_SCOPES,
             ),
         )
 
@@ -945,13 +1016,14 @@ class SlashCommandRouter:
         previous_config = self.state.config
         update = update_factory()
         save_to_project = scope == "project"
-        if save_to_project:
+        save_to_user = scope == "global"
+        if save_to_project or save_to_user:
             self.state.config = previous_config
-        scope_note = (
-            "save to project requested"
-            if save_to_project
-            else "session only"
-        )
+        scope_note = {
+            "session": "session only",
+            "project": "save to project requested",
+            "global": "save to user config requested",
+        }[scope]
         return SlashCommandResult(
             handled=True,
             message=(
@@ -961,6 +1033,7 @@ class SlashCommandRouter:
             refresh_header=refresh_header,
             config_update=update,
             save_config_to_project=save_to_project,
+            save_config_to_user=save_to_user,
         )
 
     @staticmethod
@@ -977,9 +1050,9 @@ class SlashCommandRouter:
             if scope is not None:
                 raise ValueError(f"/{command} accepts only one scope value.")
             scope = argument.split("=", 1)[1].strip().casefold()
-            if scope not in {"session", "project"}:
+            if scope not in CONFIG_PERSISTENCE_SCOPES:
                 raise ValueError(
-                    f"/{command} scope must be session or project."
+                    f"/{command} scope must be session, project, or global."
                 )
         return tuple(values), scope or "session"
 
@@ -1043,6 +1116,27 @@ class SlashCommandRouter:
 
 def _on_off(value: bool) -> str:
     return "on" if value else "off"
+
+
+def slash_command_hints(
+    value: str,
+    *,
+    limit: int = 5,
+) -> tuple[str, ...]:
+    """Return a small deterministic command list for slash autocomplete."""
+
+    if limit < 1:
+        raise ValueError("Slash hint limit must be at least 1.")
+    normalized = value.strip().casefold()
+    if not normalized.startswith("/"):
+        return ()
+    if normalized == "/":
+        return POPULAR_SLASH_COMMANDS[:limit]
+    return tuple(
+        command
+        for command in SLASH_COMMANDS
+        if command.casefold().startswith(normalized)
+    )[:limit]
 
 
 def _split_argument_text(value: str) -> tuple[str, ...]:
@@ -1292,6 +1386,9 @@ def _display_action(name: str, arguments: dict[str, object]) -> str:
 
 
 __all__ = [
+    "CONFIG_PERSISTENCE_SCOPES",
+    "POPULAR_SLASH_COMMANDS",
+    "SLASH_COMMANDS",
     "SlashActionRequest",
     "SlashCommandForm",
     "SlashCommandPicker",
@@ -1301,4 +1398,5 @@ __all__ = [
     "SlashConfirmation",
     "SlashInvocation",
     "SlashPickerOption",
+    "slash_command_hints",
 ]

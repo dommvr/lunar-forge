@@ -93,6 +93,7 @@ class EventType(str, Enum):
     SESSION_RESUMED = "session.resumed"
     TURN_STARTED = "turn.started"
     TURN_FINISHED = "turn.finished"
+    TURN_CANCELLED = "turn.cancelled"
     STATUS_UPDATED = "status.updated"
     ASSISTANT_MESSAGE_DELTA = "assistant.message.delta"
     ASSISTANT_MESSAGE_COMPLETED = "assistant.message.completed"
@@ -114,6 +115,8 @@ class EventType(str, Enum):
     GIT_COMMIT_SKIPPED = "git.commit.skipped"
     MEMORY_COMPACTION_STARTED = "memory.compaction.started"
     MEMORY_COMPACTION_FINISHED = "memory.compaction.finished"
+    ROLLBACK_STARTED = "rollback.started"
+    ROLLBACK_FINISHED = "rollback.finished"
     ERROR = "error"
 
 

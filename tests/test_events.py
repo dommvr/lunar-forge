@@ -93,6 +93,7 @@ def test_initial_event_type_values_are_stable():
         "session.resumed",
         "turn.started",
         "turn.finished",
+        "turn.cancelled",
         "status.updated",
         "assistant.message.delta",
         "assistant.message.completed",
@@ -114,6 +115,8 @@ def test_initial_event_type_values_are_stable():
         "git.commit.skipped",
         "memory.compaction.started",
         "memory.compaction.finished",
+        "rollback.started",
+        "rollback.finished",
         "error",
     }
 
@@ -208,6 +211,28 @@ def test_browser_artifact_reference_is_a_plain_serializable_record():
     assert json.loads(browser_event.to_json())["payload"] == dict(
         browser_event.payload
     )
+
+
+def test_core_event_payloads_do_not_gain_textual_labels_or_styles():
+    factory = EventFactory(
+        session_id="session_ui_neutral",
+        turn_id="turn_ui_neutral",
+    )
+
+    event = factory.create(
+        EventType.ASSISTANT_MESSAGE_COMPLETED,
+        {"text": "The answer is unchanged."},
+    )
+    serialized = event.to_json()
+
+    assert event.payload == {"text": "The answer is unchanged."}
+    assert "LunarForge:" not in serialized
+    assert "You:" not in serialized
+    assert "bold cyan" not in serialized
+    assert "bold green" not in serialized
+    assert json.loads(serialized)["payload"] == {
+        "text": "The answer is unchanged."
+    }
 
 
 def test_run_agent_events_wraps_existing_one_shot_result(tmp_path):

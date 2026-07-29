@@ -129,6 +129,7 @@ class ConversationCompactor:
         events: Sequence[AgentEvent | Mapping[str, Any]],
         source_session_event_count: int,
         pending_operation: bool = False,
+        force: bool = False,
     ) -> CompactionResult:
         relevant_results = relevant_tool_results(events)
         pressure = memory.estimate_pressure(
@@ -137,7 +138,7 @@ class ConversationCompactor:
             incoming_user_text=incoming_user_text,
         )
         before = memory.message_count
-        if not should_compact(
+        if not force and not should_compact(
             pressure,
             self.config.ui.chat.compact_at_tokens,
         ):

@@ -20,7 +20,9 @@ from lunar_forge.config import AppConfig, PermissionConfig, RuntimeConfig
 from lunar_forge.events import EventFactory, EventType
 from lunar_forge.model_clients import ModelResponse, ToolCall
 from lunar_forge.runtime.sessions import create_session_logger, load_session
+from lunar_forge.tools.files import write_file
 from lunar_forge.ui.textual_widgets import (
+    ChatTurnCancelled,
     TextualApprovalBridge,
     TextualChatController,
     TextualEventRenderer,
@@ -135,7 +137,8 @@ def test_textual_app_module_imports_with_mocked_dependency(monkeypatch):
             return False
 
     class FakeTextArea(FakeWidget):
-        pass
+        class Changed:
+            pass
 
     class FakeInput(FakeWidget):
         class Submitted:
@@ -159,6 +162,7 @@ def test_textual_app_module_imports_with_mocked_dependency(monkeypatch):
     fake_textual_binding.Binding = FakeBinding
     fake_containers.Horizontal = FakeContainer
     fake_containers.Vertical = FakeContainer
+    fake_containers.VerticalScroll = FakeContainer
     fake_textual_message.Message = FakeMessage
     fake_widgets.Button = FakeButton
     fake_widgets.Input = FakeInput
@@ -211,14 +215,31 @@ def test_textual_app_mounts_when_optional_dependency_is_available(tmp_path):
     async def exercise():
         async with textual_app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
+            frame = textual_app.query_one("#chat-frame")
             top_card = textual_app.query_one("#top-card")
-            assert top_card.border_title == textual_app.top_card_title
+            input_area = textual_app.query_one("#input-area")
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            assert frame.border_title == textual_app.top_card_title
+            assert top_card.border_title is None
             assert textual_app.top_card_title.startswith("LunarForge v")
             assert textual_app.top_card_title not in textual_app.top_card_text
             assert "What are we building today?" in textual_app.top_card_text
-            assert textual_app.query_one("#transcript") is not None
+            assert len(textual_app.query("#chat-frame")) == 1
+            assert frame.query_one("#top-card") is top_card
+            assert frame.query_one("#transcript") is not None
+            assert frame.query_one("#input-area") is input_area
+            assert input_area.query_one("#chat-input") is chat_input
+            assert frame.styles.border_top[0] != "none"
+            assert top_card.styles.border_bottom[0] != "none"
+            assert input_area.styles.border_top[0] != "none"
+            assert (
+                frame.styles.border_top[1]
+                == top_card.styles.border_bottom[1]
+                == input_area.styles.border_top[1]
+            )
+            assert chat_input.styles.border_top[0] in {"", "none"}
             assert textual_app.query_one("#approval-panel") is not None
-            assert textual_app.query_one("#chat-input", ChatInput) is not None
+            assert textual_app.query_one("#slash-hints") is not None
             assert len(textual_app.query("#activity-status")) == 0
             assert len(textual_app.query("#activity-panel")) == 0
             assert len(textual_app.query("#tool-log")) == 0
@@ -317,8 +338,8 @@ def test_textual_app_pilot_runs_two_turns_with_live_memory(tmp_path):
 
         assert textual_app.controller.turn_count == 2
         transcript = textual_app.transcript_plain_text
-        assert "\n\nLunarForge\nFirst pilot answer." in transcript
-        assert "\n\nYou\nNow show status." in transcript
+        assert "\n\nLunarForge:\nFirst pilot answer." in transcript
+        assert "\n\nYou:\nNow show status." in transcript
         assert "Done in " in transcript
         assert any(
             "First pilot answer." in str(message.get("content"))
@@ -364,7 +385,9 @@ def test_textual_progress_block_lifecycle_uses_events(tmp_path):
                     and textual_app.progress_text is not None
                 ),
             )
-            assert "Working" in (textual_app.progress_text or "")
+            assert "Gathering information about the project" in (
+                textual_app.progress_text or ""
+            )
             assert "Elapsed: " in (textual_app.progress_text or "")
 
             factory = EventFactory(
@@ -386,7 +409,7 @@ def test_textual_progress_block_lifecycle_uses_events(tmp_path):
                     },
                 )
             )
-            assert "Inspecting project files." in (
+            assert "Gathering information about the project" in (
                 textual_app.progress_text or ""
             )
             assert "Tool: read_file" in (textual_app.progress_text or "")
@@ -397,7 +420,7 @@ def test_textual_progress_block_lifecycle_uses_events(tmp_path):
                 lambda: textual_app.controller.turn_count == 1,
             )
             assert textual_app.progress_text is None
-            assert "LunarForge\nProgress answer." in (
+            assert "LunarForge:\nProgress answer." in (
                 textual_app.transcript_plain_text
             )
             assert "Done in " in textual_app.transcript_plain_text
@@ -408,7 +431,423 @@ def test_textual_progress_block_lifecycle_uses_events(tmp_path):
         model.release.set()
 
 
-def test_textual_chat_input_paste_multiline_keys_and_bound(tmp_path):
+@pytest.mark.parametrize("approved", (True, False))
+def test_textual_approval_progress_restores_active_phase(
+    tmp_path,
+    approved,
+):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import LunarForgeTextualApp
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(100, 34)) as pilot:
+            textual_app._turn_running = True
+            textual_app._begin_progress("Applying project changes...")
+            factory = EventFactory(
+                session_id=textual_app.controller.session_id,
+                turn_id="turn_approval_progress",
+            )
+            textual_app._handle_agent_event(
+                factory.create(
+                    EventType.PERMISSION_REQUESTED,
+                    {
+                        "request_id": "approval_progress",
+                        "tool_name": "write_file",
+                        "file_path": "README.md",
+                    },
+                )
+            )
+            assert "Waiting for approval" in (
+                textual_app.progress_text or ""
+            )
+            assert "Tool: write_file" in (
+                textual_app.progress_text or ""
+            )
+
+            textual_app._handle_agent_event(
+                factory.create(
+                    EventType.PERMISSION_RESOLVED,
+                    {
+                        "request_id": "approval_progress",
+                        "approved": approved,
+                    },
+                )
+            )
+            await pilot.pause()
+
+            assert "Applying project changes" in (
+                textual_app.progress_text or ""
+            )
+            assert "Approval granted" not in (
+                textual_app.progress_text or ""
+            )
+            assert "Approval denied" not in (
+                textual_app.progress_text or ""
+            )
+            textual_app._turn_running = False
+            textual_app._end_progress()
+
+    asyncio.run(exercise())
+
+
+def test_textual_progress_ellipsis_advances_deterministically(tmp_path):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import (
+        ELLIPSIS_TICK_SECONDS,
+        PROGRESS_REFRESH_SECONDS,
+        _ProgressState,
+        LunarForgeTextualApp,
+    )
+
+    assert ELLIPSIS_TICK_SECONDS == pytest.approx(2.0 / 3.0)
+    assert ELLIPSIS_TICK_SECONDS * 3 == pytest.approx(2.0)
+    assert PROGRESS_REFRESH_SECONDS < ELLIPSIS_TICK_SECONDS
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+    textual_app._render_transcript = lambda: None
+    textual_app._progress = _ProgressState(
+        sentence="Planning the implementation",
+        started_at=0.0,
+        animate_ellipsis=True,
+    )
+
+    # Responsive elapsed-time refreshes do not advance the visible dots.
+    textual_app._refresh_progress_timer()
+    textual_app._refresh_progress_timer()
+    assert textual_app.progress_text.splitlines()[0] == (
+        "Planning the implementation."
+    )
+    textual_app._refresh_progress_ellipsis()
+    assert textual_app.progress_text.splitlines()[0] == (
+        "Planning the implementation.."
+    )
+    textual_app._refresh_progress_ellipsis()
+    assert textual_app.progress_text.splitlines()[0] == (
+        "Planning the implementation..."
+    )
+    textual_app._refresh_progress_ellipsis()
+    assert textual_app.progress_text.splitlines()[0] == (
+        "Planning the implementation."
+    )
+
+    textual_app._progress = None
+    textual_app._refresh_progress_ellipsis()
+    assert textual_app.progress_text is None
+
+
+def test_textual_mount_schedules_visible_ellipsis_at_two_second_cycle(
+    tmp_path,
+):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import (
+        ELLIPSIS_TICK_SECONDS,
+        PROGRESS_REFRESH_SECONDS,
+        LunarForgeTextualApp,
+    )
+
+    class RecordingIntervalApp(LunarForgeTextualApp):
+        def __init__(self, *args, **kwargs):
+            self.scheduled_intervals = []
+            super().__init__(*args, **kwargs)
+
+        def set_interval(self, interval, callback, **kwargs):
+            self.scheduled_intervals.append(
+                (interval, callback.__name__)
+            )
+            return super().set_interval(interval, callback, **kwargs)
+
+    textual_app = RecordingIntervalApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            scheduled = dict(
+                (callback_name, interval)
+                for interval, callback_name
+                in textual_app.scheduled_intervals
+            )
+            assert scheduled["_refresh_progress_timer"] == pytest.approx(
+                PROGRESS_REFRESH_SECONDS
+            )
+            assert scheduled[
+                "_refresh_progress_ellipsis"
+            ] == pytest.approx(ELLIPSIS_TICK_SECONDS)
+            assert (
+                scheduled["_refresh_progress_ellipsis"] * 3
+            ) == pytest.approx(2.0)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("viewport", ((56, 32), (140, 50)))
+def test_textual_long_approval_keeps_scroll_body_and_fixed_footer(
+    tmp_path,
+    viewport,
+):
+    pytest.importorskip("textual")
+    from textual.containers import VerticalScroll
+
+    from lunar_forge.ui.textual_app import LunarForgeTextualApp
+
+    request = ApprovalRequest.create(
+        kind="command",
+        title="Run a reviewed project command",
+        summary="Long approval summary " * 80,
+        details="Long wrapped approval detail line. " * 300,
+        risk="medium",
+        mode="local",
+        command="python scripts/verify_project.py --all-checks",
+        tool_name="run_command",
+    )
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=viewport) as pilot:
+            textual_app._turn_running = True
+            textual_app._begin_progress("Running an approved command...")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                decision_future = executor.submit(
+                    textual_app.controller.approval_provider.request_approval,
+                    request,
+                )
+                await _wait_for(
+                    pilot,
+                    lambda: (
+                        textual_app._approval_bridge.pending_request
+                        is not None
+                    ),
+                )
+                panel = textual_app.query_one("#approval-panel")
+                body = textual_app.query_one(
+                    "#approval-details-scroll",
+                    VerticalScroll,
+                )
+                actions = textual_app.query_one("#approval-actions")
+                approve = textual_app.query_one("#approval-approve")
+                deny = textual_app.query_one("#approval-deny")
+                input_area = textual_app.query_one("#input-area")
+
+                assert panel.display is True
+                assert body.max_scroll_y > 0
+                assert actions.region.y >= body.region.y
+                assert actions.region.bottom <= panel.region.bottom
+                assert approve.region.width > 0
+                assert deny.region.width > 0
+                assert approve.region.bottom <= textual_app.screen.size.height
+                assert deny.region.bottom <= textual_app.screen.size.height
+                assert input_area.region.y >= panel.region.bottom - 1
+
+                body.scroll_end(animate=False)
+                await pilot.pause()
+                assert body.scroll_y > 0
+
+                await pilot.click("#approval-approve")
+                await _wait_for(
+                    pilot,
+                    lambda: (
+                        textual_app._approval_bridge.pending_request is None
+                    ),
+                )
+                decision = decision_future.result(timeout=1)
+                assert decision.approved is True
+                assert "Running an approved command" in (
+                    textual_app.progress_text or ""
+                )
+            textual_app._turn_running = False
+            textual_app._end_progress()
+
+    asyncio.run(exercise())
+
+
+def test_textual_slash_hints_filter_and_hide(tmp_path):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(120, 40)) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            hints = textual_app.query_one("#slash-hints")
+
+            chat_input.load_text("/")
+            await _wait_for(pilot, lambda: hints.display)
+            rendered = str(hints.render())
+            for command in (
+                "/help",
+                "/status",
+                "/compact",
+                "/sessions",
+                "/resume",
+            ):
+                assert command in rendered
+
+            chat_input.load_text("/s")
+            await pilot.pause()
+            rendered = str(hints.render())
+            assert "/show-usage" in rendered
+            assert "/subagents" in rendered
+            assert "/sessions" in rendered
+
+            chat_input.load_text("/git")
+            await pilot.pause()
+            rendered = str(hints.render())
+            assert "/git status" in rendered
+            assert "/git commit" in rendered
+
+            chat_input.load_text("/not-a-command")
+            await pilot.pause()
+            assert "No matching commands." in str(hints.render())
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert hints.display is False
+
+            chat_input.load_text("/status")
+            await _wait_for(pilot, lambda: hints.display)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert hints.display is False
+            assert textual_app.controller.turn_count == 0
+
+            chat_input.load_text("ordinary text")
+            await pilot.pause()
+            assert hints.display is False
+
+    asyncio.run(exercise())
+
+
+def _create_resumable_sessions(project_root, count):
+    for index in range(count):
+        logger = create_session_logger(project_root, environ={})
+        logger.log(
+            "user_prompt",
+            prompt=f"Historical question {index}.",
+        )
+        logger.log(
+            "assistant_message",
+            text=f"Historical answer {index}.",
+        )
+
+
+def test_textual_short_sessions_picker_renders_without_scroll(tmp_path):
+    pytest.importorskip("textual")
+    from textual.containers import VerticalScroll
+
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    _create_resumable_sessions(tmp_path, 1)
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(100, 34)) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/sessions"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            details = textual_app.query_one(
+                "#slash-details-scroll",
+                VerticalScroll,
+            )
+            assert textual_app.query_one("#slash-popup").display is True
+            assert details.max_scroll_y == 0
+            assert "Select a compatible session" in str(
+                textual_app.query_one("#slash-details").render()
+            )
+            assert chat_input.region.height > 0
+            assert chat_input.region.bottom <= textual_app.screen.size.height
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("viewport", ((62, 30), (140, 52)))
+def test_textual_long_sessions_picker_is_bounded_and_keeps_input_visible(
+    tmp_path,
+    viewport,
+):
+    pytest.importorskip("textual")
+    from textual.containers import VerticalScroll
+
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    _create_resumable_sessions(tmp_path, 24)
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=viewport) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/sessions"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            popup = textual_app.query_one("#slash-popup")
+            details = textual_app.query_one(
+                "#slash-details-scroll",
+                VerticalScroll,
+            )
+            input_area = textual_app.query_one("#input-area")
+            frame = textual_app.query_one("#chat-frame")
+
+            assert popup.display is True
+            assert details.max_scroll_y > 0
+            assert popup.region.bottom <= input_area.region.y + 1
+            assert input_area.region.height > 0
+            assert chat_input.region.height > 0
+            assert chat_input.region.bottom <= frame.region.bottom
+            assert frame.region.bottom <= textual_app.screen.size.height
+
+            details.scroll_end(animate=False)
+            await pilot.pause()
+            assert details.scroll_y > 0
+            chat_input.focus()
+            chat_input.load_text("/status")
+            await pilot.pause()
+            assert chat_input.has_focus is True
+
+    asyncio.run(exercise())
+
+
+def test_textual_transcript_labels_are_colon_styled_and_separated(tmp_path):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import (
+        TRANSCRIPT_LABEL_STYLES,
+        LunarForgeTextualApp,
+    )
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(120, 40)) as pilot:
+            textual_app._write_transcript("user", "First message.")
+            textual_app._write_transcript(
+                "assistant",
+                "Second message.",
+            )
+            await pilot.pause()
+
+            assert textual_app.transcript_plain_text == (
+                "You:\nFirst message.\n\n"
+                "LunarForge:\nSecond message."
+            )
+            entries = textual_app._transcript_entries
+            assert entries[0].label_style == (
+                TRANSCRIPT_LABEL_STYLES["user"]
+            )
+            assert entries[1].label_style == (
+                TRANSCRIPT_LABEL_STYLES["assistant"]
+            )
+            assert entries[0].label_style != entries[1].label_style
+
+    asyncio.run(exercise())
+
+
+def test_textual_chat_input_paste_multiline_keys_and_bound(
+    tmp_path,
+    monkeypatch,
+):
     pytest.importorskip("textual")
     from textual import events
 
@@ -429,13 +868,28 @@ def test_textual_chat_input_paste_multiline_keys_and_bound(tmp_path):
         async with textual_app.run_test(size=(120, 40)) as pilot:
             chat_input = textual_app.query_one("#chat-input", ChatInput)
 
+            textual_app.copy_to_clipboard("clipboard\npaste")
+            await pilot.press("ctrl+v")
+            await pilot.pause()
+            assert chat_input.text == "clipboard\npaste"
+            assert textual_app.controller.turn_count == 0
+
+            textual_app.copy_to_clipboard("")
+            monkeypatch.setitem(
+                ChatInput.action_paste.__globals__,
+                "_read_system_clipboard_text",
+                lambda: "fallback\nclipboard",
+            )
+            chat_input.load_text("")
+            chat_input.action_paste()
+            await pilot.pause()
+            assert chat_input.text == "fallback\nclipboard"
+            assert textual_app.controller.turn_count == 0
+
+            chat_input.load_text("")
             await chat_input._on_paste(events.Paste("first\nsecond"))
             assert chat_input.text == "first\nsecond"
-
-            chat_input.load_text("alpha")
-            chat_input.move_cursor((0, 5))
-            await pilot.press("shift+enter")
-            assert chat_input.text == "alpha\n"
+            assert textual_app.controller.turn_count == 0
 
             chat_input.load_text("")
             await chat_input._on_paste(
@@ -467,6 +921,36 @@ def test_textual_chat_input_paste_multiline_keys_and_bound(tmp_path):
             await pilot.pause()
             assert textual_app.controller.turn_count == 1
             assert "Completed turns: 1" in (
+                textual_app.transcript_plain_text
+            )
+
+    asyncio.run(exercise())
+
+
+def test_textual_ctrl_v_unavailable_shows_note_without_submitting(
+    tmp_path,
+    monkeypatch,
+):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+    monkeypatch.setitem(
+        ChatInput.action_paste.__globals__,
+        "_read_system_clipboard_text",
+        lambda: None,
+    )
+
+    async def exercise():
+        async with textual_app.run_test(size=(100, 32)) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            textual_app.copy_to_clipboard("")
+            chat_input.action_paste()
+            await pilot.pause()
+
+            assert chat_input.text == ""
+            assert textual_app.controller.turn_count == 0
+            assert "Clipboard text was unavailable" in (
                 textual_app.transcript_plain_text
             )
 
@@ -538,6 +1022,9 @@ def test_textual_config_popup_validates_and_saves_only_explicitly(tmp_path):
 
             slash_choice = textual_app.query_one("#slash-choice", Select)
             assert slash_choice.value == "local"
+            assert textual_app.query_one("#slash-apply").display is True
+            assert textual_app.query_one("#slash-save").display is True
+            assert textual_app.query_one("#slash-save-user").display is True
             slash_choice.value = "docker"
             await pilot.click("#slash-apply")
             await _wait_for(
@@ -743,6 +1230,270 @@ def test_textual_app_pilot_resolves_command_approval(tmp_path):
         assert '"approved":true' in session_text
 
     asyncio.run(exercise())
+
+
+def test_textual_finish_without_active_task_keeps_chat_open(tmp_path):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    textual_app = LunarForgeTextualApp(tmp_path, AppConfig())
+
+    async def exercise():
+        async with textual_app.run_test(size=(100, 32)) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            chat_input.text = "/finish"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert textual_app.controller.turn_count == 0
+            assert "No active task to finish." in (
+                textual_app.transcript_plain_text
+            )
+            assert chat_input.disabled is False
+            assert textual_app._turn_running is False
+
+    asyncio.run(exercise())
+
+
+def test_textual_finish_clears_pending_approval_and_keeps_chat_open(
+    tmp_path,
+):
+    pytest.importorskip("textual")
+    from lunar_forge.ui.textual_app import ChatInput, LunarForgeTextualApp
+
+    model = _SequenceModel(
+        (
+            ModelResponse(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        id="finish-command",
+                        name="run_command",
+                        arguments={"command": "python --version"},
+                    ),
+                ),
+            ),
+            ModelResponse(text="The denied command was not run."),
+        )
+    )
+    textual_app = LunarForgeTextualApp(
+        tmp_path,
+        AppConfig(),
+        model_client=model,
+    )
+
+    async def exercise():
+        async with textual_app.run_test(size=(110, 36)) as pilot:
+            chat_input = textual_app.query_one("#chat-input", ChatInput)
+            chat_input.text = (
+                "Use run_command to run python --version. Do not edit files."
+            )
+            await pilot.press("enter")
+            await _wait_for(
+                pilot,
+                lambda: (
+                    textual_app._approval_bridge.pending_request is not None
+                ),
+            )
+            assert chat_input.disabled is False
+
+            chat_input.text = "/finish"
+            chat_input.focus()
+            await pilot.press("enter")
+            await _wait_for(
+                pilot,
+                lambda: (
+                    textual_app._approval_bridge.pending_request is None
+                    and not textual_app._turn_running
+                ),
+            )
+
+            assert textual_app.controller.turn_count == 0
+            assert "Task finished. Current-turn changes were revoked." in (
+                textual_app.transcript_plain_text
+            )
+            assert "No current-turn file changes needed to be revoked." in (
+                textual_app.transcript_plain_text
+            )
+            assert chat_input.disabled is False
+
+        session_text = (
+            textual_app.controller.session_logger.path.read_text(
+                encoding="utf-8"
+            )
+        )
+        assert '"event":"turn.cancelled"' in session_text
+        assert '"event":"rollback.started"' in session_text
+        assert '"event":"rollback.finished"' in session_text
+        assert '"approved":false' in session_text
+
+    asyncio.run(exercise())
+
+
+def test_chat_controller_finish_rolls_back_only_current_turn_files(
+    tmp_path,
+):
+    edited = tmp_path / "edited.txt"
+    previous_turn = tmp_path / "previous-turn.txt"
+    unrelated = tmp_path / "unrelated.txt"
+    edited.write_text("before active turn\n", encoding="utf-8")
+    previous_turn.write_text("kept from prior turn\n", encoding="utf-8")
+    unrelated.write_text("unrelated dirty content\n", encoding="utf-8")
+    callback_reached = Event()
+    release_callback = Event()
+
+    def event_runner(prompt, project_root, **kwargs):
+        factory = kwargs["event_factory"]
+        edited_result = write_file(
+            project_root,
+            "edited.txt",
+            "changed by active turn\n",
+            overwrite=True,
+        )
+        yield factory.create(
+            EventType.TOOL_FINISHED,
+            {
+                "tool_name": "write_file",
+                "call_id": "edit-existing",
+                "ok": True,
+                "result": edited_result,
+            },
+        )
+        created_result = write_file(
+            project_root,
+            "created-this-turn.txt",
+            "created by active turn\n",
+        )
+        yield factory.create(
+            EventType.TOOL_FINISHED,
+            {
+                "tool_name": "write_file",
+                "call_id": "create-new",
+                "ok": True,
+                "result": created_result,
+            },
+        )
+        yield factory.create(
+            EventType.ASSISTANT_MESSAGE_COMPLETED,
+            {"text": "This result should be cancelled."},
+        )
+
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        DenyApprovalProvider(),
+        event_runner=event_runner,
+    )
+
+    def observe(event):
+        if (
+            event.type == EventType.TOOL_FINISHED.value
+            and event.payload.get("call_id") == "create-new"
+        ):
+            callback_reached.set()
+            assert release_callback.wait(2)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            controller.send_turn,
+            "Make two tracked file changes.",
+            event_callback=observe,
+        )
+        assert callback_reached.wait(1)
+        assert controller.request_active_turn_finish() is True
+        release_callback.set()
+        with pytest.raises(ChatTurnCancelled) as cancelled:
+            future.result(timeout=3)
+
+    summary = cancelled.value.summary
+    assert summary.complete is True
+    assert summary.restored_files == ("edited.txt",)
+    assert summary.removed_files == ("created-this-turn.txt",)
+    assert edited.read_text(encoding="utf-8") == "before active turn\n"
+    assert not (tmp_path / "created-this-turn.txt").exists()
+    assert previous_turn.read_text(encoding="utf-8") == (
+        "kept from prior turn\n"
+    )
+    assert unrelated.read_text(encoding="utf-8") == (
+        "unrelated dirty content\n"
+    )
+    assert controller.turn_count == 0
+    assert controller.conversation_messages == ()
+
+    session_text = controller.session_logger.path.read_text(
+        encoding="utf-8"
+    )
+    assert '"event":"turn.cancelled"' in session_text
+    assert '"event":"rollback.started"' in session_text
+    assert '"event":"rollback.finished"' in session_text
+    assert '"edited.txt"' in session_text
+    assert '"created-this-turn.txt"' in session_text
+
+
+def test_chat_controller_finish_skips_tracked_file_changed_externally(
+    tmp_path,
+):
+    callback_reached = Event()
+    release_callback = Event()
+
+    def event_runner(prompt, project_root, **kwargs):
+        factory = kwargs["event_factory"]
+        created_result = write_file(
+            project_root,
+            "concurrent.txt",
+            "created by active turn\n",
+        )
+        yield factory.create(
+            EventType.TOOL_FINISHED,
+            {
+                "tool_name": "write_file",
+                "call_id": "create-concurrent",
+                "ok": True,
+                "result": created_result,
+            },
+        )
+        yield factory.create(
+            EventType.ASSISTANT_MESSAGE_COMPLETED,
+            {"text": "This result should be cancelled."},
+        )
+
+    controller = TextualChatController(
+        tmp_path,
+        AppConfig(),
+        DenyApprovalProvider(),
+        event_runner=event_runner,
+    )
+
+    def observe(event):
+        if event.payload.get("call_id") == "create-concurrent":
+            (tmp_path / "concurrent.txt").write_text(
+                "changed outside LunarForge\n",
+                encoding="utf-8",
+            )
+            callback_reached.set()
+            assert release_callback.wait(2)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            controller.send_turn,
+            "Create a tracked file.",
+            event_callback=observe,
+        )
+        assert callback_reached.wait(1)
+        assert controller.request_active_turn_finish() is True
+        release_callback.set()
+        with pytest.raises(ChatTurnCancelled) as cancelled:
+            future.result(timeout=3)
+
+    summary = cancelled.value.summary
+    assert summary.complete is False
+    assert summary.removed_files == ()
+    assert summary.skipped_files == (
+        "concurrent.txt (changed after LunarForge's write)",
+    )
+    assert (tmp_path / "concurrent.txt").read_text(encoding="utf-8") == (
+        "changed outside LunarForge\n"
+    )
 
 
 def test_chat_controller_runs_two_turns_in_one_session(tmp_path):
@@ -1092,6 +1843,104 @@ def test_textual_renderer_consumes_status_tool_final_and_error_events():
     assert final.transcript_role == "assistant"
     assert error is not None and error.transcript_text == "Turn exploded."
     assert error.transcript_role == "error"
+
+
+def test_textual_renderer_derives_phase_aware_public_progress():
+    factory = EventFactory(
+        session_id="session_phases",
+        turn_id="turn_phases",
+    )
+    renderer = TextualEventRenderer()
+
+    turn = renderer.handle(
+        factory.create(
+            EventType.TURN_STARTED,
+            {"request": "Implement a pricing page."},
+        )
+    )
+    generic = renderer.handle(
+        factory.create(
+            EventType.STATUS_UPDATED,
+            {"message": "Working..."},
+        )
+    )
+    planner = renderer.handle(
+        factory.create(
+            EventType.MODEL_CALL_STARTED,
+            {"phase": "planner"},
+        )
+    )
+    writer = renderer.handle(
+        factory.create(
+            EventType.TOOL_STARTED,
+            {"tool_name": "write_file"},
+        )
+    )
+    validation = renderer.handle(
+        factory.create(EventType.VALIDATION_STARTED, {})
+    )
+    browser = renderer.handle(
+        factory.create(EventType.BROWSER_STARTED, {})
+    )
+    git = renderer.handle(
+        factory.create(EventType.GIT_PROPOSAL, {})
+    )
+    external = renderer.handle(
+        factory.create(
+            EventType.TOOL_STARTED,
+            {"tool_name": "web_design.review_files"},
+        )
+    )
+    compaction = renderer.handle(
+        factory.create(EventType.MEMORY_COMPACTION_STARTED, {})
+    )
+    cancelled = renderer.handle(
+        factory.create(EventType.TURN_CANCELLED, {})
+    )
+    rollback = renderer.handle(
+        factory.create(
+            EventType.ROLLBACK_FINISHED,
+            {
+                "restored_files": ["one.txt"],
+                "removed_files": ["two.txt"],
+            },
+        )
+    )
+    waiting = renderer.handle(
+        factory.create(
+            EventType.PERMISSION_REQUESTED,
+            {
+                "command": "python --version",
+                "tool_name": "run_command",
+            },
+        )
+    )
+    resolved = renderer.handle(
+        factory.create(
+            EventType.PERMISSION_RESOLVED,
+            {"approved": True},
+        )
+    )
+
+    assert turn.status == (
+        "Planning how to implement the requested feature..."
+    )
+    assert generic is None
+    assert planner.status == "Planning the implementation..."
+    assert writer.status == "Applying project changes..."
+    assert validation.status == "Running validation..."
+    assert browser.status == "Checking the app in a browser..."
+    assert git.status == "Preparing Git commit..."
+    assert external.status == "Running external tool review..."
+    assert compaction.status == "Compacting conversation context..."
+    assert cancelled.status == "Finishing current task..."
+    assert rollback.status == "Finishing current task..."
+    assert rollback.tool_text == "Revoked 2 tracked file change(s)"
+    assert waiting.status == "Waiting for approval"
+    assert waiting.tool_text == "Command: python --version"
+    assert waiting.approval_state == "requested"
+    assert resolved.status is None
+    assert resolved.approval_state == "approved"
 
 
 def test_textual_slash_commands_are_handled(tmp_path):

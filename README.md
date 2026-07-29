@@ -173,23 +173,43 @@ temporary event-driven progress, and the slash-command surface below. It
 reuses the event stream, approval providers, session JSONL, resume, and
 compaction systems rather than creating UI-specific copies.
 
-The layout is deliberately small:
+The layout is deliberately small and uses one common accent-colored frame:
 
-- a top card whose border title is `LunarForge v0.x`, without a duplicate
-  version in the card body;
+- an outer border titled `LunarForge v0.x`, without a duplicate version in
+  the header body;
 - `What are we building today?` for a new session or
   `Let’s get back to building.` for a resumed session;
 - project, model, reasoning effort, and mode metadata;
-- a readable chat transcript with blank lines between messages and turns; and
+- a readable chat transcript with subtly distinct `You:` and `LunarForge:`
+  labels plus blank lines between messages and turns; and
 - a bottom input that supports normal and multiline paste, `Enter` to send,
-  and `Shift+Enter` for a newline.
+  and `Ctrl+V` when the terminal/Textual driver provides clipboard or paste
+  data. Shift+Enter is not advertised or supported.
+
+The header, transcript, and input remain inside that frame and use matching
+horizontal separators. The header and input no longer look like unrelated
+nested boxes.
 
 Permanent recent-activity, last-session, changed-file, tips/status, shortcut,
 Docker-status, tool-log, and activity panels are not part of this layout.
 While a turn runs, public status/tool information appears in one temporary
-progress block inside the transcript. The block disappears or is replaced by
-the final assistant response, which includes elapsed time such as
-`Done in 1 minute 12 seconds.`
+progress block inside the transcript. It uses phase-aware descriptions such as
+`Gathering information about the project`, `Planning the implementation`,
+`Applying project changes`, or `Running validation`, with the current bounded
+tool/command below it. Ellipses animate at a relaxed cadence in UI state only.
+During permission requests it temporarily shows `Waiting for approval`;
+approving or denying restores the suspended phase instead of leaving
+`Approval granted` stuck.
+The block disappears or is replaced by the final assistant response, which
+includes elapsed time such as `Done in 1 minute 12 seconds.`
+
+Approval details use a bounded scrollable body with a fixed title and fixed
+Deny/Approve footer, so long commands remain reviewable without moving the
+buttons or covering the input.
+
+Long `/sessions` pickers also use a bounded scrollable body. Short lists stay
+simple; long lists cannot push the bottom input outside the shared frame in
+narrow, normal, or full-screen layouts.
 
 The slash-command surface mirrors existing LunarForge workflows:
 
@@ -198,6 +218,8 @@ The slash-command surface mirrors existing LunarForge workflows:
 /status
 /clear
 /exit
+/finish
+/compact
 /project
 /plan
 /docker
@@ -226,6 +248,12 @@ The slash-command surface mirrors existing LunarForge workflows:
 /plugins list
 ```
 
+Typing `/` shows only five common hints (`/help`, `/status`, `/compact`,
+`/sessions`, and `/resume`). Continuing with prefixes such as `/s`, `/git`,
+or `/browser` filters the same central command list, including nested
+commands. The hint is non-blocking and disappears on submit, `Escape`,
+non-slash input, or while an approval/popup is visible.
+
 Commands accept typed arguments and popup forms. A command that needs missing
 arguments opens its form instead of starting a broken turn. `/resume` opens a
 picker, while `/resume latest` keeps the direct shortcut. `/project` validates
@@ -233,25 +261,38 @@ and switches the active project, reloads that project’s instructions/config,
 and starts fresh conversation context. `/new` asks for a natural-language
 prompt and delegates to the existing new-project workflow.
 
+`/finish` is available while an agent turn is running. It requests
+best-effort cancellation, denies a pending approval, and conservatively
+restores checkpoint-backed edits or removes files provably created by that
+turn. It keeps chat open and never rolls back unrelated or previous-turn
+changes. If a file changed outside LunarForge after its last tracked write,
+the rollback is reported as partial instead of overwriting that state.
+`Ctrl+C` may still interrupt or close the whole chat process.
+
 `/browser-validate` supports `url`, `serve`, `screenshot`,
 `no-screenshot`, `full-page`, `width`, `height`, `startup-timeout-ms`, and
 repeatable `check` values.
 
 Config-backed commands show their current value and choices. Users may apply a
 value to the active chat only or explicitly save it to
-`.agent/config.yaml`. Typed values default to session scope; `scope=project`
-is the explicit save choice:
+`.agent/config.yaml` or `~/.lunar-forge/config.yaml`. Typed values default to
+session scope; `scope=project` and `scope=global` are explicit persistence
+choices:
 
 ```text
 /reasoning-effort high
 /reasoning-effort xhigh scope=project
+/reasoning-effort medium scope=global
 /runtime docker scope=session
 ```
 
 Session-only values affect future turns until changed or until chat exits.
-Saving project config updates the active session immediately. LunarForge must
-not silently persist session-only settings or store secrets in project config.
-All guarded slash-command actions still resolve through approval providers.
+Project and user saves ask for approval and update the active session only
+after persistence succeeds. Denied or failed writes leave active state
+unchanged. LunarForge does not silently persist session-only settings or store
+secrets in either config. Existing precedence remains CLI flags, project
+config, user config, environment, then defaults. All guarded slash-command
+actions still resolve through approval providers.
 
 Working-memory compaction continues to use:
 
@@ -268,7 +309,18 @@ threshold is reached, older turns are summarized with the configured model,
 recent turns remain verbatim, and a bounded redacted summary is written to
 `.agent/summaries/<session-id>.summary.json`. Compaction never runs while an
 approval or tool call is pending. Resume loads the compacted summary without
-replaying historical actions.
+replaying historical actions. `/compact` invokes this same flow manually and
+reports `Context compacted. Summary saved.` or a clear non-error message when
+there is not enough older context.
+
+Terminal caveat: some terminals do not expose their system clipboard.
+LunarForge handles Textual paste events, `Ctrl+V`, and a dependency-free
+Windows clipboard fallback when Textual's clipboard is empty. Use the
+terminal's paste action when `Ctrl+V` is reserved. Shift+Enter is not a
+supported newline shortcut; use multiline paste when a prompt needs embedded
+newlines. If clipboard text is unavailable, the UI shows a short note rather
+than crashing. Verify the input retains pasted/newline content before pressing
+`Enter`; clipboard contents are not logged until submitted.
 
 The one-shot CLI continues to work without the `tui` extra. Core events remain
 plain, bounded, redacted, and transport-neutral for a future UI. A

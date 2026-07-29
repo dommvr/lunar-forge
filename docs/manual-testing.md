@@ -2764,8 +2764,9 @@ and cleanup. This is the final 20-check execution order and expected result:
 9. Paste the two-line prompt in
    [Input, normal paste, and multiline paste](#input-normal-paste-and-multiline-paste).
    Expected: its newline is preserved.
-10. Press `Shift+Enter`, then `Enter`.
-    Expected: the first key inserts a newline and the second submits once.
+10. Paste a multiline prompt, verify both lines remain in the input, then
+    press `Enter`.
+    Expected: paste preserves the newline and `Enter` submits once.
 11. Run `/status`.
     Expected: current project, model, effort, runtime, permissions, network,
     subagents, commit, MCP, plugins, session, resume, and compaction values.
@@ -2809,11 +2810,12 @@ lunar-forge chat --project $ChatProject
 
 Expected:
 
-- the top card border title is exactly `LunarForge v0.x`;
-- the card body does not repeat the version;
+- one common outer frame border title is exactly `LunarForge v0.x`;
+- the header body does not repeat the version;
 - the new-session greeting is `What are we building today?`;
 - project, model, reasoning effort, and mode are visible;
-- the main body contains the chat transcript and bottom input;
+- the header, chat transcript, and bottom input are inside the same frame;
+- matching horizontal separators divide header/transcript/input;
 - there is readable blank space between messages and between turns; and
 - there are no permanent recent-activity, last-session, changed-file,
   tips/status, shortcut, Docker-status, tool-log, or activity panels.
@@ -2848,7 +2850,7 @@ Read marker.txt and explain its value. Do not edit files or run commands.
 While the turn runs, expected temporary transcript content resembles:
 
 ```text
-Working: reading the requested project file.
+Gathering information about the project...
 Tool: read_file marker.txt
 Elapsed: 00:04
 ```
@@ -2856,6 +2858,10 @@ Elapsed: 00:04
 Expected after completion:
 
 - the progress block was driven by structured public events;
+- the description is phase-aware and never falls back to only `Working...`;
+- an ellipsis cycles through `.`, `..`, and `...` while the phase is active;
+- each visible dot state lasts roughly 650–700 milliseconds, so `.`, `..`,
+  and `...` complete one cycle in about two seconds without looking twitchy;
 - hidden reasoning was never displayed;
 - the temporary block disappeared or was replaced by the final response;
 - only one final assistant response remains for the turn; and
@@ -2869,17 +2875,27 @@ Use run_command to run python --version. Do not edit files.
 ```
 
 The command must stay paused until the Textual approval provider resolves it.
-The temporary block may show the bounded command preview, but approval must not
-fall back to raw terminal `input()`.
+Expected while paused:
+
+```text
+Waiting for approval.
+Command: python --version
+Elapsed: 00:04
+```
+
+Approve it. Expected: the progress description returns to its previous phase
+or advances to the next public phase; it never remains `Approval granted`.
+Repeat and deny it; denial may appear in the final result, but must not become
+a stuck progress state. Approval must not fall back to raw terminal `input()`.
 
 ### Input, normal paste, and multiline paste
 
 Test these input paths separately:
 
 1. Paste a one-line prompt and press `Enter`.
-2. Type the first line below, press `Shift+Enter`, type the second line, then
-   press `Enter`.
-3. Paste the entire multiline block and press `Enter`.
+2. Paste the entire multiline block and press `Enter`.
+3. Copy the same block, focus the input, press `Ctrl+V`, verify both lines
+   remain visible, and only then press `Enter`.
 
 ```text
 Summarize marker.txt.
@@ -2889,12 +2905,130 @@ Do not edit files or run commands.
 Expected:
 
 - normal paste preserves the complete prompt;
-- `Shift+Enter` inserts a newline without sending;
 - multiline paste preserves its newline and does not submit only the first
   line;
+- `Ctrl+V` pastes when the terminal/Textual driver exposes clipboard or paste
+  data and does not auto-submit;
 - `Enter` sends exactly one message after the input is ready; and
 - oversized paste is bounded or produces a clear warning instead of freezing
   the app.
+
+Shift+Enter is not a supported newline shortcut. Some terminals reserve
+`Ctrl+V`; in that case, use the terminal's paste action. The Textual app
+handles paste events and a dependency-free Windows clipboard fallback, but it
+cannot recover clipboard data the terminal/OS never exposes. An unavailable
+clipboard produces a short note and no submission.
+
+### Long session list and persistent input
+
+Create enough disposable, project-compatible session logs to exercise the
+long picker without spending model tokens:
+
+```powershell
+$env:LF_MANUAL_SESSION_PROJECT = $ChatProject
+@'
+import os
+from pathlib import Path
+from lunar_forge.runtime.sessions import create_session_logger
+
+root = Path(os.environ["LF_MANUAL_SESSION_PROJECT"])
+for index in range(24):
+    logger = create_session_logger(root, environ={})
+    logger.log("user_prompt", prompt=f"Disposable history {index}.")
+    logger.log("assistant_message", text=f"Disposable answer {index}.")
+'@ | python -
+Remove-Item Env:LF_MANUAL_SESSION_PROJECT
+lunar-forge chat --project $ChatProject
+```
+
+Run:
+
+```text
+/sessions
+```
+
+Expected: the compatible session list is bounded and vertically scrollable,
+the transcript retains its own scrolling, and the bottom input remains
+visible, focusable, and usable. Repeat around 62 columns by 30 rows and again
+in a tall or full-screen terminal. With only one compatible prior session, the
+same picker remains simple and does not show unnecessary scrolling.
+
+### Finish the active task and revoke its changes
+
+First run:
+
+```text
+/finish
+```
+
+Expected: `No active task to finish.` and the chat remains open.
+
+Create two files before the active-turn test:
+
+```powershell
+Set-Content -LiteralPath (Join-Path $ChatProject "finish-revoke.txt") -Value "original"
+Set-Content -LiteralPath (Join-Path $ChatProject "unrelated-dirty.txt") -Value "keep me"
+```
+
+In chat, ask:
+
+```text
+Replace finish-revoke.txt with "changed in this turn", then use run_command to run python --version. Do not change unrelated-dirty.txt.
+```
+
+Approve the file edit. When the later command approval appears, type `/finish`
+in the still-available chat input and submit it. Expected:
+
+- the pending command approval is denied/cleared;
+- the running turn stops at its next safe boundary and chat stays open;
+- `finish-revoke.txt` is restored from the first checkpoint for this turn;
+- `unrelated-dirty.txt` still contains `keep me`;
+- the transcript reports
+  `Task finished. Current-turn changes were revoked.` or a precise partial
+  rollback result; and
+- the session JSONL contains bounded `turn.cancelled`, `rollback.started`, and
+  `rollback.finished` records.
+
+Repeat with a request that creates `created-during-finish.txt` before reaching
+an approval. `/finish` may remove that new file only when LunarForge tracked it
+as created by the current turn and its current fingerprint still matches the
+last tracked write. If you modify a tracked file yourself before cancellation,
+expected behavior is a partial rollback that leaves the file untouched and
+lists it as skipped. Previous-turn changes must also remain untouched.
+
+Managed browser workflows retain their existing `finally` cleanup.
+Cancellation is best-effort at safe event boundaries; it does not force-kill
+arbitrary host processes. `Ctrl+C` may still interrupt or close the entire
+chat process, whereas `/finish` keeps the app open.
+
+### Long approval details and one-frame resizing
+
+Start chat first in a normal terminal window around 80 columns by 32 rows.
+Submit this disposable, intentionally long command request:
+
+```text
+Use run_command to run python -c "print('approval-layout-check')" --description "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one twenty-two twenty-three twenty-four". Do not edit files.
+```
+
+Do not approve it yet. Expected:
+
+- the approval title remains fixed;
+- summary/details wrap inside a vertically scrollable body;
+- Deny and Approve remain together in a fixed footer and are reachable;
+- the approval panel does not overlap or corrupt the input;
+- the transcript still scrolls independently; and
+- the common `LunarForge v0.x` outer border still encloses the header,
+  transcript, approval area, and input.
+
+Scroll the approval body to its end, then choose **Deny**. Expected: the button
+returns a denied decision normally and the temporary progress does not remain
+`Approval denied`.
+
+Maximize the terminal to fullscreen and repeat the same request. Then restore
+the normal window size while approval is visible. Expected: buttons remain
+aligned and visible in both sizes, details remain bounded/scrollable, the
+header/transcript/input separators retain the same accent color, and there are
+no competing top-card or input borders.
 
 ### Slash-command discovery and argument routing
 
@@ -2911,6 +3045,8 @@ Expected `/help` entries:
 /status
 /clear
 /exit
+/finish
+/compact
 /project
 /plan
 /docker
@@ -2983,8 +3119,8 @@ Expected popup:
 
 - it shows the current effective reasoning effort;
 - it lists `low`, `medium`, `high`, `xhigh`, and `max`; and
-- it offers `this chat session only` and
-  `save to project .agent/config.yaml`.
+- it offers `this chat session only`, `save to project .agent/config.yaml`,
+  and `save to user ~/.lunar-forge/config.yaml`.
 
 Choose `high` for this chat session only, then run:
 
@@ -3034,6 +3170,116 @@ immediately. Repeat representative popup checks for `/plan`, `/docker`,
 Project-scope saves must use normal file safety, contain no raw API key or other
 secret, and require an explicit save choice. `/commit`, `/commit-message`, and
 `/show-usage` remain session controls in this wave.
+
+### Focused chat-polish smoke sequence
+
+This sequence covers manual compaction, lightweight hints, global config
+persistence, paste behavior, and transcript labels. Keep `$ChatProject` under
+the disposable `$ManualRoot`; summaries created here must never be committed.
+
+Before testing global scope, preserve the real user config:
+
+```powershell
+$UserConfig = Join-Path $HOME ".lunar-forge\config.yaml"
+$UserConfigExisted = Test-Path -LiteralPath $UserConfig
+$UserConfigBackup = Join-Path $ManualRoot "user-config.yaml.backup"
+if ($UserConfigExisted) {
+  Copy-Item -LiteralPath $UserConfig -Destination $UserConfigBackup
+}
+lunar-forge chat --project $ChatProject
+```
+
+In the input, type exactly:
+
+```text
+/
+```
+
+Expected: a small non-blocking hint shows about five popular commands:
+`/help`, `/status`, `/compact`, `/sessions`, and `/resume`. It does not show
+the full command encyclopedia.
+
+Replace the input with:
+
+```text
+/s
+```
+
+Expected: the hint is filtered and includes `/show-usage`, `/subagents`, and
+`/sessions`. Replace it with `/git` and expect `/git status` plus
+`/git commit`. Press `Escape`; the hint disappears. Submit `/status`; the hint
+also disappears and no agent turn starts.
+
+Create enough safe chat history by submitting these as three separate turns:
+
+```text
+Remember that this disposable project contains marker.txt. Do not edit files or run commands.
+Restate the current project constraint. Do not edit files or run commands.
+List our open discussion point in one sentence. Do not edit files or run commands.
+```
+
+Then submit:
+
+```text
+/compact
+```
+
+Expected: the transcript shows `Context compacted. Summary saved.`, the
+session JSONL contains one correlated `memory.compaction.started` /
+`memory.compaction.finished` pair with `trigger: manual`, and a bounded
+redacted file appears under `$ChatProject\.agent\summaries`. No old tool call
+is replayed. In a fresh chat with fewer than three completed turns, `/compact`
+instead reports that there is not enough older context; this is a non-error.
+
+Test global persistence twice:
+
+```text
+/reasoning-effort medium scope=global
+```
+
+First choose **Deny**. Expected: the transcript reports the denied user-config
+write, the active reasoning effort is unchanged, and `$UserConfig` is not
+created or modified. Run the same command again and choose **Approve**.
+Expected: `~/.lunar-forge/config.yaml` is safely created or updated, unrelated
+keys remain when practical, no secret is written, and the active session
+immediately reports `medium`. A project-level value still wins over this user
+value because precedence remains CLI, project, user, environment, defaults.
+
+For paste and multiline input, copy this exact block:
+
+```text
+First pasted line.
+Second pasted line; do not submit yet.
+```
+
+Focus the input and press `Ctrl+V` (or use the terminal paste action if it
+reserves that key). Expected: both lines remain in the input and no turn
+starts. Press `Enter`; exactly one turn starts with both pasted lines.
+
+After the turn, expected transcript presentation is:
+
+```text
+You:
+First typed line.
+Second typed line.
+
+LunarForge:
+<assistant response>
+```
+
+Expected: speaker labels include colons, `You:` and `LunarForge:` use subtle
+distinct Textual-only styles, and messages are separated by a blank line.
+Session JSONL and core events remain plain JSON without Rich/Textual markup.
+
+Exit chat and restore the user config:
+
+```powershell
+if ($UserConfigExisted) {
+  Copy-Item -LiteralPath $UserConfigBackup -Destination $UserConfig -Force
+} elseif (Test-Path -LiteralPath $UserConfig) {
+  Remove-Item -LiteralPath $UserConfig
+}
+```
 
 ### Project switching, resume picker, and new-project workflow
 

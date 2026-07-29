@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import yaml
 
@@ -282,6 +283,54 @@ def persist_project_config_update(
     )
 
 
+def persist_user_config_update(
+    update: SessionConfigUpdate,
+    *,
+    config: AppConfig,
+    approval_provider: ApprovalProvider,
+    approval_event_callback: ApprovalEventCallback | None = None,
+    user_home: str | Path | None = None,
+) -> ProjectConfigSaveResult:
+    """Approve and atomically persist one setting to the user config."""
+
+    home = Path(user_home or Path.home()).expanduser().resolve()
+    prepared = _prepare_user_config_update(home, update)
+    configured_mode = config.permissions.mode.strip().casefold()
+    permission_manager = PermissionManager(
+        # User-config writes are always interactive, including yes mode.
+        mode="plan" if configured_mode == "plan" else "default",
+        approval_provider=approval_provider,
+        approval_event_callback=approval_event_callback,
+        runtime_mode=config.runtime.mode,
+        project_trust=config.runtime.project_trust,
+    )
+    decision = permission_manager.authorize(
+        PermissionLevel.WRITE,
+        "write_file",
+        {
+            "path": "~/.lunar-forge/config.yaml",
+            "overwrite": prepared.target.exists(),
+            "setting": ".".join(update.path),
+            "value": update.value,
+            "config_scope": "global",
+        },
+    )
+    if not decision.allowed:
+        raise PermissionError(
+            decision.reason or "User config write was not approved."
+        )
+
+    # Approval can remain open while another process updates user config.
+    prepared = _prepare_user_config_update(home, update)
+    existed = prepared.target.exists()
+    _write_prepared_user_config(home, prepared)
+    return ProjectConfigSaveResult(
+        path=prepared.target,
+        checkpoint_path=None,
+        created=not existed,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedConfigUpdate:
     target: Path
@@ -293,10 +342,28 @@ def _prepare_project_config_update(
     update: SessionConfigUpdate,
 ) -> _PreparedConfigUpdate:
     target = safe_path(root, ".agent/config.yaml")
-    data = _read_project_config(target)
+    return _prepare_config_update(target, update, label="Project")
+
+
+def _prepare_user_config_update(
+    home: Path,
+    update: SessionConfigUpdate,
+) -> _PreparedConfigUpdate:
+    target = home / ".lunar-forge" / "config.yaml"
+    _validate_user_config_target(home, target)
+    return _prepare_config_update(target, update, label="User")
+
+
+def _prepare_config_update(
+    target: Path,
+    update: SessionConfigUpdate,
+    *,
+    label: str,
+) -> _PreparedConfigUpdate:
+    data = _read_config(target, label=label)
     if _contains_sensitive_config_key(data):
         raise ValueError(
-            "Project config contains a raw secret field. Use environment "
+            f"{label} config contains a raw secret field. Use environment "
             "variable names instead; the setting was not saved."
         )
     destination: dict[str, Any] = data
@@ -310,7 +377,7 @@ def _prepare_project_config_update(
             destination = current
         else:
             raise ValueError(
-                "Cannot save setting because an existing project config "
+                f"Cannot save setting because an existing {label.lower()} config "
                 f"section is not a mapping: {key}."
             )
     destination[update.path[-1]] = update.value
@@ -322,7 +389,7 @@ def _prepare_project_config_update(
     )
     if len(serialized) > MAX_CONFIG_CHARACTERS:
         raise ValueError(
-            "Updated project config exceeds the configured size limit."
+            f"Updated {label.lower()} config exceeds the configured size limit."
         )
     return _PreparedConfigUpdate(target=target, serialized=serialized)
 
@@ -342,25 +409,86 @@ def _write_prepared_config(
     temporary.replace(target)
 
 
-def _read_project_config(path: Path) -> dict[str, Any]:
+def _write_prepared_user_config(
+    home: Path,
+    prepared: _PreparedConfigUpdate,
+) -> None:
+    target = prepared.target
+    _validate_user_config_target(home, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _validate_user_config_target(home, target)
+    temporary = target.with_name(
+        f"{target.name}.{uuid4().hex}.tmp"
+    )
+    _validate_user_config_target(home, temporary, allow_temporary=True)
+    try:
+        temporary.write_text(
+            prepared.serialized,
+            encoding="utf-8",
+            newline="\n",
+        )
+        temporary.replace(target)
+    finally:
+        if temporary.exists() and not temporary.is_symlink():
+            temporary.unlink()
+
+
+def _validate_user_config_target(
+    home: Path,
+    target: Path,
+    *,
+    allow_temporary: bool = False,
+) -> None:
+    expected_directory = home / ".lunar-forge"
+    expected_target = expected_directory / "config.yaml"
+    if allow_temporary:
+        valid_name = (
+            target.parent == expected_directory
+            and target.name.startswith("config.yaml.")
+            and target.name.endswith(".tmp")
+        )
+    else:
+        valid_name = target == expected_target
+    if not valid_name:
+        raise PermissionError("User config path is outside the allowed location.")
+    if target.exists() and target.is_symlink():
+        raise PermissionError("User config path must not be a symbolic link.")
+    if expected_directory.exists():
+        try:
+            expected_directory.resolve().relative_to(home)
+        except ValueError as exc:
+            raise PermissionError(
+                "User config directory resolves outside the user home."
+            ) from exc
+
+
+def _read_config(path: Path, *, label: str) -> dict[str, Any]:
     if not path.exists():
         return {}
     raw = path.read_text(encoding="utf-8")
     if len(raw) > MAX_CONFIG_CHARACTERS:
-        raise ValueError("Project config exceeds the configured size limit.")
+        raise ValueError(
+            f"{label} config exceeds the configured size limit."
+        )
     loaded = yaml.safe_load(raw) or {}
     if not isinstance(loaded, Mapping):
-        raise ValueError("Project config must contain a YAML object.")
-    return _copy_mapping(loaded)
+        raise ValueError(f"{label} config must contain a YAML object.")
+    return _copy_mapping(loaded, label=label)
 
 
-def _copy_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+def _copy_mapping(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     for key, item in value.items():
         if not isinstance(key, str):
-            raise ValueError("Project config keys must be strings.")
+            raise ValueError(f"{label} config keys must be strings.")
         copied[key] = (
-            _copy_mapping(item) if isinstance(item, Mapping) else item
+            _copy_mapping(item, label=label)
+            if isinstance(item, Mapping)
+            else item
         )
     return copied
 
@@ -382,4 +510,5 @@ __all__ = [
     "ProjectConfigSaveResult",
     "SessionConfigUpdate",
     "persist_project_config_update",
+    "persist_user_config_update",
 ]

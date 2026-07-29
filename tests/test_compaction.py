@@ -412,6 +412,101 @@ def test_textual_chat_emits_compaction_pair_and_logs_usage(tmp_path):
     assert usage[0]["tool_schema_count"] == 0
 
 
+def test_manual_compact_uses_existing_flow_and_writes_summary(tmp_path):
+    model = RecordingModel(
+        (
+            ModelResponse(text="First answer."),
+            ModelResponse(text="Second answer."),
+            ModelResponse(text="Third answer."),
+            ModelResponse(
+                text=json.dumps(
+                    {
+                        "summary": "The first turn was safely summarized.",
+                        "facts": {"open_items": ["Continue the chat."]},
+                    }
+                )
+            ),
+        )
+    )
+    controller = TextualChatController(
+        tmp_path,
+        _config(compact_at=100_000, compact_to=25),
+        DenyApprovalProvider(),
+        model_client=model,
+    )
+    controller.send_turn("First prompt.")
+    controller.send_turn("Second prompt.")
+    controller.send_turn("Third prompt.")
+    events = []
+
+    command = controller.handle_slash_command("/compact")
+    outcome = controller.run_slash_action(
+        command.action,
+        event_callback=events.append,
+    )
+
+    compaction_events = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.MEMORY_COMPACTION_STARTED.value,
+            EventType.MEMORY_COMPACTION_FINISHED.value,
+        }
+    ]
+    assert outcome["ok"] is True
+    assert outcome["compacted"] is True
+    assert outcome["text"] == "Context compacted. Summary saved."
+    assert [event.type for event in compaction_events] == [
+        EventType.MEMORY_COMPACTION_STARTED.value,
+        EventType.MEMORY_COMPACTION_FINISHED.value,
+    ]
+    assert all(
+        event.payload["trigger"] == "manual"
+        for event in compaction_events
+    )
+    assert compaction_events[1].parent_event_id == (
+        compaction_events[0].event_id
+    )
+    summary_path = (
+        tmp_path / outcome["result"]["summary_path"]
+    )
+    assert summary_path.is_file()
+    assert controller.conversation_messages[0]["content"].startswith(
+        "[Working-memory compacted summary]"
+    )
+    assert len(model.calls) == 4
+    assert model.calls[-1]["tools"] == []
+
+
+def test_manual_compact_is_clear_noop_without_older_context(tmp_path):
+    model = RecordingModel((ModelResponse(text="unused"),))
+    controller = TextualChatController(
+        tmp_path,
+        _config(compact_at=100_000, compact_to=25),
+        DenyApprovalProvider(),
+        model_client=model,
+    )
+    events = []
+
+    command = controller.handle_slash_command("/compact")
+    outcome = controller.run_slash_action(
+        command.action,
+        event_callback=events.append,
+    )
+
+    assert outcome["ok"] is True
+    assert outcome["compacted"] is False
+    assert outcome["status"] == "noop"
+    assert "not enough older conversation context" in outcome["text"]
+    assert model.calls == []
+    assert not (tmp_path / ".agent" / "summaries").exists()
+    assert not any(
+        event.type.startswith("memory.compaction.")
+        for event in events
+    )
+
+
 def test_textual_chat_continues_with_warning_when_compaction_fails(tmp_path):
     class CompactionFailingModel:
         def __init__(self):

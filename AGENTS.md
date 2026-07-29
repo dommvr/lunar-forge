@@ -188,6 +188,29 @@ Completed Textual layout and slash-command wave:
 85. Add Textual project switching, session resume, new-project workflow, browser validation, Git, MCP, plugin, checkpoint, and rollback slash commands.
 86. Run hardening and manual smoke tests for Textual layout, slash commands, config persistence, resume safety, event compatibility, and one-shot CLI parity.
 
+Completed focused Textual chat-polish wave:
+
+87. Add `/compact` as a manual entry point to the existing safe working-memory compaction flow.
+88. Add lightweight, filtered slash-command hints for the chat input, including nested commands.
+89. Add explicit `scope=global` persistence for config-backed chat commands through the approval provider and `~/.lunar-forge/config.yaml`.
+90. Harden Textual paste, multiline input, speaker labels, and message spacing without changing core events or one-shot output.
+91. Keep user/project/session config priority, event transport neutrality, and optional-Textual import boundaries covered by tests.
+
+Completed focused Textual UX-hardening wave:
+
+92. Replace generic temporary work text with phase-aware public descriptions and restore the active phase after approval decisions.
+93. Add UI-only animated ellipsis state without changing event payloads.
+94. Add a dependency-free Windows clipboard fallback while preserving Textual paste events, multiline input, and explicit submission.
+95. Add a bounded, scrollable approval body with a fixed visible button footer.
+96. Place the header, transcript, and input inside one accent-colored outer frame with consistent separators.
+
+Completed focused Textual task-control and layout-hardening wave:
+
+97. Keep long `/sessions` pickers bounded and scrollable without displacing the chat input.
+98. Keep `Enter` as the supported submit key, preserve multiline paste, and remove the non-portable Shift+Enter claim and binding.
+99. Add `/finish` to cancel an active agent turn, deny a pending approval, and conservatively revoke only checkpointed or provably current-turn-created files while leaving chat open.
+100. Emit bounded, redacted, JSON-safe `turn.cancelled`, `rollback.started`, and `rollback.finished` events without adding UI fields or dependencies to the core protocol.
+
 The basic read-plan-edit-validate MVP and advanced tool waves already exist. Future work must still be staged carefully. Add features incrementally, with tests and safety reviews after every phase.
 
 ---
@@ -1803,6 +1826,7 @@ session.started
 session.resumed
 turn.started
 turn.finished
+turn.cancelled
 status.updated
 assistant.message.delta
 assistant.message.completed
@@ -1824,6 +1848,8 @@ git.commit.created
 git.commit.skipped
 memory.compaction.started
 memory.compaction.finished
+rollback.started
+rollback.finished
 error
 ```
 
@@ -1975,7 +2001,7 @@ If Textual is missing and the user runs `lunar-forge chat`, show a clear setup m
 
 The Textual UI should use a simple Claude Code-style layout, not a dashboard full of panels that nobody asked for.
 
-Top card:
+The header is the top section of one common chat frame:
 
 ```text
 ╭──────────── LunarForge v0.x ─────────────╮
@@ -1986,15 +2012,21 @@ Top card:
 │ Model: openai/gpt-5.6-sol               │
 │ Effort: medium                           │
 │ Mode: default / docker / no-command      │
+├──────────────────────────────────────────┤
+│ chat transcript                          │
+├──────────────────────────────────────────┤
+│ input                                    │
 ╰──────────────────────────────────────────╯
 ```
 
 Rules:
 
-* Put `LunarForge v0.x` in the card border/title and do not duplicate the version below it.
+* Put `LunarForge v0.x` in the common outer frame border/title and do not duplicate the version below it.
 * Show `What are we building today?` for a new chat session.
 * Show `Let’s get back to building.` for a resumed chat session.
 * Show project root, model, reasoning effort, and runtime/permission mode.
+* Keep the header, transcript, and input inside one outer frame using the accent color previously used by the input border.
+* Use consistent horizontal separators between the header, transcript, and input instead of separate competing borders.
 * Do not add permanent panels for recent activity, last sessions, changed files, tips/status, shortcuts, Docker status, tool log, or activity.
 * Keep tool/activity information as temporary progress content while a turn is running.
 
@@ -2009,19 +2041,19 @@ Main body:
 │ Mode: docker                             │
 ╰──────────────────────────────────────────╯
 
-User
+You:
 Add a pricing page.
 
-Assistant
+LunarForge:
 I’ll inspect the routing and navbar, then make the smallest change.
 
 [temporary while running]
-Working: inspecting the project structure.
+Gathering information about the project...
 Tool: list_dir .
 Elapsed: 00:08
 [/temporary]
 
-Assistant
+LunarForge:
 Done in 1 minute 12 seconds.
 
 Changed files:
@@ -2058,13 +2090,13 @@ The progress block should include:
 Examples:
 
 ```text
-Working: reading project instructions.
+Gathering information about the project...
 Tool: read_file AGENTS.md
 Elapsed: 00:04
 ```
 
 ```text
-Working: running validation in Docker.
+Running validation...
 Command: python -B -m compileall .
 Elapsed: 01:16
 ```
@@ -2073,6 +2105,12 @@ Rules:
 
 * Use public progress only. Do not show hidden reasoning or chain-of-thought.
 * Update progress from structured events such as `status.updated`, `tool.started`, `tool.finished`, `validation.started`, `validation.finished`, and `permission.requested`.
+* Prefer concise phase descriptions: gathering project information, planning implementation, applying changes, running validation, preparing a Git commit, checking the browser, compacting context, or running an external MCP/plugin review.
+* Use `Working on your request` only as a fallback.
+* If a phase description ends in an ellipsis, animate `.`, `..`, and `...` in Textual state only. Never mutate the underlying event.
+* Keep each visible ellipsis state for about two-thirds of a second, producing a complete `.`, `..`, `...` cycle in about two seconds without slowing the separate elapsed-time refresh.
+* While permission is pending, show `Waiting for approval` and the bounded command/tool/action below it.
+* Approval resolution must restore the suspended active phase. `Approval granted` or `Approval denied` must not become a stuck work description.
 * When the turn finishes, remove the temporary progress block and show the final assistant message.
 * The final assistant message should include total elapsed time.
 * One-shot CLI output should remain concise and should not be forced to mimic the Textual progress block.
@@ -2086,10 +2124,19 @@ Rules:
 * Normal paste must work.
 * Multi-line paste must work.
 * `Enter` sends the current message.
-* `Shift+Enter` inserts a newline.
+* Shift+Enter is not a supported newline shortcut because terminal key reporting is inconsistent.
+* `Ctrl+V` should paste when the terminal and Textual deliver clipboard or paste data.
+* On Windows, a lightweight UI-only system clipboard fallback may be used when Textual's clipboard is empty.
 * Pasted text must preserve newlines.
+* Paste handling must never submit the message by itself.
 * Very large pasted input should be bounded or warned about before submission rather than freezing the UI.
 * Slash commands should be recognized only when the input begins with `/` after trimming leading whitespace.
+* Terminal key reporting varies. Handle Textual paste events plus the common `Ctrl+V` binding while keeping `Enter` as the submit action.
+* If clipboard contents are unavailable, show a short UI note without crashing or logging clipboard contents.
+
+### Textual approval layout
+
+Approval UI uses a fixed header, a bounded scrollable detail body, and a fixed footer containing Deny and Approve. Long summaries, commands, and details wrap or scroll without pushing the buttons off-screen. The panel may retain its warning border, but it must stay inside the main layout, preserve transcript scrolling, and leave the input area intact in narrow and full-screen terminals.
 
 ### Textual slash commands
 
@@ -2109,6 +2156,8 @@ Initial commands:
 /status
 /clear
 /exit
+/finish
+/compact
 /project
 /plan
 /docker
@@ -2143,6 +2192,8 @@ Command behavior:
 * `/status` shows current project, model, effort, runtime mode, permission mode, network setting, subagent setting, commit setting, MCP/plugin setting, session id, and compaction status.
 * `/clear` clears the visible transcript only after confirmation; it must not delete session logs.
 * `/exit` exits cleanly.
+* `/finish` requests best-effort cancellation of the active agent turn, denies any pending approval, and revokes only changes proven to belong to that turn. It leaves chat open, preserves unrelated and previous-turn changes, and reports partial rollback instead of overwriting unverifiable state.
+* `/compact` manually invokes the existing safe compaction flow, emits the normal compaction event pair, and reports a non-error no-op when there is not enough older context.
 * `/project` switches the active project root and starts a fresh conversation context for that project.
 * `/plan` toggles or sets plan mode for the active chat session.
 * `/docker` toggles Docker runtime mode for the active chat session.
@@ -2157,7 +2208,7 @@ Command behavior:
 * `/permissions` sets permission mode.
 * `/mcp` enables/disables MCP integration.
 * `/plugins` enables/disables plugin integration.
-* `/sessions` opens a session list/picker for the current project.
+* `/sessions` opens a session list/picker for the current project. Long lists use a bounded scrollable body so the transcript and input remain intact in narrow, normal, and full-screen layouts.
 * `/resume` opens a resume picker.
 * `/resume latest` resumes the latest compatible session for the current project.
 * `/new` asks for a project prompt and runs the existing new-project workflow.
@@ -2178,6 +2229,7 @@ Typed examples:
 /project C:\Users\tiron\Desktop\my-app
 /reasoning-effort high
 /reasoning-effort xhigh scope=project
+/reasoning-effort medium scope=global
 /runtime docker
 /runtime no-command scope=session
 /permissions no-command
@@ -2211,9 +2263,16 @@ Rules:
 * If arguments are missing, show a popup form with the relevant fields.
 * Popup forms must validate input before running actions.
 * Invalid typed arguments should show a clear error and should not start an agent turn.
-* For config-backed commands, `scope=session` and `scope=project` are the typed persistence choices.
-* A typed config value without `scope` defaults to `scope=session`; it must never silently write project config.
+* For config-backed commands, `scope=session`, `scope=project`, and `scope=global` are the typed persistence choices.
+* A typed config value without `scope` defaults to `scope=session`; it must never silently write project or user config.
 * `scope=project` means the user explicitly chose save-to-project-config and should update the active session immediately after a successful save.
+* `scope=global` means the user explicitly chose save-to-user-config. It must request approval, write `~/.lunar-forge/config.yaml` safely and atomically when practical, and update active state only after persistence succeeds.
+
+### Slash-command hints
+
+When the trimmed input is exactly `/`, show a small non-blocking list of common commands: `/help`, `/status`, `/compact`, `/sessions`, and `/resume`. As the user types, filter the central command registry, including nested commands such as `/git status`, `/mcp list`, and `/plugins list`.
+
+Hide hints when input no longer begins with `/`, the message is submitted, `Escape` is pressed, or an approval/popup is visible. An unknown prefix may show a small `No matching commands.` state. This is input autocomplete, not a second command router or a permanent command palette.
 
 ### Config-backed slash commands
 
@@ -2242,7 +2301,8 @@ Popup requirements:
 * Show available choices.
 * Let the user choose either:
   * apply to this chat session only,
-  * save to project `.agent/config.yaml`.
+  * save to project `.agent/config.yaml`,
+  * save to user `~/.lunar-forge/config.yaml`.
 * If saving to project config and `.agent/config.yaml` does not exist, create it safely.
 * If saving to project config and the file exists, edit only the relevant key while preserving unrelated config when practical.
 * Validate config values before writing.
@@ -2251,6 +2311,8 @@ Popup requirements:
 * Route the config write through the normal approval provider and permission policy; the popup choice must not become a second approval mechanism.
 * Changes applied to the current chat session should affect future turns until changed again or until the session exits.
 * Saving to project config should also update the active session value immediately.
+* Saving to user config should also update the active session only after the approved write succeeds. Denied or failed writes must leave active state unchanged.
+* Preserve config precedence: CLI flags, project config, user config, environment, then defaults.
 
 Suggested mapping:
 

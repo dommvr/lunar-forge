@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -75,6 +76,7 @@ from lunar_forge.ui.textual_state import (
     ProjectConfigSaveResult,
     SessionConfigUpdate,
     persist_project_config_update,
+    persist_user_config_update,
 )
 from lunar_forge.workflows.new_project import (
     format_new_project_result,
@@ -102,6 +104,7 @@ class TextualRenderUpdate:
     transcript_text: str | None = None
     status: str | None = None
     tool_text: str | None = None
+    approval_state: str | None = None
 
 
 class TextualEventRenderer:
@@ -110,35 +113,44 @@ class TextualEventRenderer:
     def handle(self, event: AgentEvent) -> TextualRenderUpdate | None:
         payload = event.payload
         if event.type == EventType.SESSION_STARTED.value:
-            return TextualRenderUpdate(status="Session started")
-        if event.type == EventType.SESSION_RESUMED.value:
-            source_session_id = _first_text(
-                payload,
-                "source_session_id",
-                "source_session",
-            )
             return TextualRenderUpdate(
-                status=_bounded_text(
-                    (
-                        f"Session resumed from {source_session_id}"
-                        if source_session_id
-                        else "Session resumed"
-                    ),
-                    MAX_TEXTUAL_STATUS_CHARACTERS,
-                )
+                status="Gathering information about the project..."
+            )
+        if event.type == EventType.SESSION_RESUMED.value:
+            return TextualRenderUpdate(
+                status="Gathering information about the project..."
             )
         if event.type == EventType.TURN_STARTED.value:
-            return TextualRenderUpdate(status="Working...")
+            return TextualRenderUpdate(
+                status=_turn_progress_status(payload)
+            )
+        if event.type == EventType.TURN_CANCELLED.value:
+            return TextualRenderUpdate(
+                status="Finishing current task..."
+            )
         if event.type == EventType.STATUS_UPDATED.value:
+            status = (
+                _first_text(payload, "message", "status", "state")
+                or ""
+            )
+            if _is_generic_progress_status(status):
+                return None
             return TextualRenderUpdate(
                 status=_bounded_text(
-                    _first_text(payload, "message", "status", "state")
-                    or "Working...",
+                    status,
                     MAX_TEXTUAL_STATUS_CHARACTERS,
                 )
+            )
+        if event.type == EventType.MODEL_CALL_STARTED.value:
+            status = _model_call_progress_status(payload)
+            return (
+                TextualRenderUpdate(status=status)
+                if status is not None
+                else None
             )
         if event.type == EventType.TOOL_STARTED.value:
             return TextualRenderUpdate(
+                status=_tool_progress_status(payload),
                 tool_text=_bounded_text(
                     _tool_progress_text(payload, "started"),
                     MAX_TEXTUAL_TOOL_LINE_CHARACTERS,
@@ -161,14 +173,44 @@ class TextualEventRenderer:
                 )
             )
         if event.type == EventType.PERMISSION_REQUESTED.value:
-            return TextualRenderUpdate(status="Approval required")
-        if event.type == EventType.PERMISSION_RESOLVED.value:
-            approved = payload.get("approved") is True
             return TextualRenderUpdate(
-                status="Approval granted" if approved else "Approval denied"
+                status="Waiting for approval",
+                tool_text=_approval_progress_text(payload),
+                approval_state="requested",
             )
+        if event.type == EventType.PERMISSION_RESOLVED.value:
+            return TextualRenderUpdate(
+                approval_state=(
+                    "approved"
+                    if payload.get("approved") is True
+                    or payload.get("allowed") is True
+                    else "denied"
+                )
+            )
+        if event.type in {
+            EventType.VALIDATION_STARTED.value,
+            EventType.VALIDATION_FINISHED.value,
+        }:
+            return TextualRenderUpdate(status="Running validation...")
+        if event.type in {
+            EventType.BROWSER_STARTED.value,
+            EventType.BROWSER_FINISHED.value,
+        }:
+            return TextualRenderUpdate(
+                status="Checking the app in a browser..."
+            )
+        if event.type == EventType.CHECKPOINT_CREATED.value:
+            return TextualRenderUpdate(status="Applying project changes...")
+        if event.type in {
+            EventType.GIT_PROPOSAL.value,
+            EventType.GIT_COMMIT_CREATED.value,
+            EventType.GIT_COMMIT_SKIPPED.value,
+        }:
+            return TextualRenderUpdate(status="Preparing Git commit...")
         if event.type == EventType.MEMORY_COMPACTION_STARTED.value:
-            return TextualRenderUpdate(status="Compacting conversation...")
+            return TextualRenderUpdate(
+                status="Compacting conversation context..."
+            )
         if event.type == EventType.MEMORY_COMPACTION_FINISHED.value:
             if payload.get("status") == "failed":
                 warning = _first_text(payload, "warning", "message")
@@ -181,9 +223,25 @@ class TextualEventRenderer:
                         ),
                         MAX_TEXTUAL_TRANSCRIPT_CHARACTERS,
                     ),
-                    status="Compaction warning",
+                    status="Working on your request...",
                 )
-            return TextualRenderUpdate(status="Conversation compacted")
+            return None
+        if event.type == EventType.ROLLBACK_STARTED.value:
+            return TextualRenderUpdate(
+                status="Revoking current-turn changes..."
+            )
+        if event.type == EventType.ROLLBACK_FINISHED.value:
+            restored = payload.get("restored_files")
+            removed = payload.get("removed_files")
+            count = (
+                len(restored) if isinstance(restored, list) else 0
+            ) + (
+                len(removed) if isinstance(removed, list) else 0
+            )
+            return TextualRenderUpdate(
+                status="Finishing current task...",
+                tool_text=f"Revoked {count} tracked file change(s)",
+            )
         if event.type == EventType.ASSISTANT_MESSAGE_COMPLETED.value:
             text = _first_text(payload, "text", "message") or ""
             return TextualRenderUpdate(
@@ -319,6 +377,69 @@ class ChatTurnResult:
     turn_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class TurnRollbackSummary:
+    """Bounded result of cancelling and revoking one active chat turn."""
+
+    turn_id: str
+    restored_files: tuple[str, ...] = ()
+    removed_files: tuple[str, ...] = ()
+    skipped_files: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.skipped_files and not self.errors
+
+    def display_text(self) -> str:
+        if self.complete:
+            lead = "Task finished. Current-turn changes were revoked."
+        else:
+            lead = "Task finished. Current-turn rollback was partial."
+        lines = [lead]
+        if self.restored_files:
+            lines.append(
+                "Restored: " + ", ".join(self.restored_files)
+            )
+        if self.removed_files:
+            lines.append(
+                "Removed newly created: " + ", ".join(self.removed_files)
+            )
+        if self.skipped_files:
+            lines.append(
+                "Skipped for safety: " + ", ".join(self.skipped_files)
+            )
+        if self.errors:
+            lines.append("Rollback errors: " + "; ".join(self.errors))
+        if (
+            not self.restored_files
+            and not self.removed_files
+            and not self.skipped_files
+            and not self.errors
+        ):
+            lines.append("No current-turn file changes needed to be revoked.")
+        return _bounded_text(
+            "\n".join(lines),
+            MAX_TEXTUAL_TRANSCRIPT_CHARACTERS,
+        )
+
+
+class ChatTurnCancelled(RuntimeError):
+    """Raised after an active Textual turn is cancelled and rolled back."""
+
+    def __init__(self, summary: TurnRollbackSummary) -> None:
+        super().__init__(summary.display_text())
+        self.summary = summary
+
+
+@dataclass(slots=True)
+class _TurnFileMutation:
+    path: str
+    created: bool
+    checkpoint_id: str | None
+    expected_digest: str | None
+
+
 class TextualChatController:
     """Synchronous multi-turn controller used from a Textual thread worker."""
 
@@ -332,6 +453,7 @@ class TextualChatController:
         model_client: ModelClient | None = None,
         event_runner: AgentEventRunner = run_agent_events,
         session_logger: SessionLogger | None = None,
+        user_home: str | Path | None = None,
     ) -> None:
         self.session_state = ChatSessionState.create(project_root, config)
         self.project_root = self.session_state.project_root
@@ -349,9 +471,18 @@ class TextualChatController:
                 "safe conversation context."
             )
         self.approval_provider = approval_provider
+        self._user_home = (
+            Path(user_home).expanduser().resolve()
+            if user_home is not None
+            else None
+        )
         self.model_client = model_client
         self._event_runner = event_runner
         self._turn_lock = Lock()
+        self._turn_state_lock = Lock()
+        self._turn_cancel_requested = Event()
+        self._active_turn_id: str | None = None
+        self._current_turn_mutations: dict[str, _TurnFileMutation] = {}
         self._memory = ConversationMemory(
             previous_session.messages if previous_session is not None else ()
         )
@@ -525,12 +656,29 @@ class TextualChatController:
             )
         return "\n".join(lines)
 
-    def handle_slash_command(self, value: str) -> SlashCommandResult:
+    def handle_slash_command(
+        self,
+        value: str,
+        *,
+        active_turn: bool = False,
+    ) -> SlashCommandResult:
         previous_config = self.config
-        result = self.slash_router.route(value)
+        result = self.slash_router.route(
+            value,
+            active_turn=active_turn,
+        )
         if self.config is not previous_config:
             self._compactor = None
         return result
+
+    def request_active_turn_finish(self) -> bool:
+        """Signal the active agent turn to stop at the next safe boundary."""
+
+        with self._turn_state_lock:
+            if self._active_turn_id is None:
+                return False
+            self._turn_cancel_requested.set()
+            return True
 
     def submit_slash_form(
         self,
@@ -573,6 +721,21 @@ class TextualChatController:
             config=self.config,
             approval_provider=self.approval_provider,
             approval_event_callback=self._log_config_approval_event,
+        )
+        self.session_state.apply_config_update(update)
+        self._compactor = None
+        return result
+
+    def save_user_config_update(
+        self,
+        update: SessionConfigUpdate,
+    ) -> ProjectConfigSaveResult:
+        result = persist_user_config_update(
+            update,
+            config=self.config,
+            approval_provider=self.approval_provider,
+            approval_event_callback=self._log_config_approval_event,
+            user_home=self._user_home,
         )
         self.session_state.apply_config_update(update)
         self._compactor = None
@@ -631,6 +794,8 @@ class TextualChatController:
     def run_slash_action(
         self,
         request: SlashActionRequest,
+        *,
+        event_callback: AgentEventCallback | None = None,
     ) -> dict[str, Any]:
         """Run one existing LunarForge action without starting an agent turn."""
 
@@ -647,7 +812,10 @@ class TextualChatController:
                     arguments=request.arguments,
                 )
             try:
-                outcome = self._execute_slash_action(request)
+                outcome = self._execute_slash_action(
+                    request,
+                    event_callback=event_callback,
+                )
             except Exception as exc:
                 if self.session_logger is not None:
                     self.session_logger.log(
@@ -670,9 +838,18 @@ class TextualChatController:
     def _execute_slash_action(
         self,
         request: SlashActionRequest,
+        *,
+        event_callback: AgentEventCallback | None = None,
     ) -> dict[str, Any]:
         arguments = request.arguments
         action = request.name
+        if action == "memory.compact":
+            return self._run_compaction(
+                "",
+                force=True,
+                collected=[],
+                event_callback=event_callback,
+            )
         if action == "browser-setup":
             result = run_browser_setup(
                 self.project_root,
@@ -933,6 +1110,7 @@ class TextualChatController:
         with self._turn_lock:
             self._ensure_session_logger()
             turn_id = self.event_factory.begin_turn()
+            self._begin_turn_tracking(turn_id)
             collected: list[AgentEvent] = []
             final_text: str | None = None
             try:
@@ -948,6 +1126,7 @@ class TextualChatController:
                 def forward_live_event(event: AgentEvent) -> None:
                     with live_event_lock:
                         live_event_ids.add(event.event_id)
+                    self._record_public_event(event)
                     if event_callback is not None:
                         event_callback(event)
 
@@ -980,14 +1159,13 @@ class TextualChatController:
                 )
                 try:
                     for event in events:
-                        self._record_public_event(event)
-                        collected.append(event)
                         with live_event_lock:
                             already_forwarded = (
                                 event.event_id in live_event_ids
                             )
-                        if event_callback is not None and not already_forwarded:
-                            event_callback(event)
+                        if not already_forwarded:
+                            self._record_public_event(event)
+                        collected.append(event)
                         if (
                             event.type
                             == EventType.ASSISTANT_MESSAGE_COMPLETED.value
@@ -995,17 +1173,49 @@ class TextualChatController:
                             text = event.payload.get("text")
                             if isinstance(text, str):
                                 final_text = _conversation_text(text)
+                        if self._turn_cancel_requested.is_set():
+                            raise ChatTurnCancelled(
+                                self._cancel_and_rollback_turn(
+                                    turn_id,
+                                    collected=collected,
+                                    event_callback=event_callback,
+                                )
+                            )
+                        if event_callback is not None and not already_forwarded:
+                            event_callback(event)
+                        if self._turn_cancel_requested.is_set():
+                            raise ChatTurnCancelled(
+                                self._cancel_and_rollback_turn(
+                                    turn_id,
+                                    collected=collected,
+                                    event_callback=event_callback,
+                                )
+                            )
                 finally:
                     if self.session_logger is not None:
                         self.session_logger.set_event_callback(None)
+                if self._turn_cancel_requested.is_set():
+                    raise ChatTurnCancelled(
+                        self._cancel_and_rollback_turn(
+                            turn_id,
+                            collected=collected,
+                            event_callback=event_callback,
+                        )
+                    )
+            except ChatTurnCancelled:
+                self._session_started = True
+                self._finish_turn_tracking(turn_id)
+                raise
             except Exception:
                 self._memory.append_user_after_error(normalized_prompt)
                 self._session_started = True
+                self._finish_turn_tracking(turn_id)
                 raise
 
             if final_text is None:
                 self._memory.append_user_after_error(normalized_prompt)
                 self._session_started = True
+                self._finish_turn_tracking(turn_id)
                 raise RuntimeError(
                     "Agent turn completed without a final assistant event."
                 )
@@ -1018,12 +1228,213 @@ class TextualChatController:
                 and self.session_state.commit_message is not None
             ):
                 self.session_state.commit_message = None
+            self._finish_turn_tracking(turn_id)
             return ChatTurnResult(
                 final_text=final_text,
                 events=tuple(collected),
                 session_id=self.session_id,
                 turn_id=turn_id,
             )
+
+    def _begin_turn_tracking(self, turn_id: str) -> None:
+        with self._turn_state_lock:
+            self._active_turn_id = turn_id
+            self._current_turn_mutations.clear()
+            self._turn_cancel_requested.clear()
+
+    def _finish_turn_tracking(self, turn_id: str) -> None:
+        with self._turn_state_lock:
+            if self._active_turn_id != turn_id:
+                return
+            self._active_turn_id = None
+            self._current_turn_mutations.clear()
+            self._turn_cancel_requested.clear()
+
+    def _cancel_and_rollback_turn(
+        self,
+        turn_id: str,
+        *,
+        collected: list[AgentEvent],
+        event_callback: AgentEventCallback | None,
+    ) -> TurnRollbackSummary:
+        cancelled = self.event_factory.create(
+            EventType.TURN_CANCELLED,
+            {
+                "status": "cancelled",
+                "reason": "User requested /finish.",
+                "active_tool_count": len(self._active_tool_calls),
+                "pending_approval_count": len(self._pending_approvals),
+            },
+            turn_id=turn_id,
+        )
+        self._publish_turn_control_event(
+            cancelled,
+            collected=collected,
+            event_callback=event_callback,
+        )
+        rollback_started = self.event_factory.create(
+            EventType.ROLLBACK_STARTED,
+            {
+                "reason": "Revoking current-turn changes after /finish.",
+                "tracked_file_count": len(self._current_turn_mutations),
+            },
+            parent_event_id=cancelled.event_id,
+            turn_id=turn_id,
+        )
+        self._publish_turn_control_event(
+            rollback_started,
+            collected=collected,
+            event_callback=event_callback,
+        )
+        summary = self._rollback_current_turn_files(turn_id)
+        rollback_finished = self.event_factory.create(
+            EventType.ROLLBACK_FINISHED,
+            {
+                "status": "completed" if summary.complete else "partial",
+                "restored_files": list(summary.restored_files),
+                "removed_files": list(summary.removed_files),
+                "skipped_files": list(summary.skipped_files),
+                "errors": list(summary.errors),
+            },
+            parent_event_id=rollback_started.event_id,
+            turn_id=turn_id,
+        )
+        self._publish_turn_control_event(
+            rollback_finished,
+            collected=collected,
+            event_callback=event_callback,
+        )
+        self._active_tool_calls.clear()
+        self._pending_approvals.clear()
+        return summary
+
+    def _publish_turn_control_event(
+        self,
+        event: AgentEvent,
+        *,
+        collected: list[AgentEvent],
+        event_callback: AgentEventCallback | None,
+    ) -> None:
+        if self.session_logger is not None:
+            self.session_logger.log(event.type, **dict(event.payload))
+        self._publish_controller_event(
+            event,
+            collected=collected,
+            event_callback=event_callback,
+        )
+
+    def _rollback_current_turn_files(
+        self,
+        turn_id: str,
+    ) -> TurnRollbackSummary:
+        with self._turn_state_lock:
+            mutations = tuple(self._current_turn_mutations.values())
+        restored: list[str] = []
+        removed: list[str] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        for mutation in mutations:
+            try:
+                target = safe_path(self.project_root, mutation.path)
+                if mutation.expected_digest is None:
+                    skipped.append(
+                        f"{mutation.path} (state could not be verified)"
+                    )
+                    continue
+                if not target.exists():
+                    if mutation.created:
+                        removed.append(mutation.path)
+                    else:
+                        skipped.append(
+                            f"{mutation.path} (file is no longer present)"
+                        )
+                    continue
+                if not target.is_file():
+                    skipped.append(
+                        f"{mutation.path} (target is not a file)"
+                    )
+                    continue
+                if _file_digest(target) != mutation.expected_digest:
+                    skipped.append(
+                        f"{mutation.path} (changed after LunarForge's write)"
+                    )
+                    continue
+                if mutation.created:
+                    target.unlink()
+                    self._changed_files.discard(mutation.path)
+                    removed.append(mutation.path)
+                    continue
+                if mutation.checkpoint_id is None:
+                    skipped.append(
+                        f"{mutation.path} (no original checkpoint)"
+                    )
+                    continue
+                result = rollback_file(
+                    self.project_root,
+                    mutation.path,
+                    checkpoint_id=mutation.checkpoint_id,
+                )
+                if result.get("ok") is not True:
+                    errors.append(
+                        f"{mutation.path}: "
+                        f"{result.get('error', 'rollback failed')}"
+                    )
+                    continue
+                self._changed_files.discard(mutation.path)
+                restored.append(mutation.path)
+            except (OSError, PermissionError, ValueError) as exc:
+                errors.append(f"{mutation.path}: {exc}")
+        return TurnRollbackSummary(
+            turn_id=turn_id,
+            restored_files=tuple(restored),
+            removed_files=tuple(removed),
+            skipped_files=tuple(skipped),
+            errors=tuple(errors),
+        )
+
+    def _record_turn_mutation(self, event: AgentEvent) -> None:
+        if event.type != EventType.TOOL_FINISHED.value:
+            return
+        tool_name = _tool_name(event.payload)
+        if tool_name not in {
+            "write_file",
+            "edit_file",
+            "replace_lines",
+            "insert_lines",
+        }:
+            return
+        result = event.payload.get("result")
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            return
+        path = result.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            target = safe_path(self.project_root, path)
+            relative_path = target.relative_to(self.project_root).as_posix()
+            digest = _file_digest(target) if target.is_file() else None
+        except (OSError, PermissionError, ValueError):
+            return
+        checkpoint_id = _checkpoint_id(
+            result.get("checkpoint_path"),
+        )
+        with self._turn_state_lock:
+            if self._active_turn_id != event.turn_id:
+                return
+            existing = self._current_turn_mutations.get(relative_path)
+            if existing is None:
+                self._current_turn_mutations[relative_path] = (
+                    _TurnFileMutation(
+                        path=relative_path,
+                        created=result.get("created") is True,
+                        checkpoint_id=checkpoint_id,
+                        expected_digest=digest,
+                    )
+                )
+                return
+            if existing.checkpoint_id is None and not existing.created:
+                existing.checkpoint_id = checkpoint_id
+            existing.expected_digest = digest
 
     def _switch_project(self, project_root: Path) -> None:
         if self._turn_lock.locked():
@@ -1263,8 +1674,33 @@ class TextualChatController:
         collected: list[AgentEvent],
         event_callback: AgentEventCallback | None,
     ) -> None:
+        self._run_compaction(
+            incoming_prompt,
+            force=False,
+            collected=collected,
+            event_callback=event_callback,
+        )
+
+    def _run_compaction(
+        self,
+        incoming_prompt: str,
+        *,
+        force: bool,
+        collected: list[AgentEvent],
+        event_callback: AgentEventCallback | None,
+    ) -> dict[str, Any]:
+        trigger = "manual" if force else "automatic"
         if self.session_logger is None:
-            return
+            return {
+                "ok": True,
+                "compacted": False,
+                "status": "noop",
+                "text": (
+                    "Context was not compacted because session logging is "
+                    "disabled."
+                ),
+                "result": {"reason": "session_logging_disabled"},
+            }
         try:
             instruction_context = load_project_instructions(self.project_root)
         except Exception as exc:
@@ -1279,15 +1715,39 @@ class TextualChatController:
             ),
             incoming_user_text=incoming_prompt,
         )
-        if not should_compact(
+        if not force and not should_compact(
             pressure,
             self.config.ui.chat.compact_at_tokens,
         ):
-            return
+            return {
+                "ok": True,
+                "compacted": False,
+                "status": "noop",
+                "text": "Context is below the automatic compaction threshold.",
+                "result": {"reason": "below_threshold"},
+            }
         if not self._memory.can_compact():
-            return
+            return {
+                "ok": True,
+                "compacted": False,
+                "status": "noop",
+                "text": (
+                    "There is not enough older conversation context to "
+                    "compact yet."
+                ),
+                "result": {"reason": "insufficient_context"},
+            }
         if self._active_tool_calls or self._pending_approvals:
-            return
+            return {
+                "ok": True,
+                "compacted": False,
+                "status": "noop",
+                "text": (
+                    "Context compaction is deferred while an approval or tool "
+                    "call is active."
+                ),
+                "result": {"reason": "operation_pending"},
+            }
 
         started = self.event_factory.create(
             EventType.MEMORY_COMPACTION_STARTED,
@@ -1300,6 +1760,7 @@ class TextualChatController:
                     self.config.ui.chat.compact_to_tokens
                 ),
                 "messages_before": self._memory.message_count,
+                "trigger": trigger,
             },
         )
         self._publish_controller_event(
@@ -1320,6 +1781,7 @@ class TextualChatController:
                 instruction_context=instruction_context,
                 events=self._session_events,
                 source_session_event_count=source_event_count,
+                force=force,
             )
             if not result.compacted or result.summary_path is None:
                 raise CompactionError(result.reason)
@@ -1336,6 +1798,7 @@ class TextualChatController:
                     "warning": warning,
                     "messages_before": self._memory.message_count,
                     "messages_after": self._memory.message_count,
+                    "trigger": trigger,
                 },
                 parent_event_id=started.event_id,
             )
@@ -1348,7 +1811,13 @@ class TextualChatController:
                 collected=collected,
                 event_callback=event_callback,
             )
-            return
+            return {
+                "ok": False,
+                "compacted": False,
+                "status": "failed",
+                "text": warning,
+                "result": {"warning": warning},
+            }
 
         if result.model_usage is not None:
             self.session_logger.log(
@@ -1375,6 +1844,7 @@ class TextualChatController:
                 "compact_to_tokens": (
                     self.config.ui.chat.compact_to_tokens
                 ),
+                "trigger": trigger,
             },
             parent_event_id=started.event_id,
         )
@@ -1387,6 +1857,17 @@ class TextualChatController:
             collected=collected,
             event_callback=event_callback,
         )
+        return {
+            "ok": True,
+            "compacted": True,
+            "status": "completed",
+            "text": "Context compacted. Summary saved.",
+            "result": {
+                "summary_path": result.summary_path,
+                "messages_before": result.messages_before,
+                "messages_after": result.messages_after,
+            },
+        }
 
     def _get_compactor(self) -> ConversationCompactor:
         if self._compactor is None:
@@ -1430,6 +1911,27 @@ class TextualChatController:
             EventType.TOOL_FAILED.value,
         }:
             self._active_tool_calls.discard(identifier)
+            if event.type == EventType.TOOL_FINISHED.value:
+                self._record_turn_mutation(event)
+                tool_name = _tool_name(event.payload)
+                if tool_name in {
+                    "create_dir",
+                    "write_file",
+                    "edit_file",
+                    "replace_lines",
+                    "insert_lines",
+                }:
+                    result = event.payload.get("result")
+                    if (
+                        isinstance(result, Mapping)
+                        and result.get("ok") is True
+                    ):
+                        path = result.get("path")
+                        if isinstance(path, str) and path:
+                            self._changed_files.add(path)
+                        if self._validation_status != "failed":
+                            self._validation_status = None
+                            self._validation_error = None
         elif event.type == EventType.PERMISSION_REQUESTED.value:
             self._pending_approvals.add(identifier)
         elif event.type == EventType.PERMISSION_RESOLVED.value:
@@ -1442,25 +1944,6 @@ class TextualChatController:
             self._validation_error = (
                 str(error) if isinstance(error, str) and error else None
             )
-        elif event.type == EventType.TOOL_FINISHED.value:
-            tool_name = _tool_name(event.payload)
-            if tool_name not in {
-                "create_dir",
-                "write_file",
-                "edit_file",
-                "replace_lines",
-                "insert_lines",
-            }:
-                return
-            result = event.payload.get("result")
-            if not isinstance(result, Mapping) or result.get("ok") is not True:
-                return
-            path = result.get("path")
-            if isinstance(path, str) and path:
-                self._changed_files.add(path)
-            if self._validation_status != "failed":
-                self._validation_status = None
-                self._validation_error = None
 
 
 def _action_outcome(
@@ -1475,6 +1958,28 @@ def _action_outcome(
         ),
         "result": dict(result),
     }
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    parts = Path(value.replace("\\", "/")).parts
+    if (
+        len(parts) < 4
+        or parts[0] != ".agent"
+        or parts[1] != "checkpoints"
+        or not parts[2]
+    ):
+        return None
+    return parts[2]
 
 
 def _json_text(result: Mapping[str, Any]) -> str:
@@ -1612,6 +2117,153 @@ def _tool_name(payload: Mapping[str, Any]) -> str:
     ) or "unknown"
 
 
+def _turn_progress_status(payload: Mapping[str, Any]) -> str:
+    request = (_first_text(payload, "request", "prompt") or "").casefold()
+    requests_changes = not any(
+        marker in request
+        for marker in (
+            "do not edit",
+            "don't edit",
+            "no edits",
+            "without editing",
+            "read-only",
+            "readonly",
+        )
+    ) and any(
+        marker in request
+        for marker in (
+            "implement",
+            "add ",
+            "build ",
+            "create ",
+            "edit ",
+            "fix ",
+            "refactor ",
+            "update ",
+            "change ",
+        )
+    )
+    if requests_changes:
+        return "Planning how to implement the requested feature..."
+    if "plan" in request:
+        return "Planning the implementation..."
+    return "Gathering information about the project..."
+
+
+def _model_call_progress_status(
+    payload: Mapping[str, Any],
+) -> str | None:
+    phase = (
+        _first_text(payload, "phase", "role", "task_profile") or ""
+    ).casefold()
+    if any(marker in phase for marker in ("plan", "scaffold")):
+        return "Planning the implementation..."
+    if any(marker in phase for marker in ("coder", "edit", "write")):
+        return "Applying project changes..."
+    if any(marker in phase for marker in ("test", "validation")):
+        return "Running validation..."
+    if any(marker in phase for marker in ("plugin", "mcp", "security")):
+        return "Running external tool review..."
+    if "browser" in phase:
+        return "Checking the app in a browser..."
+    if "commit" in phase or phase == "git":
+        return "Preparing Git commit..."
+    return None
+
+
+def _tool_progress_status(payload: Mapping[str, Any]) -> str:
+    name = _tool_name(payload).casefold()
+    if (
+        "browser" in name
+        or name in {"run_browser_validation", "run_managed_browser_validation"}
+    ):
+        return "Checking the app in a browser..."
+    if "validation" in name or name in {"run_tests", "test"}:
+        return "Running validation..."
+    if "git_commit" in name or name in {"commit", "create_git_commit"}:
+        return "Preparing Git commit..."
+    if (
+        "mcp" in name
+        or "plugin" in name
+        or "." in name
+        or name.startswith("web_design")
+    ):
+        return "Running external tool review..."
+    if name in {
+        "create_dir",
+        "write_file",
+        "edit_file",
+        "replace_lines",
+        "insert_lines",
+        "rollback_file",
+    }:
+        return "Applying project changes..."
+    if name == "run_command":
+        return "Running an approved command..."
+    if name in {
+        "list_dir",
+        "read_file",
+        "read_file_with_line_numbers",
+        "grep",
+        "glob",
+        "detect_project",
+        "project_health",
+        "dependency_summary",
+        "git_status",
+        "git_diff",
+        "list_changed_files",
+        "read_json",
+        "read_yaml",
+        "read_many_files",
+        "list_symbols",
+        "ci_summary",
+    }:
+        return "Gathering information about the project..."
+    return "Working on your request..."
+
+
+def _is_generic_progress_status(value: str) -> bool:
+    normalized = value.strip().casefold().rstrip(".…")
+    return normalized in {
+        "",
+        "running",
+        "working",
+        "working on your request",
+    }
+
+
+def _approval_progress_text(payload: Mapping[str, Any]) -> str | None:
+    command = _first_text(payload, "command")
+    if command:
+        return _bounded_text(
+            f"Command: {command}",
+            MAX_TEXTUAL_TOOL_LINE_CHARACTERS,
+        )
+    tool_name = _first_text(
+        payload,
+        "tool_name",
+        "internal_tool_name",
+    )
+    if tool_name:
+        return _bounded_text(
+            f"Tool: {tool_name}",
+            MAX_TEXTUAL_TOOL_LINE_CHARACTERS,
+        )
+    file_path = _first_text(payload, "file_path", "path")
+    if file_path:
+        return _bounded_text(
+            f"File: {file_path}",
+            MAX_TEXTUAL_TOOL_LINE_CHARACTERS,
+        )
+    action = _first_text(payload, "summary", "title", "description")
+    if action:
+        return _bounded_text(
+            f"Action: {action}",
+            MAX_TEXTUAL_TOOL_LINE_CHARACTERS,
+        )
+    return None
+
+
 def _tool_progress_text(
     payload: Mapping[str, Any],
     state: str,
@@ -1657,6 +2309,7 @@ def _bounded_text(value: str, maximum: int) -> str:
 
 
 __all__ = [
+    "ChatTurnCancelled",
     "ChatTurnResult",
     "MAX_TEXTUAL_STATUS_CHARACTERS",
     "MAX_TEXTUAL_TOOL_LINE_CHARACTERS",
@@ -1666,4 +2319,5 @@ __all__ = [
     "TextualChatController",
     "TextualEventRenderer",
     "TextualRenderUpdate",
+    "TurnRollbackSummary",
 ]
