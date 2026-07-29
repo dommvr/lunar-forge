@@ -85,9 +85,6 @@ from lunar_forge.tools.registry import (
     parse_explicit_readonly_tool_request,
     select_task_profile,
 )
-from lunar_forge.ui.console_renderer import ConsoleRenderer
-
-
 MAX_STEPS = 30
 MAX_TOOL_RESULT_CHARACTERS = 20_000
 MAX_FINAL_OUTPUT_CHARACTERS = 50_000
@@ -2290,6 +2287,8 @@ def run_agent(
     show_usage: bool = False,
 ) -> str:
     """Run the existing one-shot interface through the event renderer."""
+    from lunar_forge.ui.console_renderer import ConsoleRenderer
+
     return ConsoleRenderer.one_shot().consume(
         run_agent_events(
             prompt,

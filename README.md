@@ -19,6 +19,39 @@ The current MVP supports:
 - optional local browser validation; and
 - checkpoint, rollback, session resume, and utility commands.
 
+## Current milestone and integration boundary
+
+LunarForge core is usable now through the one-shot CLI and the optional
+Textual terminal UI. This repository is the stabilized core package for the
+current milestone. A product website, hosted UI, FastAPI service, cloud
+sandbox, authentication, and deployment system are future projects and should
+live in separate repositories.
+
+Future wrappers should use the small, typed package API instead of importing
+internal agent, renderer, or session modules:
+
+```python
+from lunar_forge import (
+    AgentRequest,
+    AgentEvent,
+    ApprovalRequest,
+    ApprovalDecision,
+    SessionRef,
+    load_config,
+    list_sessions,
+    resume_session,
+    run_agent_events,
+)
+```
+
+`run_agent_events(...)` delegates to the same agent engine used by the current
+interfaces. Its events and approval records are bounded, redacted, JSON-safe,
+and free of Rich/Textual objects. Resume returns inert historical context:
+prior tool calls are not replayed and prior approvals are not reused. See
+[`lunar_forge.public_api`](lunar_forge/public_api.py) for the typed contract and
+[`docs/website-copy.md`](docs/website-copy.md) for material intended for a
+separate website repository.
+
 ## Requirements and installation
 
 LunarForge requires Python 3.11 or newer. Create a virtual environment and
@@ -166,6 +199,9 @@ python -m pip install -e ".[tui]"
 lunar-forge chat --project <path>
 lunar-forge chat --resume latest --project <path>
 ```
+
+Installing the `tui` extra is not required for the one-shot CLI or the public
+package API.
 
 The current UI provides continuous chat, interactive approvals, safe resume,
 working-memory compaction, the simplified transcript layout, multiline input,
@@ -968,6 +1004,10 @@ lunar-forge --docker "Run the tests and explain failures"
 lunar-forge --docker --allow-network "Run an approved network-dependent task"
 ```
 
+On Windows, Docker mode requires Docker Desktop or another compatible Docker
+engine to be installed and running. Local mode does not require Docker, but it
+is not OS-level isolation.
+
 Docker mode checks availability with `docker info`. The application, not the
 model, constructs the wrapper. It mounts only the project root at `/workspace`,
 uses `/workspace` as the working directory, applies 2 GiB memory and 2 CPU
@@ -1315,6 +1355,9 @@ six project starters, validation, browser setup and managed validation,
 Playwright MCP, local/Docker execution safety and warning acceptance tests,
 every checked-in example project, plugin diagnostics, sessions, the web design
 review plugin, rollback, parallel subagents, and guarded Git finalization.
+Use the [core release checklist](docs/release-checklist.md) for final validation
+and artifact/commit readiness. Website repositories can consume the concise
+[website copy and demo source](docs/website-copy.md).
 
 ## Known limitations
 

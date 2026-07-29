@@ -71,6 +71,8 @@ are all current pass/fail checks.
 - [x] Event/web-cloud transport hardening
 - [x] Textual simplified layout, temporary progress, and multiline input
 - [x] Textual slash commands, popup forms, and config persistence scopes
+- [x] Stable public package API and fake web-renderer compatibility
+- [x] Final core release and runtime-artifact readiness
 - [x] Repository validation after documentation changes
 
 ## 1. Install and CLI availability
@@ -3424,6 +3426,79 @@ if (-not $ResolvedManualRoot.StartsWith($ResolvedTemp, [System.StringComparison]
 }
 Remove-Item -Recurse -Force -LiteralPath $ResolvedManualRoot
 ```
+
+## Final core milestone and website readiness
+
+The complete release gate is maintained in
+[`docs/release-checklist.md`](release-checklist.md). Concise copy, demo
+commands, safety language, FAQ material, and a screenshot checklist for a
+separate website repository are in
+[`docs/website-copy.md`](website-copy.md). Neither document authorizes a web
+server, frontend, or cloud runtime inside this repository.
+
+### Stable package API smoke
+
+**Purpose**
+
+Confirm a future wrapper can import the supported package front door and
+consume structured events without importing Textual or parsing console text.
+
+**Setup**
+
+Use the editable development install from section 1. No model call is needed
+for the import check.
+
+**Command**
+
+```powershell
+python -c "from lunar_forge import AgentRequest, AgentEvent, ApprovalRequest, ApprovalDecision, SessionRef, load_config, list_sessions, resume_session, run_agent_events; print('public API OK')"
+python -m pytest -q tests/test_public_api.py tests/test_events.py
+```
+
+**Expected result**
+
+The import prints `public API OK`. Tests prove that the import does not load
+Rich or Textual, a fake web-style renderer consumes plain JSON-safe
+`AgentEvent` records, approval records remain transport-neutral, and resume
+context does not replay old tools or reuse approvals.
+
+**Cleanup**
+
+The import creates no project or `.agent` runtime file. Pytest temporary
+projects are removed by pytest.
+
+### Artifact audit and final commit readiness
+
+**Purpose**
+
+Ensure the final change contains no generated session, summary, checkpoint,
+browser, screenshot, or disposable-project data.
+
+**Command**
+
+```powershell
+$TrackedRuntime = git -C $RepoRoot ls-files |
+  Where-Object { $_ -match '(^|/)\.agent/(sessions|summaries|checkpoints|artifacts)(/|$)' }
+if ($TrackedRuntime) {
+  throw "Tracked runtime files found: $($TrackedRuntime -join ', ')"
+}
+git -C $RepoRoot ls-files .agent
+git -C $RepoRoot status --short --untracked-files=all
+git -C $RepoRoot diff --stat
+git -C $RepoRoot diff --check
+```
+
+**Expected result**
+
+`$TrackedRuntime` is empty. Any tracked `.agent` path is a deliberate config
+example rather than runtime data. Status and diff contain only intended core
+API, test, or documentation changes, and the whitespace check is silent.
+Review the full diff before approving a release commit.
+
+**Cleanup**
+
+Remove only disposable projects created under the verified `$ManualRoot`.
+Never remove a computed or unresolved path.
 
 ## Repository validation after documentation changes
 
