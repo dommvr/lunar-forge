@@ -12,12 +12,18 @@ from threading import Lock
 from typing import Any
 
 from lunar_forge.approvals import ApprovalProvider, CliApprovalProvider
+from lunar_forge.cancellation import (
+    AgentRunCancelled,
+    CancellableModelClient,
+    CancellationToken,
+)
 from lunar_forge.config import AppConfig, load_config
 from lunar_forge.events import (
     AgentEvent,
     EventFactory,
     EventType,
     events_from_session_record,
+    sanitize_event_payload,
 )
 from lunar_forge.instructions import load_project_instructions
 from lunar_forge.mcp.client import MCPClient, TransportFactory
@@ -25,10 +31,12 @@ from lunar_forge.mcp.config import load_mcp_config
 from lunar_forge.mcp.registry import register_mcp_tools
 from lunar_forge.model_clients import (
     ModelClient,
+    ModelClientFactory,
     ModelResponse,
     ModelUsage,
     ToolCall,
     create_model_client,
+    model_client_sensitive_values,
 )
 from lunar_forge.permissions import (
     ApprovalCallback,
@@ -60,6 +68,17 @@ from lunar_forge.runtime.git import (
     format_git_commit_result,
     list_changed_files as list_git_changed_files,
 )
+from lunar_forge.runtime.base import (
+    RuntimeCheckpoint,
+    RuntimeRollbackResult,
+    RuntimeRollbackStatus,
+    WorkspaceRuntime,
+)
+from lunar_forge.runtime.tooling import (
+    inspect_runtime_project,
+    runtime_project_instructions,
+)
+from lunar_forge.runtime.workspace import create_workspace_runtime
 from lunar_forge.runtime.sessions import (
     SessionEventCallback,
     SessionLogger,
@@ -290,6 +309,109 @@ class _UsageTrackingModelClient:
 
 
 @dataclass(frozen=True)
+class _CancellationAwareModelClient:
+    """Bind one optional active model canceller to a shared run token."""
+
+    delegate: ModelClient
+    token: CancellationToken
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ModelResponse:
+        self.token.raise_if_cancelled()
+        callback = (
+            self.delegate.cancel_active
+            if isinstance(self.delegate, CancellableModelClient)
+            else None
+        )
+        with self.token._bind_canceller("model", callback):
+            return self.delegate.complete(messages, tools)
+
+
+@dataclass
+class _EventSessionSink:
+    """Route legacy session records to public events without local persistence."""
+
+    _event_callback: SessionEventCallback | None
+    _usage_totals: dict[str, int] = field(default_factory=dict)
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    @property
+    def relative_path(self) -> str:
+        return "not persisted (external workspace)"
+
+    @property
+    def usage_totals(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._usage_totals)
+
+    def set_event_callback(
+        self,
+        callback: SessionEventCallback | None,
+    ) -> None:
+        with self._lock:
+            self._event_callback = callback
+
+    def log(self, event: str, **data: Any) -> bool:
+        with self._lock:
+            if event == "model_usage":
+                for name in (
+                    "input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "total_tokens",
+                ):
+                    value = data.get(name)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        self._usage_totals[name] = (
+                            self._usage_totals.get(name, 0) + value
+                        )
+            callback = self._event_callback
+        if callback is not None:
+            try:
+                callback(event, data)
+            except Exception:
+                pass
+        return True
+
+
+@dataclass(frozen=True)
+class _SensitiveEventFactory:
+    """Apply per-run redaction without retaining secrets on a caller's factory."""
+
+    delegate: EventFactory
+    sensitive_values: Sequence[str] = field(repr=False)
+
+    @property
+    def session_id(self) -> str:
+        return self.delegate.session_id
+
+    @property
+    def turn_id(self) -> str:
+        return self.delegate.turn_id
+
+    def create(
+        self,
+        event_type: EventType | str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        parent_event_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> AgentEvent:
+        return self.delegate.create(
+            event_type,
+            sanitize_event_payload(
+                payload or {},
+                sensitive_values=self.sensitive_values,
+            ),
+            parent_event_id=parent_event_id,
+            turn_id=turn_id,
+        )
+
+
+@dataclass(frozen=True)
 class SubagentPhaseResult:
     text: str
     changed_files: tuple[str, ...] = ()
@@ -413,6 +535,9 @@ class CodeAgent:
 
     config: AppConfig
     model_client: ModelClient | None = None
+    model_client_factory: ModelClientFactory | None = None
+    runtime: WorkspaceRuntime | None = None
+    cancellation_token: CancellationToken | None = None
     max_steps: int = MAX_STEPS
     approval_callback: ApprovalCallback | None = None
     mcp_transport_factory: TransportFactory | None = None
@@ -426,7 +551,7 @@ class CodeAgent:
     def run(
         self,
         request: str,
-        project_root: str | Path,
+        project_root: str | Path | None,
         mode: str = "default",
         registry: ToolRegistry | None = None,
         *,
@@ -440,14 +565,23 @@ class CodeAgent:
         session_logger: SessionLogger | None = None,
     ) -> str:
         """Run the permission-gated model/tool loop until final text."""
-        root = Path(project_root).expanduser().resolve()
+        root = _resolve_local_project_root(project_root, self.runtime)
+        if root is None and self.runtime is None:
+            raise ValueError(
+                "A local project root or workspace runtime is required."
+            )
         normalized_mode = mode.strip().lower()
-        if session_logger is not None and session_logger.project_root != root:
+        if (
+            session_logger is not None
+            and (root is None or session_logger.project_root != root)
+        ):
             raise ValueError(
                 "The supplied session logger belongs to another project."
             )
         if normalized_mode == "plan":
             session = None
+        elif root is None:
+            session = _EventSessionSink(event_callback)
         elif session_logger is not None:
             session = session_logger
             session.set_event_callback(event_callback)
@@ -456,6 +590,11 @@ class CodeAgent:
                 root,
                 normalized_mode,
                 event_callback=event_callback,
+                sensitive_values=(
+                    model_client_sensitive_values(self.model_client)
+                    if self.model_client is not None
+                    else ()
+                ),
             )
         in_memory_usage_totals = (
             _RunUsageTotals()
@@ -477,18 +616,40 @@ class CodeAgent:
             if self.max_steps < 1:
                 raise ValueError("max_steps must be at least 1.")
 
-            project_info = detect_project(root)
-            project_trust = resolve_project_trust(
-                root,
-                self.config.runtime.project_trust,
+            project_info = (
+                detect_project(root)
+                if root is not None
+                else inspect_runtime_project(self.runtime)
             )
-            instructions = load_project_instructions(root)
+            project_trust = (
+                resolve_project_trust(
+                    root,
+                    self.config.runtime.project_trust,
+                )
+                if root is not None
+                else (
+                    self.config.runtime.project_trust
+                    if self.config.runtime.project_trust != "auto"
+                    else "unknown"
+                )
+            )
+            instructions = (
+                load_project_instructions(root)
+                if root is not None
+                else runtime_project_instructions(self.runtime)
+            )
+            effective_runtime_mode = (
+                "remote"
+                if self.runtime is not None
+                and self.runtime.local_project_root is None
+                else self.config.runtime.mode
+            )
             permission_manager = PermissionManager(
                 mode=mode,
                 approval_provider=self.approval_provider,
                 approval_callback=self.approval_callback,
                 approval_event_callback=approval_event_callback,
-                runtime_mode=self.config.runtime.mode,
+                runtime_mode=effective_runtime_mode,
                 project_trust=project_trust,
             )
             browser_intent = detect_browser_intent(request, project_info)
@@ -516,15 +677,17 @@ class CodeAgent:
                         approval_provider=self.approval_provider,
                         approval_callback=self.approval_callback,
                         approval_event_callback=approval_event_callback,
-                        runtime_mode=self.config.runtime.mode,
+                        runtime_mode=effective_runtime_mode,
                         project_trust=project_trust,
                         allow_network=self.config.runtime.allow_network,
+                        runtime=self.runtime,
+                        cancellation_token=self.cancellation_token,
                     )
                 else:
                     readonly_tools = registry
                     readonly_tools.set_permission_manager(permission_manager)
                 model_client = _track_model_usage(
-                    self.model_client or self._create_model_client(),
+                    self._model_client_for_run(),
                     in_memory_usage_totals,
                 )
                 return self._run_explicit_readonly_fast_path(
@@ -537,18 +700,23 @@ class CodeAgent:
                     show_usage=show_usage,
                     usage_totals=in_memory_usage_totals,
                 )
+            if root is None and (self.config.mcp.enabled or self.config.plugins.enabled):
+                raise AgentError(
+                    "MCP and local plugins require a local project root; "
+                    "remote runtimes expose only the portable built-in tools."
+                )
             mcp_client = (
                 MCPClient(
                     load_mcp_config(root),
                     transport_factory=self.mcp_transport_factory,
                     project_root=root,
                 )
-                if self.config.mcp.enabled
+                if self.config.mcp.enabled and root is not None
                 else None
             )
             loaded_plugins = (
                 load_enabled_plugins(root)
-                if self.config.plugins.enabled
+                if self.config.plugins.enabled and root is not None
                 else ()
             )
             plugin_resolver = self.plugin_resolver or resolve_local_plugin_entrypoint
@@ -559,12 +727,14 @@ class CodeAgent:
                     approval_provider=self.approval_provider,
                     approval_callback=self.approval_callback,
                     approval_event_callback=approval_event_callback,
-                    runtime_mode=self.config.runtime.mode,
+                    runtime_mode=effective_runtime_mode,
                     project_trust=project_trust,
                     allow_network=self.config.runtime.allow_network,
                     mcp_client=mcp_client,
                     plugins=loaded_plugins,
                     plugin_resolver=plugin_resolver,
+                    runtime=self.runtime,
+                    cancellation_token=self.cancellation_token,
                 )
             else:
                 tools = registry
@@ -615,15 +785,20 @@ class CodeAgent:
                 )
             )
             model_client = _track_model_usage(
-                self.model_client or self._create_model_client(),
+                self._model_client_for_run(),
                 in_memory_usage_totals,
             )
             system_prompt = build_system_prompt(
                 project_info,
                 instructions,
                 mode,
-                runtime_mode=self.config.runtime.mode,
+                runtime_mode=effective_runtime_mode,
                 allow_network=self.config.runtime.allow_network,
+                network_policy=(
+                    self.runtime.network_policy.value
+                    if self.runtime is not None
+                    else None
+                ),
                 browser_intent=browser_intent,
                 task_profile=task_selection.profile.value,
             )
@@ -1038,7 +1213,7 @@ class CodeAgent:
         text: str,
         *,
         request: str,
-        root: Path,
+        root: Path | None,
         mode: str,
         session: SessionLogger | None,
         changed_files: Sequence[str],
@@ -1061,6 +1236,19 @@ class CodeAgent:
                 reason="Plan mode blocks Git commits.",
             )
             return f"{text}\n\nGit:\n- Commit not created: plan mode"
+        if root is None:
+            _log_git_commit_skipped(
+                session,
+                result_code="external_workspace",
+                reason=(
+                    "Core Git commit support requires a locally addressable "
+                    "project root."
+                ),
+            )
+            return (
+                f"{text}\n\nGit:\n"
+                "- Commit not created: external workspace Git is unavailable"
+            )
         git_mode = (
             "no-command"
             if self.config.runtime.mode.strip().lower() == "no-command"
@@ -1726,7 +1914,7 @@ class CodeAgent:
         """
         if self.model_client is not None:
             return (fallback,) * count
-        return tuple(self._create_model_client() for _ in range(count))
+        return tuple(self._model_client_for_run() for _ in range(count))
 
     def _run_subagent_phase_outcome(
         self,
@@ -1885,6 +2073,30 @@ class CodeAgent:
             return create_model_client(self.config.model)
         except ValueError as exc:
             raise AgentError(str(exc)) from exc
+
+    def _model_client_for_run(self) -> ModelClient:
+        if self.model_client is not None and self.model_client_factory is not None:
+            raise AgentError(
+                "Supply either model_client or model_client_factory, not both."
+            )
+        try:
+            client = (
+                self.model_client_factory()
+                if self.model_client_factory is not None
+                else self.model_client or self._create_model_client()
+            )
+        except Exception as exc:
+            if isinstance(exc, AgentError):
+                raise
+            raise AgentError(
+                f"The injected model client factory failed: {type(exc).__name__}."
+            ) from None
+        if self.cancellation_token is not None:
+            return _CancellationAwareModelClient(
+                client,
+                self.cancellation_token,
+            )
+        return client
 
 
 def _run_subagent_model_loop(
@@ -2096,12 +2308,15 @@ def _run_subagent_model_loop(
 
 def run_agent_events(
     prompt: str,
-    project_root: str | Path,
+    project_root: str | Path | None,
     *,
     config: AppConfig | None = None,
     mode: str = "default",
     max_steps: int = MAX_STEPS,
     model_client: ModelClient | None = None,
+    model_client_factory: ModelClientFactory | None = None,
+    runtime: WorkspaceRuntime | None = None,
+    cancellation_token: CancellationToken | None = None,
     approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
     resume_messages: Sequence[Mapping[str, Any]] = (),
@@ -2123,18 +2338,55 @@ def run_agent_events(
     synchronous agent call is still active. The same events remain in the
     yielded stream afterward, preserving existing consumers and ordering.
     """
-    root = Path(project_root).expanduser().resolve()
+    root = _resolve_local_project_root(project_root, runtime)
+    if root is None and runtime is None:
+        raise ValueError("A local project root or workspace runtime is required.")
     resolved_config = config or load_config(root)
-    factory = event_factory or EventFactory()
+    if model_client is not None and model_client_factory is not None:
+        raise ValueError(
+            "Supply either model_client or model_client_factory, not both."
+        )
+    injected_model_client = model_client
+    if model_client_factory is not None:
+        try:
+            injected_model_client = model_client_factory()
+        except Exception as exc:
+            raise AgentError(
+                f"The injected model client factory failed: {type(exc).__name__}."
+            ) from None
+    sensitive_values = (
+        model_client_sensitive_values(injected_model_client)
+        if injected_model_client is not None
+        else ()
+    )
+    base_factory = event_factory or EventFactory()
+    factory = (
+        _SensitiveEventFactory(base_factory, sensitive_values)
+        if sensitive_values
+        else base_factory
+    )
+    effective_runtime = runtime
+    if cancellation_token is not None and effective_runtime is None:
+        if root is None:
+            raise ValueError(
+                "Cancellation requires a workspace runtime when no local root "
+                "is supplied."
+            )
+        effective_runtime = create_workspace_runtime(
+            root,
+            mode=resolved_config.runtime.mode,
+            allow_network=resolved_config.runtime.allow_network,
+        )
     buffered_events: list[AgentEvent] = []
     buffer_lock = Lock()
+    event_observer_lock = Lock()
     approval_parent_events: dict[str, str] = {}
 
     def buffer_event(event: AgentEvent) -> None:
         with buffer_lock:
             buffered_events.append(event)
 
-    def observe_session_event(
+    def _observe_session_event_locked(
         legacy_event: str,
         data: Mapping[str, Any],
     ) -> None:
@@ -2163,12 +2415,23 @@ def run_agent_events(
             ):
                 approval_parent_events[str(request_id)] = event.event_id
 
+    def observe_session_event(
+        legacy_event: str,
+        data: Mapping[str, Any],
+    ) -> None:
+        # Parallel subagents may report simultaneously. Serialize adaptation and
+        # delivery so sequence numbers are observed in their assigned order.
+        with event_observer_lock:
+            _observe_session_event_locked(legacy_event, data)
+
     selected_approval_provider = approval_provider
     if selected_approval_provider is None and approval_callback is None:
         selected_approval_provider = CliApprovalProvider()
     agent = CodeAgent(
         config=resolved_config,
-        model_client=model_client,
+        model_client=injected_model_client,
+        runtime=effective_runtime,
+        cancellation_token=cancellation_token,
         max_steps=max_steps,
         approval_provider=selected_approval_provider,
         approval_callback=approval_callback,
@@ -2181,9 +2444,31 @@ def run_agent_events(
         session_event = factory.create(
             EventType.SESSION_STARTED,
             {
-                "project_root": str(root),
+                "project_root": str(root) if root is not None else None,
+                "workspace_id": (
+                    effective_runtime.workspace_id
+                    if effective_runtime is not None
+                    else None
+                ),
                 "mode": mode,
-                "runtime_mode": resolved_config.runtime.mode,
+                "runtime_mode": (
+                    "remote"
+                    if effective_runtime is not None
+                    and effective_runtime.local_project_root is None
+                    else resolved_config.runtime.mode
+                ),
+                "network_policy": (
+                    effective_runtime.network_policy.value
+                    if effective_runtime is not None
+                    else (
+                        "host"
+                        if resolved_config.runtime.mode == "local"
+                        else "allowed"
+                        if resolved_config.runtime.mode == "docker"
+                        and resolved_config.runtime.allow_network
+                        else "denied"
+                    )
+                ),
                 "permission_mode": mode,
                 "resumed": resumed_from is not None,
             },
@@ -2216,6 +2501,11 @@ def run_agent_events(
         {"state": "running", "message": "Working..."},
         parent_event_id=turn_event.event_id,
     )
+    runtime_checkpoint = _runtime_turn_checkpoint(
+        effective_runtime,
+        factory.turn_id,
+        enabled=cancellation_token is not None,
+    )
 
     try:
         final_text = agent.run(
@@ -2231,14 +2521,42 @@ def run_agent_events(
             event_callback=observe_session_event,
             session_logger=session_logger,
         )
-    except Exception as exc:
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
+    except AgentRunCancelled:
         yield from _drain_event_buffer(buffered_events, buffer_lock)
+        yield from _finish_cancelled_run(
+            factory=factory,
+            turn_event=turn_event,
+            token=cancellation_token,
+            runtime=effective_runtime,
+            checkpoint=runtime_checkpoint,
+            live_event_callback=live_event_callback,
+        )
+        return
+    except Exception as exc:
+        if (
+            cancellation_token is not None
+            and cancellation_token.is_cancellation_requested
+        ):
+            yield from _drain_event_buffer(buffered_events, buffer_lock)
+            yield from _finish_cancelled_run(
+                factory=factory,
+                turn_event=turn_event,
+                token=cancellation_token,
+                runtime=effective_runtime,
+                checkpoint=runtime_checkpoint,
+                live_event_callback=live_event_callback,
+            )
+            return
+        yield from _drain_event_buffer(buffered_events, buffer_lock)
+        safe_error_message = _redact_known_values(str(exc), sensitive_values)
         error_event = factory.create(
             EventType.ERROR,
             {
                 "source": "agent",
                 "error_type": type(exc).__name__,
-                "message": str(exc),
+                "message": safe_error_message,
             },
             parent_event_id=turn_event.event_id,
         )
@@ -2248,6 +2566,8 @@ def run_agent_events(
             {"status": "failed", "error_event_id": error_event.event_id},
             parent_event_id=turn_event.event_id,
         )
+        if sensitive_values:
+            raise AgentError(safe_error_message) from None
         raise
 
     yield from _drain_event_buffer(buffered_events, buffer_lock)
@@ -2269,12 +2589,15 @@ def run_agent_events(
 
 def run_agent(
     prompt: str,
-    project_root: str | Path,
+    project_root: str | Path | None,
     *,
     config: AppConfig | None = None,
     mode: str = "default",
     max_steps: int = MAX_STEPS,
     model_client: ModelClient | None = None,
+    model_client_factory: ModelClientFactory | None = None,
+    runtime: WorkspaceRuntime | None = None,
+    cancellation_token: CancellationToken | None = None,
     approval_provider: ApprovalProvider | None = None,
     approval_callback: ApprovalCallback | None = None,
     resume_messages: Sequence[Mapping[str, Any]] = (),
@@ -2297,6 +2620,9 @@ def run_agent(
             mode=mode,
             max_steps=max_steps,
             model_client=model_client,
+            model_client_factory=model_client_factory,
+            runtime=runtime,
+            cancellation_token=cancellation_token,
             approval_provider=approval_provider,
             approval_callback=approval_callback,
             resume_messages=resume_messages,
@@ -2321,17 +2647,173 @@ def _drain_event_buffer(
     return drained
 
 
+def _resolve_local_project_root(
+    project_root: str | Path | None,
+    runtime: WorkspaceRuntime | None,
+) -> Path | None:
+    root = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else None
+    )
+    runtime_root = (
+        runtime.local_project_root.expanduser().resolve()
+        if runtime is not None and runtime.local_project_root is not None
+        else None
+    )
+    if root is not None and runtime is not None and runtime_root is None:
+        raise ValueError(
+            "A non-local workspace runtime must be used with project_root=None."
+        )
+    if root is not None and runtime_root is not None and root != runtime_root:
+        raise ValueError(
+            "The supplied runtime belongs to a different local project root."
+        )
+    selected = root or runtime_root
+    if selected is not None and not selected.is_dir():
+        raise NotADirectoryError(f"Project root is not a directory: {selected}")
+    return selected
+
+
+def _runtime_turn_checkpoint(
+    runtime: WorkspaceRuntime | None,
+    turn_id: str,
+    *,
+    enabled: bool,
+) -> RuntimeCheckpoint | None:
+    if not enabled or runtime is None:
+        return None
+    try:
+        return runtime.checkpoint_turn(turn_id)
+    except Exception as exc:
+        return RuntimeCheckpoint(
+            supported=False,
+            error=f"Runtime checkpoint failed: {type(exc).__name__}.",
+        )
+
+
+def _finish_cancelled_run(
+    *,
+    factory: EventFactory,
+    turn_event: AgentEvent,
+    token: CancellationToken | None,
+    runtime: WorkspaceRuntime | None,
+    checkpoint: RuntimeCheckpoint | None,
+    live_event_callback: Callable[[AgentEvent], None] | None,
+) -> Iterator[AgentEvent]:
+    if token is None:
+        return
+    cancelled = factory.create(
+        EventType.TURN_CANCELLED,
+        {
+            "status": "cancelled",
+            "reason": "Cancellation was requested by the caller.",
+        },
+        parent_event_id=turn_event.event_id,
+    )
+    _notify_live_event(live_event_callback, cancelled)
+    yield cancelled
+
+    rollback = RuntimeRollbackResult(RuntimeRollbackStatus.NOT_REQUESTED)
+    if token.rollback_requested:
+        rollback_started = factory.create(
+            EventType.ROLLBACK_STARTED,
+            {
+                "reason": "Revoking current-turn changes after cancellation.",
+                "checkpoint_supported": bool(
+                    checkpoint is not None and checkpoint.supported
+                ),
+            },
+            parent_event_id=cancelled.event_id,
+        )
+        _notify_live_event(live_event_callback, rollback_started)
+        yield rollback_started
+        rollback = _rollback_runtime_turn(runtime, checkpoint)
+        rollback_finished = factory.create(
+            EventType.ROLLBACK_FINISHED,
+            rollback.to_dict(),
+            parent_event_id=rollback_started.event_id,
+        )
+        _notify_live_event(live_event_callback, rollback_finished)
+        yield rollback_finished
+
+    result = token._finish(rollback)
+    finished = factory.create(
+        EventType.TURN_FINISHED,
+        {
+            "status": "cancelled",
+            "cancellation": result.to_dict(),
+        },
+        parent_event_id=turn_event.event_id,
+    )
+    _notify_live_event(live_event_callback, finished)
+    yield finished
+
+
+def _rollback_runtime_turn(
+    runtime: WorkspaceRuntime | None,
+    checkpoint: RuntimeCheckpoint | None,
+) -> RuntimeRollbackResult:
+    if runtime is None:
+        return RuntimeRollbackResult(RuntimeRollbackStatus.UNSUPPORTED)
+    if checkpoint is None or not checkpoint.supported or not checkpoint.checkpoint_id:
+        errors = (
+            (checkpoint.error,)
+            if checkpoint is not None and checkpoint.error
+            else ()
+        )
+        return RuntimeRollbackResult(
+            RuntimeRollbackStatus.UNSUPPORTED,
+            errors=errors,
+        )
+    try:
+        return runtime.rollback_turn(checkpoint.checkpoint_id)
+    except Exception as exc:
+        return RuntimeRollbackResult(
+            RuntimeRollbackStatus.FAILED,
+            errors=(f"Runtime rollback failed: {type(exc).__name__}.",),
+        )
+
+
+def _notify_live_event(
+    callback: Callable[[AgentEvent], None] | None,
+    event: AgentEvent,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        pass
+
+
+def _redact_known_values(value: str, sensitive_values: Sequence[str]) -> str:
+    safe = str(value)
+    for secret in sorted(
+        (item for item in sensitive_values if item),
+        key=len,
+        reverse=True,
+    ):
+        safe = safe.replace(secret, "[REDACTED]")
+    return safe
+
+
 def _start_session(
     root: Path,
     mode: str,
     *,
     event_callback: SessionEventCallback | None = None,
+    sensitive_values: Sequence[str] = (),
 ) -> SessionLogger | None:
     # Plan mode remains strictly read-only, including LunarForge runtime files.
     if mode == "plan":
         return None
     try:
-        return create_session_logger(root, event_callback=event_callback)
+        return create_session_logger(
+            root,
+            event_callback=event_callback,
+            sensitive_values=sensitive_values,
+        )
     except Exception:
         return None
 

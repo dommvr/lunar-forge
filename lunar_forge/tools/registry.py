@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lunar_forge.approvals import ApprovalProvider
+from lunar_forge.cancellation import AgentRunCancelled, CancellationToken
 from lunar_forge.permissions import (
     ApprovalCallback,
     ApprovalEventCallback,
@@ -52,6 +53,12 @@ from lunar_forge.tools.structured_readers import (
     read_many_files,
     read_yaml,
 )
+from lunar_forge.runtime.base import (
+    MAX_RUNTIME_COMMAND_CHARACTERS,
+    MAX_RUNTIME_COMMAND_TIMEOUT_MS,
+    WorkspaceRuntime,
+)
+from lunar_forge.runtime.tooling import RuntimeToolAdapter
 
 
 if TYPE_CHECKING:
@@ -754,6 +761,8 @@ class ToolRegistry:
 
         try:
             result = tool.handler(**dict(arguments))
+        except AgentRunCancelled:
+            raise
         except Exception as exc:
             return {
                 "ok": False,
@@ -1236,7 +1245,7 @@ def create_read_only_registry(
 
 
 def create_tool_registry(
-    project_root: str | Path,
+    project_root: str | Path | None,
     mode: str = "default",
     approval_callback: ApprovalCallback | None = None,
     *,
@@ -1249,19 +1258,45 @@ def create_tool_registry(
     plugins: Sequence[LoadedPlugin] = (),
     plugin_resolver: EntrypointResolver | None = None,
     session_changed_files: list[str] | None = None,
+    runtime: WorkspaceRuntime | None = None,
+    cancellation_token: CancellationToken | None = None,
 ) -> ToolRegistry:
     """Create built-ins and explicitly enabled external extension tools."""
     from lunar_forge.project_detection import resolve_project_trust
 
     normalized_mode = mode.strip().lower()
-    resolved_project_trust = resolve_project_trust(
-        project_root,
-        project_trust,
-    )
     session_tracker = (
         session_changed_files
         if session_changed_files is not None
         else []
+    )
+    runtime_adapter = (
+        RuntimeToolAdapter(
+            runtime,
+            cancellation_token=cancellation_token,
+            changed_files=session_tracker,
+        )
+        if runtime is not None
+        else None
+    )
+    if project_root is None:
+        if runtime_adapter is None:
+            raise ValueError(
+                "A workspace runtime is required without a local project root."
+            )
+        return _create_runtime_only_registry(
+            runtime_adapter,
+            mode=mode,
+            runtime_mode="remote",
+            approval_provider=approval_provider,
+            approval_callback=approval_callback,
+            approval_event_callback=approval_event_callback,
+            session_changed_files=session_tracker,
+        )
+
+    resolved_project_trust = resolve_project_trust(
+        project_root,
+        project_trust,
     )
     read_registry = create_read_only_registry(
         project_root,
@@ -1271,13 +1306,19 @@ def create_tool_registry(
     )
     tools = [read_registry.get(name) for name in read_registry.names()]
     if normalized_mode != "plan":
-        tools.extend(_write_tools(project_root))
+        tools.extend(
+            _runtime_write_tools(runtime_adapter)
+            if runtime_adapter is not None
+            else _write_tools(project_root)
+        )
     if (
         normalized_mode not in {"plan", "no-command"}
         and runtime_mode.strip().lower() != "no-command"
     ):
         tools.extend(
-            _execution_tools(
+            _runtime_execution_tools(runtime_adapter)
+            if runtime_adapter is not None
+            else _execution_tools(
                 project_root,
                 runtime_mode=runtime_mode,
                 allow_network=allow_network,
@@ -1290,7 +1331,11 @@ def create_tool_registry(
             approval_provider=approval_provider,
             approval_callback=approval_callback,
             approval_event_callback=approval_event_callback,
-            runtime_mode=runtime_mode,
+            runtime_mode=(
+                "remote"
+                if runtime is not None and runtime.local_project_root is None
+                else runtime_mode
+            ),
             project_trust=resolved_project_trust,
         ),
         session_changed_files=session_tracker,
@@ -1316,6 +1361,258 @@ def create_tool_registry(
             plugin_resolver,
         )
     return registry
+
+
+def _create_runtime_only_registry(
+    adapter: RuntimeToolAdapter,
+    *,
+    mode: str,
+    runtime_mode: str,
+    approval_provider: ApprovalProvider | None,
+    approval_callback: ApprovalCallback | None,
+    approval_event_callback: ApprovalEventCallback | None,
+    session_changed_files: list[str],
+) -> ToolRegistry:
+    """Create the portable built-in subset for a non-local workspace."""
+
+    normalized_mode = mode.strip().lower()
+    tools: list[Tool] = [
+        Tool(
+            "list_dir",
+            "List bounded entries inside the confined runtime workspace.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                },
+                "additionalProperties": False,
+            },
+            adapter.list_dir,
+        ),
+        Tool(
+            "read_file",
+            "Read a bounded line range from a runtime workspace text file.",
+            _runtime_read_schema(),
+            adapter.read_file,
+        ),
+        Tool(
+            "read_file_with_line_numbers",
+            "Read bounded runtime text with stable one-based line numbers.",
+            _runtime_read_schema(),
+            adapter.read_file_with_line_numbers,
+        ),
+        Tool(
+            "read_json",
+            "Parse one bounded JSON file from the runtime workspace.",
+            _runtime_structured_read_schema("JSON"),
+            adapter.read_json,
+        ),
+        Tool(
+            "read_yaml",
+            "Safely parse one bounded YAML file from the runtime workspace.",
+            _runtime_structured_read_schema("YAML"),
+            adapter.read_yaml,
+        ),
+        Tool(
+            "detect_project",
+            "Detect common project markers through the runtime boundary.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            adapter.detect_project,
+        ),
+        Tool(
+            "list_changed_files",
+            "List files changed through this runtime-backed agent session.",
+            {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["session", "git", "both"],
+                        "default": "session",
+                    }
+                },
+                "additionalProperties": False,
+            },
+            adapter.list_changed_files,
+        ),
+    ]
+    if normalized_mode != "plan":
+        tools.extend(_runtime_write_tools(adapter))
+    if normalized_mode not in {"plan", "no-command"}:
+        tools.extend(_runtime_execution_tools(adapter))
+    return ToolRegistry(
+        tools,
+        permission_manager=PermissionManager(
+            mode=mode,
+            approval_provider=approval_provider,
+            approval_callback=approval_callback,
+            approval_event_callback=approval_event_callback,
+            runtime_mode=runtime_mode,
+            project_trust="unknown",
+        ),
+        session_changed_files=session_changed_files,
+    )
+
+
+def _runtime_read_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+
+def _runtime_structured_read_schema(kind: str) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": f"Project-relative {kind} path.",
+            },
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50_000,
+                "default": 50_000,
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+
+def _runtime_write_tools(adapter: RuntimeToolAdapter) -> tuple[Tool, ...]:
+    return (
+        Tool(
+            "create_dir",
+            "Create a directory inside the confined runtime workspace.",
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            adapter.create_dir,
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            "write_file",
+            "Create or explicitly replace one runtime workspace text file.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "overwrite": {"type": "boolean", "default": False},
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            adapter.write_file,
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            "edit_file",
+            "Replace exact text that occurs once in a runtime workspace file.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": False,
+            },
+            adapter.edit_file,
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            "replace_lines",
+            "Replace a one-based inclusive line range in a runtime file.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "start_line", "end_line", "new_text"],
+                "additionalProperties": False,
+            },
+            adapter.replace_lines,
+            permission=PermissionLevel.WRITE,
+        ),
+        Tool(
+            "insert_lines",
+            "Insert text after a one-based runtime file line.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "after_line": {"type": "integer", "minimum": 0},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "after_line", "new_text"],
+                "additionalProperties": False,
+            },
+            adapter.insert_lines,
+            permission=PermissionLevel.WRITE,
+        ),
+    )
+
+
+def _runtime_execution_tools(adapter: RuntimeToolAdapter) -> tuple[Tool, ...]:
+    return (
+        Tool(
+            "run_command",
+            "Run one bounded command through the supplied workspace runtime.",
+            {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "maxLength": MAX_RUNTIME_COMMAND_CHARACTERS,
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_RUNTIME_COMMAND_TIMEOUT_MS,
+                        "default": 120000,
+                    },
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+            adapter.run_command,
+            permission=PermissionLevel.EXECUTE,
+        ),
+        Tool(
+            "run_validation",
+            "Detect and run bounded validation commands through the runtime.",
+            {
+                "type": "object",
+                "properties": {
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_RUNTIME_COMMAND_TIMEOUT_MS,
+                        "default": 120000,
+                    }
+                },
+                "additionalProperties": False,
+            },
+            adapter.run_validation,
+            permission=PermissionLevel.EXECUTE,
+        ),
+    )
 
 
 def _write_tools(project_root: str | Path) -> tuple[Tool, ...]:

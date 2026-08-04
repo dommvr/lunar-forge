@@ -36,7 +36,10 @@ from lunar_forge import (
     AgentEvent,
     ApprovalRequest,
     ApprovalDecision,
+    CancellationToken,
+    ModelClient,
     SessionRef,
+    WorkspaceRuntime,
     load_config,
     list_sessions,
     resume_session,
@@ -48,9 +51,34 @@ from lunar_forge import (
 interfaces. Its events and approval records are bounded, redacted, JSON-safe,
 and free of Rich/Textual objects. Resume returns inert historical context:
 prior tool calls are not replayed and prior approvals are not reused. See
-[`lunar_forge.public_api`](lunar_forge/public_api.py) for the typed contract and
+[`docs/public-api.md`](docs/public-api.md) for the stable integration contract,
+[`lunar_forge.public_api`](lunar_forge/public_api.py) for its implementation, and
 [`docs/website-copy.md`](docs/website-copy.md) for material intended for a
 separate website repository.
+
+External applications may supply a `WorkspaceRuntime` and a `ModelClient` (or
+factory) for one run without changing `os.environ` or requiring a local
+`pathlib.Path`. The same runtime contract has built-in local, Docker, and
+no-command adapters. A remote provider such as E2B is an external adapter use
+case; LunarForge core does not depend on or implement E2B.
+
+```python
+from lunar_forge import AgentRequest, CancellationToken, run_agent_events
+
+runtime = MyRemoteRuntime(...)       # implements WorkspaceRuntime outside core
+model = MyInMemoryModelClient(...)   # implements ModelClient outside core
+cancel = CancellationToken()
+
+# A request handler in another task or thread may call:
+# cancel.request_cancel(rollback=True)
+for event in run_agent_events(
+    AgentRequest(project_root=None, message="Inspect and update the project."),
+    runtime=runtime,
+    model_client=model,
+    cancellation_token=cancel,
+):
+    send_json(event.to_dict())
+```
 
 ## Requirements and installation
 

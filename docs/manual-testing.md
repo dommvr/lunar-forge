@@ -3451,8 +3451,8 @@ for the import check.
 **Command**
 
 ```powershell
-python -c "from lunar_forge import AgentRequest, AgentEvent, ApprovalRequest, ApprovalDecision, SessionRef, load_config, list_sessions, resume_session, run_agent_events; print('public API OK')"
-python -m pytest -q tests/test_public_api.py tests/test_events.py
+python -c "from lunar_forge import AgentRequest, AgentEvent, ApprovalRequest, ApprovalDecision, CancellationToken, ModelClient, WorkspaceRuntime, SessionRef, load_config, list_sessions, resume_session, run_agent_events; print('public API OK')"
+python -m pytest -q tests/test_public_integrations.py tests/test_public_api.py tests/test_events.py
 ```
 
 **Expected result**
@@ -3466,6 +3466,34 @@ context does not replay old tools or reuse approvals.
 
 The import creates no project or `.agent` runtime file. Pytest temporary
 projects are removed by pytest.
+
+### External runtime, model injection, and cancellation smoke
+
+**Purpose**
+
+Confirm the stable package boundary can drive an implementation-neutral remote
+workspace without a local project path or process-global credential changes.
+This is a contract test, not a live E2B test; E2B remains an external adapter.
+
+**Command**
+
+```powershell
+python -m pytest -q tests/test_public_integrations.py
+```
+
+**Expected result**
+
+The deterministic suite covers remote file metadata/read/write/move/delete,
+bounded command output, confinement, approval correlation, model and command
+cancellation from another thread, rollback success/partial/unsupported states,
+event ordering, per-run model factories, concurrent credential isolation, and
+redaction from events, session logs, representations, and raised errors. It
+does not contact a model provider or sandbox service.
+
+**Cleanup**
+
+The suite uses pytest temporary directories and in-memory fake workspaces. It
+does not mutate environment variables or create live remote resources.
 
 ### Artifact audit and final commit readiness
 

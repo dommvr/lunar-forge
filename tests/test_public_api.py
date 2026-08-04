@@ -12,7 +12,11 @@ from lunar_forge import (
     AgentRequest,
     ApprovalDecision,
     ApprovalRequest,
+    CancellationToken,
+    ModelClient,
+    RuntimeCommandResult,
     SessionRef,
+    WorkspaceRuntime,
     list_sessions,
     load_config,
     resume_session,
@@ -80,7 +84,11 @@ from lunar_forge import (
     AgentRequest,
     ApprovalDecision,
     ApprovalRequest,
+    CancellationToken,
+    ModelClient,
+    RuntimeCommandResult,
     SessionRef,
+    WorkspaceRuntime,
     list_sessions,
     load_config,
     resume_session,
@@ -230,6 +238,7 @@ def test_public_event_runner_delegates_to_core_for_fake_web_renderer(
                 "project_root": project_root,
                 "mode": kwargs["mode"],
                 "resume_messages": kwargs["resume_messages"],
+                "live_event_callback": kwargs["live_event_callback"],
             }
         )
         yield factory.create(
@@ -252,13 +261,15 @@ def test_public_event_runner_delegates_to_core_for_fake_web_renderer(
         ui_metadata={"transport": "sse"},
     )
 
-    renderer.consume(run_agent_events(request))
+    callback = lambda event: None
+    renderer.consume(run_agent_events(request, live_event_callback=callback))
 
     assert observed == {
         "prompt": "Explain this project.",
         "project_root": tmp_path.resolve(),
         "mode": "plan",
         "resume_messages": (),
+        "live_event_callback": callback,
     }
     assert [record["type"] for record in renderer.records] == [
         "status.updated",

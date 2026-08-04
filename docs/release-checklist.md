@@ -18,7 +18,7 @@ stateful smoke tests only in disposable projects. Do not commit generated
 
 ```powershell
 python -m pip install -e ".[dev]"
-python -c "from lunar_forge import AgentRequest, AgentEvent, ApprovalRequest, ApprovalDecision, SessionRef, load_config, list_sessions, resume_session, run_agent_events; print('public API OK')"
+python -c "from lunar_forge import AgentRequest, AgentEvent, ApprovalRequest, ApprovalDecision, CancellationToken, ModelClient, WorkspaceRuntime, SessionRef, load_config, list_sessions, resume_session, run_agent_events; print('public API OK')"
 lunar-forge --help
 lunar-forge chat --help
 ```
@@ -26,6 +26,26 @@ lunar-forge chat --help
 - [ ] The public import succeeds without importing Textual.
 - [ ] `chat --help` works without eager Textual app loading.
 - [ ] Without `.[tui]`, starting chat prints the documented install guidance.
+- [ ] The public runtime/model/cancellation imports add no E2B, web, Rich, or
+  Textual dependency.
+
+## External runtime integration smoke
+
+Use deterministic fakes; no provider credential or live sandbox is required:
+
+```powershell
+python -m pytest -q tests/test_public_integrations.py tests/test_public_api.py tests/test_events.py
+```
+
+- [ ] `run_agent_events(AgentRequest(...))` retains its existing behavior.
+- [ ] A request with `project_root=None` runs through a fake `WorkspaceRuntime`.
+- [ ] Remote file and command results are bounded and project-confined.
+- [ ] Approval request/resolution IDs remain correlated.
+- [ ] Cancellation from another thread cancels supported model/runtime work.
+- [ ] Completed, partial, and unsupported rollback results emit the existing
+  ordered rollback events.
+- [ ] Concurrent runs use distinct injected clients without environment
+  mutation or credential cross-contamination.
 
 ## One-shot CLI smoke
 
@@ -174,7 +194,7 @@ git status --short --untracked-files=all
 Run focused compatibility suites:
 
 ```powershell
-python -m pytest -q tests/test_public_api.py tests/test_events.py tests/test_textual_ui.py tests/test_sessions.py tests/test_compaction.py tests/test_slash_commands.py tests/test_approvals.py
+python -m pytest -q tests/test_public_integrations.py tests/test_public_api.py tests/test_events.py tests/test_textual_ui.py tests/test_sessions.py tests/test_compaction.py tests/test_slash_commands.py tests/test_approvals.py
 ```
 
 Run the complete gate:

@@ -103,7 +103,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_config(
-    project_root: Path,
+    project_root: str | Path | None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> AppConfig:
     """Load configuration in increasing order of precedence.
@@ -111,14 +111,21 @@ def load_config(
     Raw API keys are deliberately excluded. ``api_key_env`` identifies the
     environment variable that a model client may read only when making a call.
     """
-    root = Path(project_root).expanduser().resolve()
+    root = (
+        Path(project_root).expanduser().resolve()
+        if project_root is not None
+        else None
+    )
     user_config_path = Path.home() / ".lunar-forge" / "config.yaml"
-    project_config_path = safe_path(root, ".agent/config.yaml")
+    project_config_path = (
+        safe_path(root, ".agent/config.yaml") if root is not None else None
+    )
 
     merged = _default_config()
     merged = deep_merge(merged, _environment_config(os.environ))
     merged = deep_merge(merged, _read_yaml(user_config_path))
-    merged = deep_merge(merged, _read_yaml(project_config_path))
+    if project_config_path is not None:
+        merged = deep_merge(merged, _read_yaml(project_config_path))
     if cli_overrides:
         merged = deep_merge(merged, dict(cli_overrides))
 

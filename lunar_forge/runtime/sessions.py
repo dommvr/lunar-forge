@@ -6,7 +6,7 @@ import json
 import os
 import re
 from hashlib import sha256
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -215,6 +215,7 @@ def create_session_logger(
     environ: Mapping[str, str] | None = None,
     *,
     event_callback: SessionEventCallback | None = None,
+    sensitive_values: Sequence[str] = (),
 ) -> SessionLogger:
     """Create a unique session file beneath ``.agent/sessions``."""
     root = Path(project_root).expanduser().resolve()
@@ -229,11 +230,24 @@ def create_session_logger(
 
     environment = os.environ if environ is None else environ
     names, values = _redaction_context(environment)
+    explicit_values = tuple(
+        sorted(
+            {
+                value
+                for value in sensitive_values
+                if isinstance(value, str) and value
+            },
+            key=len,
+            reverse=True,
+        )
+    )
     return SessionLogger(
         project_root=root,
         path=session_path,
         _environment_names=names,
-        _environment_values=values,
+        _environment_values=tuple(
+            dict.fromkeys((*explicit_values, *values))
+        ),
         _event_callback=event_callback,
     )
 

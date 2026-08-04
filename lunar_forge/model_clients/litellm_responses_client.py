@@ -39,12 +39,14 @@ class LiteLLMResponsesClient(LiteLLMClient):
         model: str,
         *,
         api_key_env: str | None = None,
+        api_key: str | None = None,
         api_base: str | None = None,
         reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(
             model,
             api_key_env=api_key_env,
+            api_key=api_key,
             api_base=api_base,
             reasoning_effort=reasoning_effort,
         )
@@ -63,7 +65,10 @@ class LiteLLMResponsesClient(LiteLLMClient):
             request["tools"] = _responses_tools(tools)
         request.update(self._request_options(api="responses"))
 
-        response = _litellm_responses(**request)
+        try:
+            response = _litellm_responses(**request)
+        except Exception as exc:
+            raise RuntimeError(self._safe_provider_error(exc)) from None
         normalized = _normalize_responses_response(
             response,
             fallback_model=self.model,

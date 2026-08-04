@@ -438,7 +438,8 @@ class PermissionManager:
     ) -> str:
         if (
             tool_name not in _LOCAL_COMMAND_TOOLS
-            or self.runtime_mode.strip().lower() not in {"local", "docker"}
+            or self.runtime_mode.strip().lower()
+            not in {"local", "docker", "remote"}
         ):
             return _describe_request(tool_name, arguments)
 
@@ -451,6 +452,16 @@ class PermissionManager:
                 else "Run Docker validation commands"
             )
             return f"{heading}\n{_DOCKER_EXECUTION_NOTICE}"
+        if self.runtime_mode.strip().lower() == "remote":
+            heading = (
+                f"Run remote workspace command: {preview}"
+                if preview is not None
+                else "Run remote workspace validation commands"
+            )
+            return (
+                f"{heading}\nExecution is delegated to the caller-supplied "
+                "confined workspace runtime."
+            )
 
         full_warning = (
             not self._local_command_warning_shown
@@ -547,6 +558,7 @@ def _approval_mode(
     if kind in {"command", "browser_server"} and normalized_runtime in {
         "local",
         "docker",
+        "remote",
     }:
         return normalized_runtime
     return "default"

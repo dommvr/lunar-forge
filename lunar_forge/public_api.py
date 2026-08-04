@@ -8,7 +8,7 @@ event, approval, configuration, and session systems.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,11 +19,51 @@ from lunar_forge.approvals import (
     ApprovalRequest,
 )
 from lunar_forge.config import ALLOWED_REASONING_EFFORTS, load_config
+from lunar_forge.cancellation import (
+    CancellableModelClient,
+    CancellationResult,
+    CancellationToken,
+)
 from lunar_forge.events import AgentEvent, sanitize_event_payload
+from lunar_forge.model_clients import (
+    ModelClient,
+    ModelClientFactory,
+    ModelResponse,
+    ModelUsage,
+    RedactingModelClient,
+    ToolCall,
+    create_ephemeral_model_client,
+)
+from lunar_forge.runtime.base import (
+    MAX_RUNTIME_DIRECTORY_ENTRIES,
+    MAX_RUNTIME_COMMAND_CHARACTERS,
+    MAX_RUNTIME_COMMAND_TIMEOUT_MS,
+    MAX_RUNTIME_OUTPUT_CHARACTERS,
+    MAX_RUNTIME_PATH_CHARACTERS,
+    MAX_RUNTIME_TEXT_CHARACTERS,
+    RuntimeCheckpoint,
+    RuntimeCommandResult,
+    RuntimeFileInfo,
+    RuntimeNetworkPolicy,
+    RuntimeOperationResult,
+    RuntimePathType,
+    RuntimeRollbackResult,
+    RuntimeRollbackStatus,
+    RuntimeTextResult,
+    RuntimeWriteResult,
+    WorkspaceRuntime,
+    normalize_workspace_path,
+)
 from lunar_forge.runtime.sessions import (
     LoadedSession,
     list_session_files,
     load_session,
+)
+from lunar_forge.runtime.workspace import (
+    DockerWorkspaceRuntime,
+    LocalWorkspaceRuntime,
+    NoCommandWorkspaceRuntime,
+    create_workspace_runtime,
 )
 
 
@@ -101,7 +141,7 @@ class ResumedSession:
 class AgentRequest:
     """One typed request for the public structured agent-event stream."""
 
-    project_root: Path | str
+    project_root: Path | str | None
     message: str
     runtime_mode: str | None = None
     permission_mode: str | None = None
@@ -115,8 +155,12 @@ class AgentRequest:
     ui_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        root = Path(self.project_root).expanduser().resolve()
-        if not root.is_dir():
+        root = (
+            Path(self.project_root).expanduser().resolve()
+            if self.project_root is not None
+            else None
+        )
+        if root is not None and not root.is_dir():
             raise NotADirectoryError(
                 f"Project root is not a directory: {root}"
             )
@@ -214,7 +258,11 @@ class AgentRequest:
         )
         return sanitize_event_payload(
             {
-                "project_root": str(self.project_root),
+                "project_root": (
+                    str(self.project_root)
+                    if self.project_root is not None
+                    else None
+                ),
                 "message": self.message,
                 "runtime_mode": self.runtime_mode,
                 "permission_mode": self.permission_mode,
@@ -281,11 +329,30 @@ def resume_session(
 def run_agent_events(
     request: AgentRequest,
     approval_provider: ApprovalProvider | None = None,
+    *,
+    runtime: WorkspaceRuntime | None = None,
+    model_client: ModelClient | None = None,
+    model_client_factory: ModelClientFactory | None = None,
+    cancellation_token: CancellationToken | None = None,
+    live_event_callback: Callable[[AgentEvent], None] | None = None,
 ) -> Iterator[AgentEvent]:
-    """Yield the existing transport-neutral event stream for ``request``."""
+    """Yield the existing transport-neutral event stream for ``request``.
+
+    All optional integrations are per invocation. They are never stored in the
+    request or session representation, and existing ``run_agent_events(request)``
+    calls retain their environment/config-based behavior.
+    """
 
     if not isinstance(request, AgentRequest):
         raise TypeError("run_agent_events expects an AgentRequest.")
+    if request.project_root is None and runtime is None:
+        raise ValueError(
+            "AgentRequest project_root may be None only with a workspace runtime."
+        )
+    if model_client is not None and model_client_factory is not None:
+        raise ValueError(
+            "Supply either model_client or model_client_factory, not both."
+        )
 
     # Keep the package front door importable without Rich/Textual. The core
     # agent engine itself is loaded only when iteration actually begins.
@@ -312,17 +379,39 @@ def run_agent_events(
         request.project_root,
         cli_overrides=overrides or None,
     )
-    if request.allow_network is True and config.runtime.mode != "docker":
+    remote_runtime = runtime is not None and runtime.local_project_root is None
+    if (
+        request.allow_network is True
+        and config.runtime.mode != "docker"
+        and not remote_runtime
+    ):
         raise ValueError(
             "AgentRequest allow_network requires Docker runtime mode."
         )
+    if (
+        request.allow_network is True
+        and remote_runtime
+        and runtime.network_policy is RuntimeNetworkPolicy.DENIED
+    ):
+        raise ValueError(
+            "The supplied workspace runtime reports a denied network policy."
+        )
     loaded: ResumedSession | None = None
     if request.resume is not None:
+        if request.project_root is None:
+            raise ValueError(
+                "Persisted session resume requires a local project root."
+            )
         loaded = resume_session(request.project_root, request.resume)
     yield from _run_agent_events(
         request.message,
         request.project_root,
         config=config,
+        runtime=runtime,
+        model_client=model_client,
+        model_client_factory=model_client_factory,
+        cancellation_token=cancellation_token,
+        live_event_callback=live_event_callback,
         mode=request.permission_mode or config.permissions.mode,
         approval_provider=approval_provider,
         resume_messages=loaded.messages if loaded is not None else (),
@@ -356,10 +445,42 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalProvider",
     "ApprovalRequest",
+    "CancellableModelClient",
+    "CancellationResult",
+    "CancellationToken",
+    "DockerWorkspaceRuntime",
+    "LocalWorkspaceRuntime",
+    "MAX_RUNTIME_DIRECTORY_ENTRIES",
+    "MAX_RUNTIME_COMMAND_CHARACTERS",
+    "MAX_RUNTIME_COMMAND_TIMEOUT_MS",
+    "MAX_RUNTIME_OUTPUT_CHARACTERS",
+    "MAX_RUNTIME_PATH_CHARACTERS",
+    "MAX_RUNTIME_TEXT_CHARACTERS",
+    "ModelClient",
+    "ModelClientFactory",
+    "ModelResponse",
+    "ModelUsage",
+    "RedactingModelClient",
+    "NoCommandWorkspaceRuntime",
     "ResumedSession",
+    "RuntimeCheckpoint",
+    "RuntimeCommandResult",
+    "RuntimeFileInfo",
+    "RuntimeNetworkPolicy",
+    "RuntimeOperationResult",
+    "RuntimePathType",
+    "RuntimeRollbackResult",
+    "RuntimeRollbackStatus",
+    "RuntimeTextResult",
+    "RuntimeWriteResult",
     "SessionRef",
+    "ToolCall",
+    "WorkspaceRuntime",
+    "create_ephemeral_model_client",
+    "create_workspace_runtime",
     "list_sessions",
     "load_config",
+    "normalize_workspace_path",
     "resume_session",
     "run_agent_events",
 ]

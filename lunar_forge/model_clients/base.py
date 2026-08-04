@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -54,3 +54,21 @@ class ModelClient(Protocol):
         tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> ModelResponse:
         """Return a normalized completion for messages and optional tools."""
+
+
+@runtime_checkable
+class ModelClientFactory(Protocol):
+    """Create one in-memory model client for an agent run or parallel phase."""
+
+    def __call__(self) -> ModelClient:
+        """Return a new provider-neutral model client."""
+        ...
+
+
+@runtime_checkable
+class RedactingModelClient(ModelClient, Protocol):
+    """Optional client capability for registering in-memory secrets."""
+
+    def sensitive_values_for_redaction(self) -> Sequence[str]:
+        """Return transient values the core must redact from public records."""
+        ...

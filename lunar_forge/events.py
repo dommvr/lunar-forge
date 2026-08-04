@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -272,6 +272,7 @@ class EventFactory:
     session_id: str = field(default_factory=lambda: f"session_{uuid4().hex}")
     turn_id: str = field(default_factory=lambda: f"turn_{uuid4().hex}")
     environment: Mapping[str, str] | None = field(default=None, repr=False)
+    sensitive_values: Sequence[str] = field(default=(), repr=False)
     timestamp_factory: Callable[[], str] = field(
         default=lambda: _timestamp(),
         repr=False,
@@ -302,6 +303,7 @@ class EventFactory:
         safe_payload = sanitize_event_payload(
             payload or {},
             environment=self.environment,
+            sensitive_values=self.sensitive_values,
         )
         return AgentEvent(
             schema_version=SCHEMA_VERSION,
@@ -477,7 +479,11 @@ def events_from_session_record(
                 )
             )
         checkpoint_path = result.get("checkpoint_path")
-        if isinstance(checkpoint_path, str) and checkpoint_path:
+        checkpoint_id = result.get("checkpoint_id")
+        if (
+            isinstance(checkpoint_path, str)
+            and checkpoint_path
+        ) or (isinstance(checkpoint_id, str) and checkpoint_id):
             events.append(
                 factory.create(
                     EventType.CHECKPOINT_CREATED,
@@ -485,6 +491,7 @@ def events_from_session_record(
                         "tool_name": tool_name,
                         "path": result.get("path"),
                         "checkpoint_path": checkpoint_path,
+                        "checkpoint_id": checkpoint_id,
                     },
                     parent_event_id=finished.event_id,
                 )
@@ -526,6 +533,7 @@ def sanitize_event_payload(
     payload: Mapping[str, Any],
     *,
     environment: Mapping[str, str] | None = None,
+    sensitive_values: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Return a bounded JSON-safe payload with secrets and reasoning removed."""
     if not isinstance(payload, Mapping):
@@ -534,10 +542,21 @@ def sanitize_event_payload(
     environment_names, environment_values = _redaction_context(
         selected_environment
     )
+    explicit_values = tuple(
+        sorted(
+            {
+                value
+                for value in sensitive_values
+                if isinstance(value, str) and value
+            },
+            key=len,
+            reverse=True,
+        )
+    )
     sanitized = _sanitize(
         payload,
         environment_names,
-        environment_values,
+        tuple(dict.fromkeys((*explicit_values, *environment_values))),
     )
     if not isinstance(sanitized, dict):
         sanitized = {"value": sanitized}

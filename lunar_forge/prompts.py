@@ -321,6 +321,7 @@ def build_system_prompt(
     *,
     runtime_mode: str = "local",
     allow_network: bool = False,
+    network_policy: str | None = None,
     browser_intent: BrowserIntent | None = None,
     task_profile: str | None = None,
 ) -> str:
@@ -354,6 +355,13 @@ def build_system_prompt(
         )
     elif normalized_runtime == "no-command":
         runtime_guidance = "Command execution is disabled."
+    elif normalized_runtime == "remote":
+        reported_policy = (network_policy or "unknown").strip().lower()
+        runtime_guidance = (
+            "Commands are delegated to the caller-supplied confined workspace "
+            f"runtime. Its reported network policy is {reported_policy}. The "
+            "runtime remains responsible for enforcing that policy."
+        )
     else:
         runtime_guidance = "Commands use the local project-scoped runner."
     project_json = json.dumps(

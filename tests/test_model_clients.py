@@ -10,7 +10,54 @@ from lunar_forge.model_clients import (
     LiteLLMClient,
     LiteLLMResponsesClient,
     create_litellm_client,
+    create_ephemeral_model_client,
 )
+
+
+def test_ephemeral_client_redacts_direct_key_from_repr_and_provider_errors(
+    monkeypatch,
+):
+    credential = "ephemeral-provider-secret-12345678"
+
+    def failing_completion(**request):
+        assert request["api_key"] == credential
+        raise RuntimeError(f"provider echoed {credential}")
+
+    monkeypatch.setattr(
+        "lunar_forge.model_clients.litellm_client._litellm_completion",
+        failing_completion,
+    )
+    client = create_ephemeral_model_client(
+        model="openai/gpt-test",
+        api_key=credential,
+    )
+
+    assert credential not in repr(client)
+    with pytest.raises(RuntimeError) as raised:
+        client.complete([{"role": "user", "content": "hello"}])
+    assert credential not in str(raised.value)
+    assert "[REDACTED]" in str(raised.value)
+
+
+def test_environment_configured_client_redacts_provider_error(monkeypatch):
+    credential = "environment-provider-secret-12345678"
+    monkeypatch.setenv("TEST_PROVIDER_API_KEY", credential)
+
+    def failing_completion(**request):
+        raise RuntimeError(f"provider echoed {request['api_key']}")
+
+    monkeypatch.setattr(
+        "lunar_forge.model_clients.litellm_client._litellm_completion",
+        failing_completion,
+    )
+    client = LiteLLMClient(
+        "openai/gpt-test",
+        api_key_env="TEST_PROVIDER_API_KEY",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        client.complete([{"role": "user", "content": "hello"}])
+    assert credential not in str(raised.value)
 
 
 def _fake_litellm(monkeypatch, *, completion=None, responses=None):

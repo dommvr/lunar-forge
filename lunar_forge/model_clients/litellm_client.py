@@ -19,14 +19,30 @@ class LiteLLMClient:
         model: str,
         *,
         api_key_env: str | None = None,
+        api_key: str | None = None,
         api_base: str | None = None,
         reasoning_effort: str | None = None,
     ) -> None:
+        if api_key is not None and api_key_env is not None:
+            raise ValueError("Use either api_key or api_key_env, not both.")
+        if api_key is not None and (
+            not isinstance(api_key, str) or not api_key.strip()
+        ):
+            raise ValueError("api_key must be a non-empty string when supplied.")
         self.model = model
         self.api_key_env = api_key_env
+        self._api_key = api_key
         self.api_base = api_base
         self.reasoning_effort = reasoning_effort
         self._reasoning_warning_emitted = False
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(model={self.model!r}, "
+            f"api_key_env={self.api_key_env!r}, api_key='[REDACTED]', "
+            f"api_base={self.api_base!r}, "
+            f"reasoning_effort={self.reasoning_effort!r})"
+        )
 
     def complete(
         self,
@@ -41,15 +57,20 @@ class LiteLLMClient:
             request["tools"] = [dict(tool) for tool in tools]
         request.update(self._request_options(api="chat"))
 
-        response = _litellm_completion(**request)
+        try:
+            response = _litellm_completion(**request)
+        except Exception as exc:
+            raise RuntimeError(self._safe_provider_error(exc)) from None
         return _normalize_response(response, fallback_model=self.model)
 
     def _request_options(self, *, api: str) -> dict[str, Any]:
-        """Return shared LiteLLM connection options without retaining a raw key."""
+        """Return one call's LiteLLM connection options."""
         options = self._reasoning_request_options(api=api)
         if self.api_base:
             options["api_base"] = self.api_base
-        if self.api_key_env:
+        if self._api_key is not None:
+            options["api_key"] = self._api_key
+        elif self.api_key_env:
             api_key = os.getenv(self.api_key_env)
             if not api_key:
                 raise RuntimeError(
@@ -57,6 +78,20 @@ class LiteLLMClient:
                 )
             options["api_key"] = api_key
         return options
+
+    def sensitive_values_for_redaction(self) -> tuple[str, ...]:
+        """Register the in-memory credential with the core redaction boundary."""
+
+        return (self._api_key,) if self._api_key is not None else ()
+
+    def _safe_provider_error(self, exc: Exception) -> str:
+        message = str(exc)
+        credential = self._api_key
+        if credential is None and self.api_key_env:
+            credential = os.getenv(self.api_key_env)
+        if credential:
+            message = message.replace(credential, "[REDACTED]")
+        return f"Model request failed with {type(exc).__name__}: {message}"
 
     def _reasoning_request_options(self, *, api: str) -> dict[str, Any]:
         """Shape configured reasoning effort only where LiteLLM supports it."""

@@ -23,7 +23,7 @@ APPROVAL_KINDS = frozenset(
 )
 APPROVAL_RISKS = frozenset({"low", "medium", "high"})
 APPROVAL_MODES = frozenset(
-    {"local", "docker", "plan", "no-command", "default"}
+    {"local", "docker", "remote", "plan", "no-command", "default"}
 )
 APPROVAL_SOURCES = frozenset({"cli", "auto", "deny", "textual"})
 
